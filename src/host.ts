@@ -1249,6 +1249,7 @@ export class AmplifierHost {
   async nativeControl(session:string,operation:string,args:Json,options:{requireExisting?:boolean}={}):Promise<Json> {
     session=(await this.record(session)).uri;
     if(this.relocationFence(session))throw new RpcFault(-32011,'Session relocation is fenced; no runtime control was dispatched');
+    if(operation==='history.edit')throw new RpcFault(-32601,'Canonical history editing requires an admitted lifecycle; generic dispatch is unavailable');
     if(operation==='session.relocate')throw new RpcFault(-32602,'Relocation requires relocateSession admission');
     const admissionMethod:Record<string,string>={'steer':'updatePendingQueue','steer.submit':'updatePendingQueue','schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation'};
     if(admissionMethod[operation])throw new RpcFault(-32602,`Execution requires ${admissionMethod[operation]} admission`);
