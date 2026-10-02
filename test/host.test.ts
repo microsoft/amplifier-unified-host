@@ -9,7 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
 import { WebSocketTransport } from '@microsoft/agent-host-protocol/ws';
 import { chatReducer,type ChatState,type StateAction } from '@microsoft/agent-host-protocol';
-import { createHost } from '../src/host.js';
+import { createHost,MessageUnavailableError } from '../src/host.js';
 
 async function setup(options:any={}) {
   const dir=await mkdtemp(join(tmpdir(),'ahp-host-'));const log=join(dir,'prompts.jsonl');
@@ -386,5 +386,32 @@ test('workspace capture holds only the selected session mapping against relocati
   release();await second;await turn;assert.equal((await f.host.waitForTurn(one.session,commandId)).completed,true);
   let touched=false;await assert.rejects(f.host.withSessionWorkspace(one.session,{expectedExecutionRevision:after.executionRevision},async()=>{touched=true;}),/revision changed/);await assert.rejects(f.host.withSessionWorkspace(one.session,{expectedDirectory:initial.executionDirectory},async()=>{touched=true;}),/directory changed/);assert.equal(touched,false);
   await assert.rejects(f.host.withSessionWorkspace(one.session,{},async()=>{throw new Error('capture failed');}),/capture failed/);assert.equal(await f.host.withSessionWorkspace(one.session,{},async view=>view.executionDirectory),target);
+ }finally{await f.cleanup();}
+});
+
+
+test('exact indexed input lookup reaches beyond fifty turns without transcript paging or losing provenance',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session,chat}=await f.create(client),old=randomUUID();await f.host.submitTurn(session,{commandId:old,text:'Exact original authorization',clientId:'user-client'});await f.host.waitForTurn(session,old);
+  for(let i=0;i<51;i++){const id=randomUUID();await f.host.submitTurn(session,{commandId:id,text:'later '+i,clientId:'user-client'});await f.host.waitForTurn(session,id);}
+  assert.ok(!(await f.host.readSessionContext(session,50)).messages.some(row=>row.id===old));
+  const originalTurns=f.host.store.turns;f.host.store.turns=()=>{throw new Error('Exact lookup must not page any transcript');};
+  try{const found=await f.host.readUserMessage(session,old);assert.equal(found.text,'Exact original authorization');assert.equal(found.provenance.admission.clientId,'user-client');assert.equal(found.provenance.complete,true);assert.equal(found.inputOrigin,'user');}finally{f.host.store.turns=originalTurns;}
+  for(const [kind,meta,expected] of [
+   ['scheduled',{'amplifier.dev/scheduled':{scheduledRunId:'run-1',inputOrigin:'scheduled'}},{inputOrigin:'scheduled',scheduledRunId:'run-1'}],
+   ['question',{'amplifier.dev/input':{inputOrigin:'ui',questionId:'question-1'}},{inputOrigin:'question',questionId:'question-1'}],
+   ['voice',{'amplifier.dev/history':{via:'call',callId:'call-1',itemId:'item-1',recordedOnly:true}},{inputOrigin:'voice',voiceId:'call-1',voiceItemId:'item-1'}]
+  ] as const){const turn=action('source '+kind);turn.message._meta=meta;client.dispatch(chat,turn);await waitFor(()=>f.host.store.receipt(turn.turnId)?.status==='completed');const found=await f.host.readUserMessage(session,turn.turnId);for(const [key,value]of Object.entries(expected))assert.equal(found[key],value);assert.deepEqual(found._meta,meta);}
+  const large=action('😀'.repeat(500));client.dispatch(chat,large);await waitFor(()=>f.host.store.receipt(large.turnId)?.status==='completed');await assert.rejects(f.host.readUserMessage(session,large.turnId,{maxBytes:100}),(error:any)=>error instanceof MessageUnavailableError&&error.reason==='oversized');assert.equal((await f.host.readUserMessage(session,large.turnId)).text,large.message.text);
+  const other=await f.create(client);await assert.rejects(f.host.readUserMessage(other.session,old),(error:any)=>error instanceof MessageUnavailableError&&error.reason==='not-indexed');
+ }finally{await f.cleanup();}
+});
+
+test('unindexed legacy input refuses without starting native history and non-user records are explicit',async()=>{
+ const f=await setup();try{
+  const timestamp=new Date().toISOString(),uri='ahp-session:/cold-legacy';f.host.config.catalog={list:async()=>({items:[]}),get:async()=>({uri,engineId:'fixture',nativeSessionId:'legacy-native',workingDirectory:f.dir,title:'Legacy',createdAt:timestamp,modifiedAt:timestamp,status:'idle'}),upsert:async()=>{}};
+  await assert.rejects(f.host.readUserMessage(uri,'never-indexed'),(error:any)=>error instanceof MessageUnavailableError&&error.reason==='not-indexed'&&error.data.available===false);assert.equal(f.host.diagnostics().activeAgents,0);await assert.rejects(readFile(f.log,'utf8'));
+  f.host.store.saveTurn('ahp-chat:/cold-legacy',{id:'assistant-voice',startedAt:timestamp,state:'complete',message:{text:'Spoken assistant response',origin:{kind:'agent'}},responseParts:[]} as any);
+  await assert.rejects(f.host.readUserMessage(uri,'assistant-voice'),(error:any)=>error instanceof MessageUnavailableError&&error.reason==='not-user');
  }finally{await f.cleanup();}
 });

@@ -20,6 +20,11 @@ export interface Catalog {
   directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   close?():Promise<void>;
 }
+export type MessageUnavailableReason='not-indexed'|'not-user'|'oversized'|'invalid-provenance';
+export class MessageUnavailableError extends Error {
+  readonly code=-32012;readonly data:{available:false;reason:MessageUnavailableReason;session:string;messageId:string};
+  constructor(readonly reason:MessageUnavailableReason,session:string,messageId:string){super(`User message unavailable: ${reason}; no native history scan or absence claim`);this.name='MessageUnavailableError';this.data={available:false,reason,session,messageId};}
+}
 export interface SessionWorkspace {
   session:string;engineId:string;nativeSessionId?:string;historyHome:string;executionDirectory:string;executionRevision:number;
 }
@@ -604,6 +609,26 @@ export class AmplifierHost {
     const turn=row?JSON.parse(row.payload as string):undefined;
     const text=(turn?.responseParts??[]).filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n').slice(0,50000);
     return {generation_id:commandId,status:current.status,completed:current.status==='completed',text,detail:current.detail,workContinues:['admitted','dispatching'].includes(current.status)};
+  }
+  /** Exact host-indexed input, never a recent-window search or eager native transcript read. */
+  async readUserMessage(session:string,messageId:string,options:{maxBytes?:number}={}):Promise<Json> {
+    if(typeof messageId!=='string'||!messageId||messageId.length>512)throw new RpcFault(-32602,'A bounded exact message identity is required');
+    const maxBytes=bounded(options.maxBytes,65536,1024*1024),record=await this.record(session);
+    const fail=(reason:MessageUnavailableReason):never=>{throw new MessageUnavailableError(reason,record.uri,messageId);};
+    let message:Message,createdAt:string;
+    if(record.chat.activeTurn?.id===messageId){message=record.chat.activeTurn.message;createdAt=record.chat.activeTurn.startedAt;if(Buffer.byteLength(JSON.stringify(message))>maxBytes)fail('oversized');}
+    else {
+      // The composite unique index selects one turn. Never materialize its potentially huge response.
+      const row=this.store.db.prepare("SELECT length(CAST(json_extract(payload,'$.message') AS BLOB)) AS bytes, CASE WHEN length(CAST(json_extract(payload,'$.message') AS BLOB))<=? THEN json_extract(payload,'$.message') END AS message, json_extract(payload,'$.startedAt') AS created_at FROM turns WHERE chat=? AND turn_id=?").get(maxBytes,record.chat.resource,messageId);
+      if(!row)fail('not-indexed');if(Number(row!.bytes)>maxBytes)fail('oversized');
+      if(typeof row!.message!=='string')fail('invalid-provenance');message=JSON.parse(String(row!.message));createdAt=String(row!.created_at);
+    }
+    if(message.origin?.kind!=='user')fail('not-user');if(typeof message.text!=='string'||!Number.isFinite(Date.parse(createdAt)))fail('invalid-provenance');
+    const history=message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=message._meta?.['amplifier.dev/scheduled'] as Json|undefined,input=message._meta?.['amplifier.dev/input'] as Json|undefined,raw=message as unknown as Json;
+    const receipt=this.store.receipt(messageId),admission=receipt?.channel===record.chat.resource?receipt:undefined;
+    const questionId=input?.questionId??history?.questionId??scheduled?.questionId??raw.questionId,scheduledRunId=scheduled?.scheduledRunId??input?.scheduledRunId??raw.scheduledRunId,voiceId=history?.callId??input?.voiceId??raw.voiceId,voiceItemId=history?.itemId??input?.voiceItemId??raw.voiceItemId;
+    const inputOrigin=scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??raw.inputOrigin??(admission?'user':'unknown');
+    return structuredClone({...message,id:messageId,role:'user',createdAt,inputOrigin,...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(voiceId?{voiceId}:{}),...(voiceItemId?{voiceItemId}:{}),provenance:{source:admission?'host-admission':'host-projection',complete:true,...(admission?{admission:{clientId:admission.clientId,status:admission.status,createdAt:admission.createdAt}}:{})}});
   }
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {

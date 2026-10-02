@@ -297,3 +297,23 @@ host does not freeze external filesystem edits or an already-running agent, and
 this guard is not an immutable file snapshot. Publishers must independently capture
 content/version evidence and use their own durable effect receipts. Other sessions
 remain available throughout the capture.
+
+`readUserMessage(session, messageId, {maxBytes?})` selects one indexed host input,
+including an input older than the recent 50-message context window. Success returns
+the complete raw message plus `id`, `role`, `createdAt`, normalized `inputOrigin`,
+question/schedule/voice identifiers and `provenance`. The default bound is 64 KiB
+for the complete message; callers may explicitly request up to 1 MiB. Text and
+attachments are never silently truncated for an authorization decision.
+
+`MessageUnavailableError` is exported with numeric code `-32012` and
+`data: {available:false, reason, session, messageId}`. Reasons are `not-indexed`,
+`not-user`, `oversized`, or `invalid-provenance`. A missing host index entry is not
+proof that no native message exists. This API never searches recent pages, starts
+an agent, or scans native transcripts. Callers must refuse unavailable provenance;
+legacy native lookup requires a separate storage-owner index/capability.
+
+A role label alone is not proof of human authorization. The returned observation
+preserves scheduled/question/voice provenance and the original admission client and
+status when present. Unadmitted projections default to `inputOrigin: 'unknown'`
+unless recorded provenance explicitly identifies another origin. Consumers must
+apply their own authenticated actor, timing and content policies to this evidence.
