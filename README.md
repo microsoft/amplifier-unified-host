@@ -280,3 +280,20 @@ older than ten minutes. This is a cooperative-host guard, not proof against an
 undiscovered or noncooperating external process; no filesystem scan or transcript
 read is substituted during a query. The capability owner retains its own durable
 Git removal receipt and explicit handling for an unknown filesystem outcome.
+
+`withSessionWorkspace(session, {expectedExecutionRevision?, expectedDirectory?},
+async captured => ...)` authorizes the selected execution directory and holds only
+that session's relocation/admission mutex through trusted bounded source-capture
+I/O. The immutable callback value is `{session, engineId, nativeSessionId?,
+historyHome, executionDirectory, executionRevision}`. Stale expectations and an
+unresolved relocation fence reject before invoking the callback. Omitting the
+expectations captures the current mapping, which is useful when a capability owner
+is only inspecting its existing receipt after the session moved.
+
+The callback must impose its own byte/time limits and must not reenter host mutation
+or admission APIs. The lock is held until its promise settles, including failure;
+a timed-out caller cannot assume its still-running I/O released the mapping. The
+host does not freeze external filesystem edits or an already-running agent, and
+this guard is not an immutable file snapshot. Publishers must independently capture
+content/version evidence and use their own durable effect receipts. Other sessions
+remain available throughout the capture.

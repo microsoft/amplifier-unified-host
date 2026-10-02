@@ -20,6 +20,10 @@ export interface Catalog {
   directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   close?():Promise<void>;
 }
+export interface SessionWorkspace {
+  session:string;engineId:string;nativeSessionId?:string;historyHome:string;executionDirectory:string;executionRevision:number;
+}
+export interface SessionWorkspaceExpectation {expectedExecutionRevision?:number;expectedDirectory?:string;}
 export interface HostConfig {
   stateDirectory:string; engines:EngineConfig[]; allowedWorkspaceRoots:string[];
   host?:string;port?:number;allowedOrigins?:string[];allowedHosts?:string[];bearerToken?:string;
@@ -779,6 +783,21 @@ export class AmplifierHost {
     const engine=this.config.engines.find(e=>e.id===record.engineId);
     const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
     return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),title:record.summary.title,activeTurnId:record.chat.activeTurn?.id,status:record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+  }
+  /** Hold the selected session mapping through bounded trusted I/O. No filesystem snapshot is implied. */
+  async withSessionWorkspace<T>(session:string,expected:SessionWorkspaceExpectation,capture:(workspace:Readonly<SessionWorkspace>)=>Promise<T>):Promise<T> {
+    if(!expected||typeof expected!=='object'||typeof capture!=='function'||(expected.expectedExecutionRevision!==undefined&&(!Number.isSafeInteger(expected.expectedExecutionRevision)||expected.expectedExecutionRevision<0))||(expected.expectedDirectory!==undefined&&(typeof expected.expectedDirectory!=='string'||!isAbsolute(expected.expectedDirectory))))throw new RpcFault(-32602,'An optional execution revision and absolute directory are required');
+    const selected=await this.record(session);
+    return this.withLock(selected.uri,async()=>{
+      const record=await this.record(selected.uri);
+      if(this.relocationFence(record.uri))throw new RpcFault(-32011,'Session relocation is fenced; workspace capture was not started',{executed:false});
+      const executionDirectory=await this.workspace(pathToFileURL(record.executionDirectory??record.workingDirectory).href),executionRevision=this.store.revisions(record.uri).executionRevision;
+      if(expected.expectedExecutionRevision!==undefined&&expected.expectedExecutionRevision!==executionRevision)throw new RpcFault(-32011,'Execution revision changed; workspace capture was not started',{executed:false});
+      if(expected.expectedDirectory!==undefined&&await this.workspace(pathToFileURL(expected.expectedDirectory).href)!==executionDirectory)throw new RpcFault(-32011,'Execution directory changed; workspace capture was not started',{executed:false});
+      // The caller owns byte/time limits and may read files, but must not reenter host mutations.
+      // Keep the mutex until its promise settles: a timeout must not free mapping while I/O runs.
+      return capture(Object.freeze({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,historyHome:record.workingDirectory,executionDirectory,executionRevision}));
+    });
   }
   private relocationFence(session:string):Json|undefined {
     const row=this.store.db.prepare("SELECT command_id,source,target,status FROM relocations WHERE uri=? AND status IN ('admitted','unknown') ORDER BY rowid DESC LIMIT 1").get(session);

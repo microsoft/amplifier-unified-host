@@ -338,7 +338,7 @@ test('lost relocation result survives restart, fences target, and reconciles dur
   const client=await f.connect(),{session}=await f.create(client),target=join(await realpath(f.dir),'lost');await mkdir(target);
   const before=await f.host.inspectSession(session),commandId=randomUUID();
   await assert.rejects(f.host.relocateSession(session,{commandId,target,expectedExecutionRevision:before.executionRevision}),(error:any)=>error.data?.receipt===commandId&&error.data.outcome==='unknown');
-  assert.equal(f.host.store.receipt(commandId)?.status,'unknown');assert.equal((await f.host.inspectSession(session)).executionDirectory,before.historyHome);assert.equal((await f.host.directoryInUse(target)).pending,true);
+  assert.equal(f.host.store.receipt(commandId)?.status,'unknown');await assert.rejects(f.host.withSessionWorkspace(session,{},async()=>{throw new Error('Must not capture fenced mapping');}),/fenced/);assert.equal((await f.host.inspectSession(session)).executionDirectory,before.historyHome);assert.equal((await f.host.directoryInUse(target)).pending,true);
   const noReplay=randomUUID();await assert.rejects(f.host.submitTurn(session,{commandId:noReplay,text:'must not execute',clientId:'relocator'}),/fenced/);assert.equal(f.host.store.receipt(noReplay),undefined);
   await client.shutdown();await f.host.close();replacement=await createHost(f.config);
   assert.equal((await replacement.inspectSession(session)).relocationFence.commandId,commandId);
@@ -367,5 +367,24 @@ test('indexed removal evidence refuses incomplete, stale and issue-bearing catal
   let freshness:any={phase:'not-started',issues:0};f.host.config.catalog={list:async()=>({items:[]}),get:async()=>undefined,upsert:async()=>{},directoryInUse:async()=>({inUse:false,coverage:'indexed-native-history',freshness})};
   for(const evidence of [{phase:'not-started',issues:0},{phase:'running',issues:0},{phase:'complete',completedAt:new Date().toISOString(),issues:1},{phase:'complete',completedAt:new Date(Date.now()-700000).toISOString(),issues:0}]){freshness=evidence;await assert.rejects(f.host.withDirectoryGuard(target,async()=>{}),/referenced/);}
   freshness={phase:'complete',completedAt:new Date().toISOString(),issues:0};assert.equal(await f.host.withDirectoryGuard(target,async()=>true),true);
+ }finally{await f.cleanup();}
+});
+
+
+test('workspace capture holds only the selected session mapping against relocation and admission',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),two=await f.create(client),target=join(await realpath(f.dir),'capture-target');await mkdir(target);
+  const initial=await f.host.inspectSession(one.session);let entered!:()=>void,release!:()=>void;let started=new Promise<void>(r=>entered=r),hold=new Promise<void>(r=>release=r);
+  const capture=f.host.withSessionWorkspace(one.session,{expectedExecutionRevision:initial.executionRevision,expectedDirectory:initial.executionDirectory},async workspace=>{assert.ok(Object.isFrozen(workspace));assert.equal(workspace.executionDirectory,initial.executionDirectory);entered();await hold;return {captured:workspace.executionDirectory};});
+  await started;const move=f.host.relocateSession(one.session,{commandId:randomUUID(),target,expectedExecutionRevision:initial.executionRevision});
+  const independent=randomUUID();await f.host.submitTurn(two.session,{commandId:independent,text:'independent while capture waits',clientId:'publisher'});assert.equal((await f.host.waitForTurn(two.session,independent)).completed,true);
+  assert.equal((await f.host.inspectSession(one.session)).executionDirectory,initial.executionDirectory);assert.equal(f.host.store.db.prepare('SELECT count(*) AS n FROM relocations').get()!.n,0);
+  release();assert.deepEqual(await capture,{captured:initial.executionDirectory});assert.equal((await move).applied,true);
+  const after=await f.host.inspectSession(one.session);started=new Promise<void>(r=>entered=r);hold=new Promise<void>(r=>release=r);
+  const second=f.host.withSessionWorkspace(one.session,{expectedExecutionRevision:after.executionRevision,expectedDirectory:target},async()=>{entered();await hold;});await started;
+  const commandId=randomUUID(),turn=f.host.submitTurn(one.session,{commandId,text:'after captured files',clientId:'publisher'});await new Promise(r=>setTimeout(r,30));assert.equal(f.host.store.receipt(commandId),undefined);
+  release();await second;await turn;assert.equal((await f.host.waitForTurn(one.session,commandId)).completed,true);
+  let touched=false;await assert.rejects(f.host.withSessionWorkspace(one.session,{expectedExecutionRevision:after.executionRevision},async()=>{touched=true;}),/revision changed/);await assert.rejects(f.host.withSessionWorkspace(one.session,{expectedDirectory:initial.executionDirectory},async()=>{touched=true;}),/directory changed/);assert.equal(touched,false);
+  await assert.rejects(f.host.withSessionWorkspace(one.session,{},async()=>{throw new Error('capture failed');}),/capture failed/);assert.equal(await f.host.withSessionWorkspace(one.session,{},async view=>view.executionDirectory),target);
  }finally{await f.cleanup();}
 });
