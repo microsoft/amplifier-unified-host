@@ -5,15 +5,16 @@ import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { realpath, stat, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { isAbsolute, relative, join, dirname, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
+import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { Store, type SessionRecord } from './store.js';
 import { AcpProcess, type EngineConfig, type AgentHandlers } from './acp.js';
+import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
-export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status:number|string;availability?:string;workspaceAvailability?:string;}
+export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;}
 export interface Catalog {
-  list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[]}):Promise<{items:CatalogRecord[];nextCursor?:string}>;
+  list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];includeArchive?:boolean}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
   get(uri:string):Promise<CatalogRecord|undefined>;
   upsert(record:CatalogRecord):Promise<unknown>;
   hint?(sessionDirectory:string):Promise<unknown>;
@@ -73,6 +74,7 @@ export class AmplifierHost {
   private nativeCursors=new Map<string,{chat:string;cursor:string;revision:string}>();
   private loadedFloors=new Map<string,number>();
   private passiveReads=0;
+  private recallCursors=new Map<string,{scope:string;cursor?:string;after?:{modified:string;uri:string}}>();
   private hotRecords=new Map<string,SessionRecord>();
   private clientTools=new Map<string,{session:string;chat:string;turnId:string;clientId:string;resolve:(result:Json)=>void;timer:ReturnType<typeof setTimeout>}>();
   private observers=new Set<{session:string;chat:string;queue:ActionEnvelope[];bytes:number;running:boolean;closed:boolean;listener:(event:ActionEnvelope)=>void|Promise<void>;onError?:(error:Error)=>void}>();
@@ -217,6 +219,72 @@ export class AmplifierHost {
   private turnCursor(chat:string,before?:number):string|undefined {
     if(before===undefined)return;const token=randomUUID();this.cursors.set(token,{chat,before});if(this.cursors.size>4096)this.cursors.delete(this.cursors.keys().next().value!);return token;
   }
+  private rememberRecallCursor(value:{scope:string;cursor?:string;after?:{modified:string;uri:string}}):string {
+    const token=randomUUID();this.recallCursors.set(token,value);if(this.recallCursors.size>4096)this.recallCursors.delete(this.recallCursors.keys().next().value!);return token;
+  }
+  private recallCursor(token:string|undefined,scope:string) {
+    if(token===undefined)return;
+    const value=this.recallCursors.get(token);if(!value||value.scope!==scope)throw new RpcFault(-32602,'Recall cursor expired or belongs to a different source/query/revision');return value;
+  }
+  private recallMetadata(record:CatalogRecord):RecallSource {
+    if(record.parentUri||record.kind&&record.kind!=='root'&&record.kind!=='session')throw new RpcFault(-32601,'Child/internal Recall sources are not advertised');
+    if(record.workspaceAvailability&&record.workspaceAvailability!=='present')throw new RpcFault(-32008,'Recall workspace is not currently visible');
+    return {id:record.uri,title:record.title,workspace:record.workingDirectory,kind:record.kind??'root'};
+  }
+  private async recallSource(id:string):Promise<{source:RecallSource;record:SessionRecord}> {
+    const catalog=await this.config.catalog?.get(id);
+    if(catalog){if(catalog.uri!==id)throw new RpcFault(-32008,'Catalog returned a different source identity');this.recallMetadata(catalog);if((catalog as Json).isArchived)throw new RpcFault(-32008,'Archived source is not visible');}
+    const record=await this.record(id);
+    if(record.state.status & SessionStatus.IsArchived)throw new RpcFault(-32008,'Archived source is not visible');
+    return {source:this.recallMetadata(catalog??{uri:record.uri,title:record.summary.title,workingDirectory:record.workingDirectory,engineId:record.engineId,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt}),record};
+  }
+  /** Indexed source inventory only; no native initialization, history reads, or global projection. */
+  async listRecallSources(input:{session:string;scope:'task'|'workspace'|'all';cursor?:string;limit?:number}) {
+    if(!input||!['task','workspace','all'].includes(input.scope))throw new RpcFault(-32602,'Recall scope is required');
+    const selected=await this.recallSource(input.session),limit=bounded(input.limit,25,25),scope=JSON.stringify(['list',selected.source.id,input.scope]);
+    const cursor=this.recallCursor(input.cursor,scope);
+    if(input.scope==='task'){if(input.cursor)throw new RpcFault(-32602,'Task inventory has no next page');return {items:[selected.source],coverage:{source:'selected-root',children:false,internal:false}};}
+    if(this.config.catalog){
+      const result=await this.config.catalog.list({connectionId:'recall:'+this.store.incarnation+':'+createHash('sha256').update(scope).digest('hex'),limit,cursor:cursor?.cursor,allowedWorkspaceRoots:this.roots,includeArchive:false,...(input.scope==='workspace'?{workingDirectory:selected.source.workspace}:{})});
+      if(result.items.length>limit)throw new RpcFault(-32000,'Catalog exceeded Recall page bound');
+      const items=result.items.map(row=>this.recallMetadata(row));
+      return {items,...(result.nextCursor?{nextCursor:this.rememberRecallCursor({scope,cursor:result.nextCursor})}:{}),coverage:{source:'indexed-catalog',freshness:result.freshness,children:false,internal:false}};
+    }
+    const after=cursor?.after,where=[`(json_extract(state,'$.status') & ${SessionStatus.IsArchived})=0`],args:any[]=[];
+    if(input.scope==='workspace'){where.push('cwd=?');args.push(selected.source.workspace);}
+    if(after){where.push('(modified,uri)<(?,?)');args.push(after.modified,after.uri);}
+    const rows=this.store.db.prepare(`SELECT uri,cwd,modified,summary FROM sessions WHERE ${where.join(' AND ')} ORDER BY modified DESC,uri DESC LIMIT ?`).all(...args,limit+1),items:RecallSource[]=[];
+    for(const row of rows.slice(0,limit)){try{await this.workspace(pathToFileURL(String(row.cwd)).href);}catch{continue;}const summary=JSON.parse(String(row.summary));items.push({id:String(row.uri),title:summary.title,workspace:String(row.cwd),kind:'root'});}
+    const last=rows[Math.min(rows.length,limit)-1];
+    return {items,...(rows.length>limit?{nextCursor:this.rememberRecallCursor({scope,after:{modified:String(last.modified),uri:String(last.uri)}})}:{}),coverage:{source:'host-owned-only',children:false,internal:false}};
+  }
+  private async passiveRecall(record:SessionRecord,operation:'inspect'|'read',params:Json={}):Promise<Json> {
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
+    const engine=this.config.engines.find(engine=>engine.id===record.engineId);
+    if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Passive native source is unavailable');
+    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}})});
+    try{
+      const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
+      if(capability?.version!==1||capability.paging!=='complete-turns'||capability.passive!==true||capability.passiveInspect!==true)throw new RpcFault(-32601,'Agent does not advertise revision-checked passive history');
+      return await agent.client.extMethod(operation==='inspect'?'_amplifier/history/inspect':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,...params});
+    }finally{this.passiveReads--;await agent.retire();}
+  }
+  /** Storage-owner stat only. Missing/unsupported history is explicit, never an empty success. */
+  async inspectRecallSource(id:string) {
+    const {source,record}=await this.recallSource(id),result=await this.passiveRecall(record,'inspect');
+    if(result.available!==true||typeof result.revision!=='string'||!result.revision||result.revision.length>512)throw new RpcFault(-32008,'Native Recall history is unavailable',{available:false,diagnostics:result.diagnostics});
+    return {...source,revision:result.revision,limits:RECALL_LIMITS,coverage:{source:'native-history',authorization:'unverified-native-history',diagnostics:result.diagnostics??[]}};
+  }
+  /** One complete-turn page; no worker mount, implicit pagination, or truncated messages. */
+  async readRecallSource(id:string,input:{cursor?:string;limit?:number;expectedRevision:string}) {
+    if(!input||typeof input.expectedRevision!=='string'||!input.expectedRevision||input.expectedRevision.length>512)throw new RpcFault(-32602,'An expected passive source revision is required');
+    const {record}=await this.recallSource(id),limit=bounded(input.limit,50,RECALL_LIMITS.maxTurns),scope=JSON.stringify(['read',record.uri,input.expectedRevision]),cursor=this.recallCursor(input.cursor,scope);
+    const result=await this.passiveRecall(record,'read',{limit,expectedRevision:input.expectedRevision,...(cursor?.cursor?{cursor:cursor.cursor}:{})});
+    if(result.revision!==input.expectedRevision||!Array.isArray(result.turnGroups)||result.turnGroups.length>limit||result.turnGroups.some((group:Json)=>!Array.isArray(group.updates)))throw new RpcFault(-32011,'Native history revision/page contract changed');
+    const mapped=recallRows(result.turnGroups);
+    if(Buffer.byteLength(JSON.stringify({...mapped,diagnostics:result.diagnostics??[]}))>RECALL_LIMITS.maxBytes)throw new RpcFault(-32000,'Complete Recall page exceeds byte capacity; use a smaller turn limit');
+    return {...mapped,revision:result.revision,...(result.nextCursor?{nextCursor:this.rememberRecallCursor({scope,cursor:result.nextCursor})}:{}),limits:RECALL_LIMITS,coverage:{source:'native-history',authorization:'unverified-native-history',diagnostics:result.diagnostics??[],omittedUpdates:mapped.omittedUpdates}};
+  }
   private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string):Promise<{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]}> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
@@ -235,7 +303,8 @@ export class AmplifierHost {
         for(const group of result.turnGroups) {
           const inputs=(group.updates as Json[]).filter(update=>update.sessionUpdate==='user_message_chunk').map(update=>update.content);
           const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
-          const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
+          const inputHistory=(group.updates as Json[]).find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
+          const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
           const attachments:any[]=[];
           for(const content of inputs){if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});else if(content.type==='resource_link')attachments.push({type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});}
           if(attachments.length)message.attachments=attachments;
@@ -647,8 +716,9 @@ export class AmplifierHost {
     if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native'){const native=await this.nativeHistory(record,limit),ids=new Set(turns.map(t=>t.id));turns=[...native.turns.filter(t=>!ids.has(t.id)),...turns].slice(-limit);}
     const messages:Json[]=[];
     for(const turn of turns){
-      const history=turn.message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=turn.message._meta?.['amplifier.dev/scheduled'] as Json|undefined;
-      const provenance={createdAt:turn.startedAt,inputOrigin:scheduled?.inputOrigin??(history?.via==='call'?'voice':'user'),...(scheduled?{scheduledRunId:scheduled.scheduledRunId}:{}),...(history?.via==='call'?{voiceId:history.callId,voiceItemId:history.itemId}:{})};
+      const history=turn.message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=turn.message._meta?.['amplifier.dev/scheduled'] as Json|undefined,input=turn.message._meta?.['amplifier.dev/input'] as Json|undefined,receipt=this.store.receipt(turn.id);
+      const questionId=input?.questionId??history?.questionId,scheduledRunId=scheduled?.scheduledRunId??input?.scheduledRunId??history?.scheduledRunId;
+      const provenance={createdAt:history?.createdAt??turn.startedAt,inputOrigin:scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??(receipt?.channel===record.chat.resource?'user':'unknown'),...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(history?.via==='call'?{voiceId:history.callId,voiceItemId:history.itemId}:{}),...(history?.authorization?{authorization:history.authorization}:{})};
       if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
       const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
       if(text)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});

@@ -460,3 +460,26 @@ test('negotiated owned-operation observations continue after prompt settlement w
   const client=await plain.connect(),{session}=await plain.create(client);await plain.host.nativeControlExisting(session,'fixture.background.observe',{});await new Promise(r=>setTimeout(r,120));assert.equal(denied.length,0);const result=JSON.parse((await readFile(plain.log+'.observations','utf8')).trim());assert.ok(result.error);
  }finally{await plain.cleanup();}
 });
+
+test('Recall inventories stay cold and pages retain exact messages, scoped cursors and unverified provenance',async()=>{
+ const f=await setup();let reader:any;try{
+  const dir=await realpath(f.dir),history=join(dir,'recall.json'),timestamp=new Date().toISOString();
+  const groups=Array.from({length:4},(_,i)=>({id:'group-'+i,updates:[
+   {sessionUpdate:'user_message_chunk',content:{type:'text',text:'request '+i},_meta:{'amplifier.dev/history':{messageId:'message-u-'+i,createdAt:timestamp,...(i===3?{inputOrigin:'question',questionId:'q1'}:{})}}},
+   {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'answer '},_meta:{'amplifier.dev/history':{messageId:'message-a-'+i}}},
+   {sessionUpdate:'agent_message_chunk',content:{type:'text',text:String(i)},_meta:{'amplifier.dev/history':{messageId:'message-a-'+i}}},
+   {sessionUpdate:'agent_thought_chunk',content:{type:'text',text:'not recalled'}}
+  ]}));await writeFile(history,JSON.stringify(groups));
+  const records=Array.from({length:4},(_,i)=>({uri:'ahp-session:/recall-'+i,engineId:'fixture',nativeSessionId:'native-'+i,workingDirectory:dir,title:'History '+i,kind:'root',workspaceAvailability:'present',createdAt:timestamp,modifiedAt:timestamp})),queries:any[]=[];
+  reader=await createHost({...f.config,stateDirectory:join(dir,'recall-state'),engines:f.config.engines.map((e:any)=>({...e,env:{...e.env,FIXTURE_HISTORY:history}})),catalog:{get:async(id:string)=>records.find(row=>row.uri===id),upsert:async()=>{},list:async(p:any)=>{queries.push(p);const offset=Number(p.cursor??0);return {items:records.slice(offset,offset+p.limit),nextCursor:offset+p.limit<records.length?String(offset+p.limit):undefined,freshness:{phase:'complete',issues:0}};}}});
+  const first=await reader.listRecallSources({session:records[0].uri,scope:'workspace',limit:2});assert.equal(first.items.length,2);assert.ok(first.nextCursor);assert.equal(queries[0].workingDirectory,dir);assert.equal(queries[0].includeArchive,false);await assert.rejects(readFile(f.log+'.passive','utf8'));assert.equal(reader.diagnostics().activeAgents,0);
+  const second=await reader.listRecallSources({session:records[0].uri,scope:'workspace',limit:2,cursor:first.nextCursor});assert.equal(second.items.length,2);assert.equal(second.nextCursor,undefined);await assert.rejects(reader.listRecallSources({session:records[0].uri,scope:'all',cursor:first.nextCursor}),/different source/);
+  const inspected=await reader.inspectRecallSource(records[0].uri);assert.equal(inspected.revision,'fixture-revision');assert.equal(await readFile(f.log+'.passive','utf8'),'inspect\n');
+  const page=await reader.readRecallSource(records[0].uri,{limit:1,expectedRevision:inspected.revision});assert.equal(page.rows.length,2);assert.equal(page.rows[0].id,'message-u-3');assert.equal(page.rows[0].questionId,'q1');assert.equal(page.rows[0].authorization,'unverified-native-history');assert.equal(page.rows[1].text,'answer 3');assert.equal(page.coverage.omittedUpdates,1);assert.ok(page.nextCursor);
+  const prior=await reader.readRecallSource(records[0].uri,{limit:1,cursor:page.nextCursor,expectedRevision:inspected.revision});assert.equal(prior.rows[0].inputOrigin,'unknown');assert.equal(prior.rows[0].id,'message-u-2');await assert.rejects(reader.readRecallSource(records[1].uri,{cursor:page.nextCursor,expectedRevision:inspected.revision}),/different source/);await assert.rejects(reader.readRecallSource(records[0].uri,{expectedRevision:'changed'}),/History source changed/);
+  const context=await reader.readSessionContext(records[0].uri,8);assert.equal(context.messages.find((m:any)=>m.id==='group-2').inputOrigin,'unknown');assert.equal(context.messages.find((m:any)=>m.id==='group-3').questionId,'q1');assert.equal(context.messages.find((m:any)=>m.id==='group-2').authorization,'unverified-native-history');
+  await assert.rejects(reader.readUserMessage(records[0].uri,'message-u-3'),(e:any)=>e.reason==='not-indexed');assert.equal(reader.diagnostics().activeAgents,0);await assert.rejects(readFile(f.log,'utf8'));
+  await writeFile(history,JSON.stringify([{id:'huge',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:'x'.repeat(2*1024*1024)},_meta:{'amplifier.dev/history':{messageId:'huge'}}}]}]));await assert.rejects(reader.readRecallSource(records[0].uri,{expectedRevision:inspected.revision}),/complete-message byte bound/);
+  records[0].kind='child';await assert.rejects(reader.inspectRecallSource(records[0].uri),/Child\/internal/);
+ }finally{if(reader)await reader.close();await f.cleanup();}
+});

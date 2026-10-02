@@ -346,3 +346,45 @@ from the currently bound native runtime after its foreground prompt settles. Thi
 exception grants no idle dispatch, context or other host capability access. The host
 limits pending observation count and bytes; the operations owner still validates the
 reported runtime and event producer before recording them.
+
+## Passive Recall source access
+
+Independent indexing owners use `listRecallSources({session, scope, cursor?, limit?})`
+with `scope: 'task' | 'workspace' | 'all'` and at most 25 root sources per page.
+The catalog supplies indexed metadata and freshness; the standalone fallback reports
+`host-owned-only` coverage. Listing never starts an ACP peer or reads history.
+Child/internal sources are not advertised. Exact source reads authorize its existing
+canonical history workspace; execution worktree changes do not move its history.
+
+`inspectRecallSource(id)` returns `{id,title,workspace,kind,revision,limits,coverage}`.
+It requires negotiated native `history.passiveInspect`, whose storage owner performs
+only a source stat. `readRecallSource(id,{expectedRevision,cursor?,limit?})` returns
+`{rows,revision,nextCursor?,limits,coverage}` from one complete-turn page, at most
+50 turns, 1000 message rows and 2 MiB. Cursors are bounded and scoped to source and
+revision. Unsupported/missing sources, changed revisions and oversized pages fail
+explicitly; there is no eager history fallback or truncated successful message.
+An index owner must inspect the revision again before committing its derived index.
+
+Rows retain native stable message IDs and recorded user/assistant text. Tool,
+reasoning and binary updates are omitted with an explicit `omittedUpdates` count.
+Native rows always carry `sourceKind: 'native-history'` and
+`authorization: 'unverified-native-history'`; missing input origin is `unknown`.
+Imported conversation text is never substituted for `readUserMessage` admission
+provenance. This seam does not mount a worker, request a model or mutate native files.
+
+## Public offline fixture and CI
+
+After installing/building this package, run
+`node examples/offline-host.mjs /absolute/workspace /private/owned-state 8765`.
+It starts this public host against the packaged independent JSON-RPC ACP echo peer
+(`fixtures/acp-peer.mjs`); it makes no model/account calls. The fixture supports
+streaming, permission choices and controlled failures for web/TUI/protocol acceptance.
+The optional example browser origins are loopback Vite ports 5173 and 5179. Use a
+private disposable state directory, stop the process when done, and configure real
+engines through the production CLI separately.
+
+The checked-in CI runs type checks, all offline tests, build and package creation.
+Native/catalog integration tests require explicit `ACP_EXECUTABLE` and
+`CATALOG_EXECUTABLE`; Core/Foundation execution tests additionally require the
+owned fixture configuration variables documented in the integration test. Skipped
+native tests are not native-runtime or real-account qualification.

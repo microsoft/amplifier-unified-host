@@ -2,3 +2,5 @@ export { AmplifierHost, createHost, MessageUnavailableError, type MessageUnavail
 export { type EngineConfig } from './acp.js';
 export { type Receipt } from './store.js';
 export { StdioCatalog, type CatalogProcessConfig } from './catalog.js';
+
+export { RECALL_LIMITS, type RecallSource, type RecallRow } from './recall.js';
