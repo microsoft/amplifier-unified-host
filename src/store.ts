@@ -44,6 +44,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS receipts(command_id TEXT PRIMARY KEY,channel TEXT NOT NULL,client_id TEXT NOT NULL,client_seq INTEGER NOT NULL,payload TEXT NOT NULL);
       DROP INDEX IF EXISTS receipt_origin;
       CREATE INDEX IF NOT EXISTS receipt_origin_lookup ON receipts(client_id,client_seq);
+      CREATE INDEX IF NOT EXISTS receipt_status_channel ON receipts(json_extract(payload,'$.status'),channel);
       CREATE TABLE IF NOT EXISTS terminals(uri TEXT PRIMARY KEY,session TEXT NOT NULL,modified TEXT NOT NULL,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS session_admission(uri TEXT PRIMARY KEY,execution INTEGER NOT NULL DEFAULT 0,interruption INTEGER NOT NULL DEFAULT 0,configuration INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS relocations(command_id TEXT PRIMARY KEY,uri TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);
@@ -55,6 +56,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS queue_pending ON queue_intents(status,chat,position);
       CREATE TABLE IF NOT EXISTS steering_intents(id TEXT PRIMARY KEY,chat TEXT NOT NULL,message TEXT,origin TEXT NOT NULL,status TEXT NOT NULL,held INTEGER NOT NULL DEFAULT 0,active_turn_id TEXT,generation_id TEXT,reason TEXT,projected INTEGER NOT NULL DEFAULT 1);
       CREATE INDEX IF NOT EXISTS steering_pending ON steering_intents(chat,status);
+      CREATE INDEX IF NOT EXISTS steering_status ON steering_intents(status,chat);
+      CREATE INDEX IF NOT EXISTS steering_unprojected ON steering_intents(id) WHERE projected=0;
       CREATE INDEX IF NOT EXISTS steering_turn ON steering_intents(chat,active_turn_id,status);
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);

@@ -654,3 +654,18 @@ test('unconfirmed steering remains unknown when its original turn finishes succe
   await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'blocked new work',clientId:'owner'}),/unknown/);
  }finally{await f.cleanup();}
 });
+
+test('cold receipt and steering archives stay out of current admission scans',async()=>{
+ const f=await setup();try{
+  const stamp=new Date().toISOString();f.host.store.transaction(()=>{
+   const receipt=f.host.store.db.prepare('INSERT INTO receipts VALUES(?,?,?,?,?)'),steering=f.host.store.db.prepare("INSERT INTO steering_intents(id,chat,message,origin,status) VALUES(?,?,NULL,'{}','removed')");
+   for(let i=0;i<25000;i++){const channel='ahp-chat:/cold-'+i;receipt.run('cold-'+i,channel,'old-client',i,JSON.stringify({commandId:'cold-'+i,channel,clientId:'old-client',clientSeq:i,status:'completed',fingerprint:'historical',createdAt:stamp,updatedAt:stamp}));steering.run('old-steer-'+i,channel);}
+  });
+  const plan=(sql:string,...args:any[])=>f.host.store.db.prepare('EXPLAIN QUERY PLAN '+sql).all(...args).map(row=>String(row.detail)).join('\n');
+  assert.match(plan("SELECT 1 FROM receipts WHERE channel=? AND json_extract(payload,'$.status')='unknown' LIMIT 1",'ahp-chat:/selected'),/SEARCH receipts USING (?:COVERING )?INDEX receipt_status_channel/);
+  assert.match(plan("SELECT payload FROM receipts WHERE json_extract(payload,'$.status') IN ('admitted','dispatching')"),/SEARCH receipts USING (?:COVERING )?INDEX receipt_status_channel/);
+  assert.match(plan("SELECT count(*) FROM steering_intents WHERE status IN ('pending','dispatching')"),/SEARCH steering_intents USING COVERING INDEX steering_status/);
+  assert.equal(f.host.store.unknown('ahp-chat:/selected'),false);
+  f.host.store.admission('ahp-chat:/selected',{text:'admitted'},'selected','owner',1);f.host.store.finish('selected','unknown');assert.equal(f.host.store.unknown('ahp-chat:/selected'),true);f.host.store.finish('selected','completed');assert.equal(f.host.store.unknown('ahp-chat:/selected'),false);
+ }finally{await f.cleanup();}
+});
