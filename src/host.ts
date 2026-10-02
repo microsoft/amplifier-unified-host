@@ -31,6 +31,7 @@ export interface SessionWorkspace {
 }
 export interface SessionWorkspaceExpectation {expectedExecutionRevision?:number;expectedDirectory?:string;}
 export type PendingQueueAction=Extract<StateAction,{type:'chat/pendingMessageSet'|'chat/pendingMessageRemoved'|'chat/queuedMessagesReordered'}>;
+export interface TurnSettled {session:string;commandId:string;status:'completed'|'cancelled'|'failed'|'unknown';inputOrigin:string;}
 export interface AgentStopped {session:string;nativeSessionId?:string;engineId:string;workingDirectory:string;reason:'runtime-closed'|'process-closed'|'idle-retired'|'host-shutdown'|'relocated'|'relocation-unknown'|'startup-failed';exitCode?:number;signal?:string;}
 export interface HostConfig {
   stateDirectory:string; engines:EngineConfig[]; allowedWorkspaceRoots:string[];
@@ -52,6 +53,8 @@ export interface HostConfig {
   nativeHostCapabilities?:Json;
   /** Actual runtime/process loss, never inferred from a completed prompt. Idempotent owner callback. */
   agentStopped?:(event:Readonly<AgentStopped>)=>Promise<void>;
+  /** Best-effort bounded completion signal, after durable settlement and session lock release. No startup replay. */
+  turnSettled?:(event:Readonly<TurnSettled>)=>Promise<void>;
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
@@ -83,6 +86,9 @@ export class AmplifierHost {
   private retireTimer:ReturnType<typeof setInterval>;
   private stoppedCallbacks=new Set<Promise<void>>();
   private stoppedCallbackFailures=0;
+  private settledCallbacks=new Set<Promise<void>>();
+  private settledCallbackFailures=0;
+  private settledCallbackDropped=0;
   private closing=false;
   private roots:string[]=[];
   url='';
@@ -812,8 +818,10 @@ export class AmplifierHost {
   }
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
-    limit=bounded(limit,12,50);const record=await this.record(session);let turns=this.store.turns(record.chat.resource,limit).turns;
+    limit=bounded(limit,12,50);const record=await this.record(session);let turns:Array<Turn|NonNullable<ChatState['activeTurn']>>=this.store.turns(record.chat.resource,limit).turns;
     if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native'){const native=await this.nativeHistory(record,limit),ids=new Set(turns.map(t=>t.id));turns=[...native.turns.filter(t=>!ids.has(t.id)),...turns].slice(-limit);}
+    const current=this.getRecord(record.uri)!.chat.activeTurn;
+    if(current)turns=[...turns.filter(turn=>turn.id!==current.id),current].slice(-limit);
     const messages:Json[]=[];
     for(const turn of turns){
       const history=turn.message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=turn.message._meta?.['amplifier.dev/scheduled'] as Json|undefined,input=turn.message._meta?.['amplifier.dev/input'] as Json|undefined,receipt=this.store.receipt(turn.id);
@@ -860,6 +868,8 @@ export class AmplifierHost {
   }
   private async run(uri:string,active:Active,blocks:ContentBlock[],special?:SettledInput) {
     const channel=chatURI(uri),turnId=active.turnId!;let drain=false;
+    const message=this.getRecord(uri)!.chat.activeTurn!.message,meta=message._meta as Json|undefined;
+    const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
       const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId}}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
       if(special&&response.accepted!==true){
@@ -879,6 +889,7 @@ export class AmplifierHost {
     } finally {
       for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.lastUsed=Date.now();
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
+      this.notifyTurnSettled(uri,turnId,inputOrigin);
       await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
     }
   }
@@ -977,6 +988,16 @@ export class AmplifierHost {
     if(tool)this.emit(uri,{type:'session/inputNeededSet',request:{id,chat:channel,kind:'toolConfirmation',turnId,toolCall:tool.toolCall}} as StateAction);
     return result;
   }
+  private notifyTurnSettled(session:string,commandId:string,inputOrigin:string) {
+    if(!this.config.turnSettled)return;
+    const status=this.store.receipt(commandId)?.status;
+    if(!status||!['completed','cancelled','failed','unknown'].includes(status))return;
+    if(this.settledCallbacks.size>=64){this.settledCallbackDropped++;return;}
+    const event=Object.freeze({session,commandId,status:status as TurnSettled['status'],inputOrigin});
+    // A barrier only: never invoke a capability owner while holding admission's mutex.
+    const pending=this.withLock(session,async()=>{}).then(()=>this.config.turnSettled!(event)).catch(()=>{this.settledCallbackFailures++;}).finally(()=>this.settledCallbacks.delete(pending));
+    this.settledCallbacks.add(pending);
+  }
   private notifyAgentStopped(session:string,active:Active,reason:AgentStopped['reason'],details:{exitCode?:number;signal?:string}={}) {
     if(active.stopNotified)return;active.stopNotified=true;
     if(!this.config.agentStopped)return;
@@ -998,7 +1019,7 @@ export class AmplifierHost {
       if(force&&retired)return;
     }
   }
-  diagnostics(){return {agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
+  diagnostics(){return {turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
   async inspectSession(session:string) {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);
@@ -1158,7 +1179,7 @@ export class AmplifierHost {
     clearInterval(this.retireTimer);
     for(const observer of this.observers){observer.closed=true;observer.queue=[];}this.observers.clear();
     for(const peer of this.peers)peer.socket.terminate();
-    const agents=[...this.active.values()];await Promise.all(agents.map(active=>{active.retireReason='host-shutdown';return active.agent.retire();}));await Promise.all([...this.stoppedCallbacks]);await Promise.allSettled(agents.map(active=>active.run));this.active.clear();
+    const agents=[...this.active.values()];await Promise.all(agents.map(active=>{active.retireReason='host-shutdown';return active.agent.retire();}));await Promise.all([...this.stoppedCallbacks]);await Promise.allSettled(agents.map(active=>active.run));await Promise.all([...this.settledCallbacks]);this.active.clear();
     await new Promise<void>(resolve=>this.ws.close(()=>resolve()));await new Promise<void>(resolve=>this.http.close(()=>resolve()));
     await this.config.catalog?.close?.();this.store.close();
   }

@@ -544,3 +544,40 @@ test('typed observations share revision admission and remain system input rather
   const stale=await f.host.submitObservation(session,{...input,commandId:randomUUID()});assert.equal(stale.accepted,false);assert.equal(stale.executed,false);assert.match(stale.reason!,/revisions changed/);await assert.rejects(f.host.submitObservation(session,input),/already admitted/);await assert.rejects(f.host.nativeControl(session,'observation.submit',{}),/submitObservation admission/);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
  }finally{await f.cleanup();}
 });
+
+test('selected context includes the current admitted input while its response is pending',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),current=randomUUID();
+  await f.host.submitTurn(session,{commandId:current,text:'queue-hold',clientId:'human'});
+  let context=await f.host.readSessionContext(session,1);
+  assert.equal(context.messages.length,1);assert.equal(context.messages[0].id,current);assert.equal(context.messages[0].inputOrigin,'user');
+  assert.equal((await f.host.readUserMessage(session,context.messages[0].id)).text,'queue-hold');
+  await f.host.waitForTurn(session,current);
+  const next=randomUUID();await f.host.submitTurn(session,{commandId:next,text:'queue-hold',clientId:'human'});
+  context=await f.host.readSessionContext(session,2);
+  assert.equal(context.messages.at(-1)!.id,next);assert.equal(context.messages.filter(row=>row.id===next).length,1);assert.ok(context.messages.length<=2);
+ }finally{await f.cleanup();}
+});
+
+test('turn settlement callback follows durable receipt and lock release, isolates failure and never replays at startup',async()=>{
+ const events:any[]=[];let host:any;const f=await setup({turnSettled:async(event:any)=>{
+  assert.equal(host.store.receipt(event.commandId).status,event.status);
+  // Re-entering a read guard proves that the callback does not retain admission's mutex.
+  await host.withSessionWorkspace(event.session,{},async()=>{events.push(event);});
+  if(event.inputOrigin==='question')throw new Error('owner unavailable');
+ }});host=f.host;
+ try{
+  const client=await f.connect(),{session}=await f.create(client),one=randomUUID();
+  await host.submitTurn(session,{commandId:one,text:'settled',clientId:'human'});await host.waitForTurn(session,one);await waitFor(()=>events.length===1);
+  assert.deepEqual(events[0],{session,commandId:one,status:'completed',inputOrigin:'user'});
+  await host.submitQuestionAnswer(session,{commandId:'question-callback',text:'saved answer',questionId:'q',questionRevision:99,answerProvenance:{actor:'user'}});await host.waitForTurn(session,'question-callback');
+  await waitFor(()=>host.diagnostics().turnSettledFailures===1);assert.equal(events[1].status,'failed');assert.equal(events[1].inputOrigin,'question');assert.equal(host.diagnostics().turnSettledPending,0);
+  const transport=await f.connect('viewer-later');await transport.subscribe(session,{view:{turns:1}});assert.equal(events.length,2);
+  await Promise.all(f.clients.map(c=>c.shutdown()));f.clients.length=0;await host.close();
+  const restarted=await createHost({...f.config,turnSettled:async()=>{throw new Error('must never run at startup');}});host=restarted;f.host=restarted;
+  assert.equal(restarted.diagnostics().turnSettledPending,0);assert.equal(restarted.diagnostics().turnSettledFailures,0);await restarted.close();
+ }finally{
+  // This test deliberately replaces the host and closes each instance exactly once.
+  for(const client of f.clients)await client.shutdown();await rm(f.dir,{recursive:true,force:true});
+ }
+});

@@ -444,3 +444,15 @@ user-consent lookup rejects it as non-user. It is never routed through an ordina
 prompt, even when the engine lacks the extension. Known busy/stale preflight refuses
 without execution; terminal refusal, completion or uncertainty is recorded in the
 same durable receipts observed by `waitForTurn`. Duplicate IDs never replay.
+
+`HostConfig.turnSettled` receives `{session, commandId, status, inputOrigin}`
+after an actually dispatched turn's durable receipt settles and the admission
+mutex has been released. It is a best-effort signal for bounded owner work such
+as incremental Recall indexing, independent of viewers and streamed deltas.
+It does not assert that background operations stopped. There is no startup
+replay. At most 64 callbacks can be pending; failures and capacity drops are
+reported by `diagnostics()` as `turnSettledFailures` and `turnSettledDropped`.
+Callbacks may use public host APIs and must complete their own bounded work.
+Shutdown drains already accepted callbacks. `readSessionContext` includes the
+current admitted active input in its bounded selected window; provenance checks
+still use exact `readUserMessage`, never a truncated context row.
