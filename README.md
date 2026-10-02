@@ -340,3 +340,9 @@ deduplicated for that lifetime, and a subsequent `runtime.ready` starts a new on
 Owners must make handling idempotent and mark affected live operations interrupted
 rather than assuming completed. Callback failures are visible in
 `diagnostics().agentStoppedFailures`; pending callbacks are drained on host close.
+
+Negotiated `features.operations` also permits bounded `operations.observe` callbacks
+from the currently bound native runtime after its foreground prompt settles. This
+exception grants no idle dispatch, context or other host capability access. The host
+limits pending observation count and bytes; the operations owner still validates the
+reported runtime and event producer before recording them.

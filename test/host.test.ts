@@ -447,3 +447,16 @@ test('runtime-loss owner notification settles before the next native lifetime is
   release();await submission;assert.equal((await f.host.waitForTurn(session,commandId)).completed,true);assert.equal(notifications,1);
  }finally{release();await f.cleanup();}
 });
+
+
+test('negotiated owned-operation observations continue after prompt settlement without idle dispatch authority',async()=>{
+ const seen:any[]=[],f=await setup({nativeHostCapabilities:{version:1,features:{operations:true}},nativeHostRequest:async(context:any,request:any)=>{seen.push({context,request});return {observed:true};}});try{
+  const client=await f.connect(),{session}=await f.create(client);await f.host.nativeControl(session,'fixture.background.start',{});
+  const id=randomUUID();await f.host.submitTurn(session,{commandId:id,text:'foreground finished',clientId:'owner'});assert.equal((await f.host.waitForTurn(session,id)).completed,true);
+  await f.host.nativeControlExisting(session,'fixture.background.observe',{});await waitFor(()=>seen.length===1);await new Promise(r=>setTimeout(r,50));
+  assert.equal(seen.length,1);assert.equal(seen[0].request.operation,'operations.observe');assert.equal(seen[0].request.args.event.phase,'finished');assert.equal(seen[0].context.session,session);assert.equal(seen[0].context.nativeSessionId,seen[0].request.args.runtimeSessionId);assert.equal((await f.host.inspectSession(session)).status,'idle');assert.deepEqual(JSON.parse((await readFile(f.log+'.observations','utf8')).trim()),{observed:true});
+ }finally{await f.cleanup();}
+ const denied:any[]=[],plain=await setup({nativeHostRequest:async(_:any,request:any)=>{denied.push(request);return {};}});try{
+  const client=await plain.connect(),{session}=await plain.create(client);await plain.host.nativeControlExisting(session,'fixture.background.observe',{});await new Promise(r=>setTimeout(r,120));assert.equal(denied.length,0);const result=JSON.parse((await readFile(plain.log+'.observations','utf8')).trim());assert.ok(result.error);
+ }finally{await plain.cleanup();}
+});

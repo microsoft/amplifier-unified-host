@@ -8,7 +8,7 @@ const reply=(id,result)=>send({id,result});
 const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+'.locations')?JSON.parse(readFileSync(process.env.FIXTURE_LOG+'.locations','utf8')):{};
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
-  if(message.result!==undefined){pending.get(message.id)?.(message.result);pending.delete(message.id);continue;}
+  if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
   if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
   else if(message.method==='_amplifier/retire'){
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
@@ -16,6 +16,12 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   }
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.start'){
     background=setInterval(()=>appendFileSync(process.env.FIXTURE_LOG+'.background','tick\n'),10);reply(message.id,{id:'background-1'});
+  }
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.observe'){
+    reply(message.id,{});setTimeout(async()=>{
+      const observed=permissionId++;const result=new Promise(resolve=>pending.set(observed,resolve));send({id:observed,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'operations.observe',args:{runtimeSessionId:p.sessionId,event:{id:'background-1',phase:'finished',output:'late owned result'}}}});const value=await result;appendFileSync(process.env.FIXTURE_LOG+'.observations',JSON.stringify(value)+'\n');
+      send({id:permissionId++,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'app.dispatch',args:{}}});
+    },50);
   }
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.stop'){clearInterval(background);background=undefined;reply(message.id,{});}
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.runtime.loss'){
