@@ -59,7 +59,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {operation:'schedule.submit'|'question.submit'|'observation.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -114,6 +114,8 @@ export class AmplifierHost {
     }
     for(const row of this.store.db.prepare("SELECT chat,id FROM queue_intents WHERE projected=0").all()){this.emit(String(row.chat),{type:'chat/pendingMessageRemoved',kind:'queued',id:String(row.id)} as PendingQueueAction);this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(row.id);}
     for(const row of this.store.db.prepare("SELECT DISTINCT chat FROM queue_intents WHERE status='pending'").all())this.holdQueue(String(row.chat),'host-restarted');
+    for(const row of this.store.db.prepare("SELECT chat,id FROM steering_intents WHERE projected=0").all()){this.emit(String(row.chat),{type:'chat/pendingMessageRemoved',kind:'steering',id:String(row.id)} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(row.id);}
+    for(const row of this.store.db.prepare("SELECT chat,id,message FROM steering_intents WHERE status='pending'").all())this.emit(String(row.chat),{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...JSON.parse(String(row.message)),_meta:{'amplifier.dev/steering':{held:true,reason:'host-restarted'}}}} as PendingQueueAction);
   }
   async listen():Promise<this> {
     this.roots=await Promise.all(this.config.allowedWorkspaceRoots.map(root=>realpath(root)));
@@ -162,7 +164,7 @@ export class AmplifierHost {
     peer.socket.send(JSON.stringify(message));
   }
   private notify(method:string,params:Json,channel=ROOT) {for(const peer of this.peers)if(peer.subscriptions.has(channel))this.send(peer,{jsonrpc:'2.0',method,params});}
-  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',features:{receipts:true,sharedDrafts:false,queue:true,steer:false,voice:false,canvas:false,nativeControl:false}}}};}
+  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',features:{receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
   private terminalList(){return this.store.db.prepare("SELECT uri,payload FROM terminals WHERE lifecycle='running' ORDER BY modified DESC LIMIT 128").all().map(row=>{const state=JSON.parse(row.payload as string);return {resource:row.uri,title:state.title,claim:state.claim,lifecycle:state.lifecycle};});}
   private terminalState(uri:string):TerminalState|undefined {const row=this.store.db.prepare('SELECT payload FROM terminals WHERE uri=?').get(uri);return row?JSON.parse(row.payload as string):undefined;}
   private terminalEvent(session:string,event:Parameters<NonNullable<AgentHandlers['terminal']>>[0]) {
@@ -510,6 +512,7 @@ export class AmplifierHost {
         stopped:event=>this.notifyAgentStopped(uri,active,active.retireReason??'process-closed',event),
         nativeEvent:async params=>{
           const event=params.event as Json|undefined;
+          if(event) this.steeringEvent(uri,active,event);
           if(event?.type==='runtime.ready')active.stopNotified=false;
           if(event?.type==='runtime.closed')this.notifyAgentStopped(uri,active,active.retireReason??'runtime-closed');
           if(event?.type==='history.persisted'&&typeof event.metadataPath==='string'&&isAbsolute(event.metadataPath)&&basename(event.metadataPath)==='metadata.json') {
@@ -590,13 +593,14 @@ export class AmplifierHost {
   private async applyQueueAction(record:SessionRecord,action:PendingQueueAction,origin:NonNullable<ActionEnvelope['origin']>) {
     if(this.closing)throw new RpcFault(-32011,'Host is shutting down');
     const channel=record.chat.resource;
+    if((action.type==='chat/pendingMessageSet'||action.type==='chat/pendingMessageRemoved')&&action.kind==='steering')return this.applySteeringAction(record,action,origin);
     if(action.type==='chat/pendingMessageSet'){
       if(action.kind!=='queued')throw new RpcFault(-32601,'Active steering requires a negotiated native admission lifecycle');
       if(typeof action.id!=='string'||!action.id||action.id.length>128||!action.message||typeof action.message.text!=='string'||action.message.origin?.kind!=='user')throw new RpcFault(-32602,'Bounded pending user message required');
       this.prompt(action.message);
       const message=this.queueMessage(action.message,false),payload=JSON.stringify(message),bytes=Buffer.byteLength(payload);
       const prior=this.store.db.prepare('SELECT chat,status,position FROM queue_intents WHERE id=?').get(action.id);
-      if(prior&&(prior.chat!==channel||prior.status!=='pending')||this.store.receipt(action.id))throw new RpcFault(-32011,'Queue identity was already consumed, removed or belongs to another conversation; it cannot be replayed');
+      if(prior&&(prior.chat!==channel||prior.status!=='pending')||this.store.receipt(action.id)||this.store.db.prepare('SELECT 1 FROM steering_intents WHERE id=?').get(action.id))throw new RpcFault(-32011,'Queue identity was already consumed, removed or belongs to another conversation; it cannot be replayed');
       const local=this.store.db.prepare("SELECT count(*) n,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM queue_intents WHERE status='pending' AND chat=? AND id!=?").get(channel,action.id)!;
       const global=this.store.db.prepare("SELECT count(*) n,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM queue_intents WHERE status='pending' AND id!=?").get(action.id)!;
       if(Number(local.n)>=50||Number(local.bytes)+bytes>1024*1024||Number(global.n)>=1024||Number(global.bytes)+bytes>16*1024*1024)throw new RpcFault(-32000,'Pending queue count/byte capacity reached');
@@ -619,6 +623,64 @@ export class AmplifierHost {
     if(action.type!=='chat/queuedMessagesReordered'||!Array.isArray(action.order)||action.order.length>50||action.order.some(id=>typeof id!=='string'||id.length>128))throw new RpcFault(-32602,'Bounded queue order required');
     const rows=this.store.db.prepare("SELECT id FROM queue_intents WHERE chat=? AND status='pending' ORDER BY position").all(channel),ids=rows.map(row=>String(row.id)),order=[...new Set([...action.order.filter(id=>ids.includes(id)),...ids])];
     this.store.transaction(()=>{order.forEach((id,index)=>this.store.db.prepare('UPDATE queue_intents SET position=? WHERE id=?').run(index,id));this.emit(channel,action,origin.clientSeq>=0?origin:undefined);});return {accepted:true};
+  }
+  private async applySteeringAction(record:SessionRecord,action:Extract<PendingQueueAction,{type:'chat/pendingMessageSet'|'chat/pendingMessageRemoved'}>,origin:NonNullable<ActionEnvelope['origin']>) {
+    const chat=record.chat.resource;
+    if(typeof action.id!=='string'||!action.id||action.id.length>128)throw new RpcFault(-32602,'Bounded steering identity required');
+    const prior=this.store.db.prepare('SELECT * FROM steering_intents WHERE id=?').get(action.id);
+    if(prior&&prior.chat!==chat)throw new RpcFault(-32009,'Steering identity belongs to another conversation');
+    if(action.type==='chat/pendingMessageRemoved'){
+      if(!prior||prior.status!=='pending')throw new RpcFault(-32011,'No unconsumed steering input; already consumed input cannot be retracted');
+      this.store.transaction(()=>{this.store.db.prepare("UPDATE steering_intents SET status='removed',message=NULL WHERE id=?").run(action.id);this.emit(chat,action,origin.clientSeq>=0?origin:undefined);});return {accepted:true,id:action.id,pending:false};
+    }
+    const native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
+    if(native?.activeSteering?.version!==1||native.activeSteering.mode!=='request_boundary')throw new RpcFault(-32601,'Agent does not advertise generation-anchored request-boundary steering');
+    if(!action.message||typeof action.message.text!=='string'||!action.message.text.trim()||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.attachments?.length||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering supports bounded user text; multimodal or per-message configuration is not negotiated');
+    const payload=JSON.stringify(action.message);if(Buffer.byteLength(payload)>65536)throw new RpcFault(-32000,'Steering message exceeds byte bound');
+    if(prior&&prior.status!=='pending'||this.store.receipt(action.id)||this.store.db.prepare('SELECT 1 FROM queue_intents WHERE id=?').get(action.id))throw new RpcFault(-32011,'Steering identity already consumed or removed; inspect its receipt without replay');
+    const capacity=this.store.db.prepare("SELECT count(*) n,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM steering_intents WHERE status IN ('pending','dispatching') AND id!=?").get(action.id)!;
+    if(Number(capacity.n)>=1024||Number(capacity.bytes)+Buffer.byteLength(payload)>16*1024*1024)throw new RpcFault(-32000,'Pending steering capacity reached');
+    const held=!!this.store.unknown(chat),activeTurnId=this.getRecord(record.uri)!.chat.activeTurn?.id??null;
+    this.store.transaction(()=>{
+      this.store.db.prepare("UPDATE steering_intents SET status='removed',message=NULL WHERE chat=? AND status='pending' AND id!=?").run(chat,action.id);
+      this.store.db.prepare("INSERT INTO steering_intents(id,chat,message,origin,status,held,active_turn_id) VALUES(?,?,?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET message=excluded.message,origin=excluded.origin,held=excluded.held,active_turn_id=excluded.active_turn_id").run(action.id,chat,payload,JSON.stringify(origin),held?1:0,activeTurnId);
+      this.emit(chat,{...action,message:{...action.message,_meta:{...action.message._meta,'amplifier.dev/steering':{held,...(held?{reason:'prior-execution-unknown'}:{})}}}},origin.clientSeq>=0?origin:undefined);
+    });
+    this.consumeSteering(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
+  }
+  /** Only the immutable current generation may consume an intent. No new prompt collector. */
+  private consumeSteering(session:string) {
+    const record=this.getRecord(session)!,active=this.active.get(session);
+    if(this.closing||!active?.busy||!active.generationId||active.cancel||!record.chat.activeTurn||active.turnId!==record.chat.activeTurn.id||this.store.unknown(record.chat.resource))return;
+    const capability=(active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.activeSteering;
+    if(capability?.version!==1||capability.mode!=='request_boundary')return;
+    const row=this.store.db.prepare("SELECT * FROM steering_intents WHERE chat=? AND status='pending' AND held=0 LIMIT 1").get(record.chat.resource);if(!row||row.active_turn_id&&row.active_turn_id!==active.turnId)return;
+    if((active.steeringRuns?.size??0)>=16||Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").get(record.chat.resource,active.turnId)!.n)>=50)return;
+    const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
+    this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);});
+    this.emit(record.chat.resource,{type:'chat/pendingMessageRemoved',kind:'steering',id} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(id);this.store.finish(id,'dispatching');
+    active.controlDepth=(active.controlDepth??0)+1;
+    const pending=active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text}}).then(result=>{
+      if(result.accepted===false&&result.executed===false){this.settleSteering(session,id,'held',String(result.reason??'Native steering refused before execution'));return;}
+      if(result.accepted!==true||result.inputId!==id||result.activeInputId!==activeInputId||result.generationId!==generationId||!['queued','applied','held','unknown'].includes(String(result.disposition)))throw new Error('Invalid native steering disposition');
+      if(result.disposition!=='queued')this.settleSteering(session,id,result.disposition as 'applied'|'held'|'unknown',String(result.reason??result.disposition));
+    }).catch(error=>this.settleSteering(session,id,'unknown',(error as Error).message)).finally(()=>{active.controlDepth!--;active.steeringRuns?.delete(pending);});
+    active.steeringRuns??=new Set();active.steeringRuns.add(pending);
+  }
+  private steeringEvent(session:string,active:Active,event:Json) {
+    if(event.type==='generation.started'&&active.busy&&event.activeInputId===active.turnId&&typeof event.generation_id==='string'&&event.generation_id.length<=128){
+      active.generationId=event.generation_id;
+      void this.withLock(session,async()=>this.consumeSteering(session)).catch(()=>{});return;
+    }
+    if(!['steering.applied','steering.held','steering.unknown'].includes(event.type)||typeof event.input_id!=='string')return;
+    const row=this.store.db.prepare('SELECT * FROM steering_intents WHERE id=? AND chat=?').get(event.input_id,chatURI(session));
+    if(!row||row.active_turn_id!==event.activeInputId||row.generation_id!==event.target_generation_id)return;
+    this.settleSteering(session,event.input_id,event.type.slice('steering.'.length) as 'applied'|'held'|'unknown',String(event.reason??event.type).slice(0,512));
+  }
+  private settleSteering(session:string,id:string,disposition:'applied'|'held'|'unknown',reason:string) {
+    const chat=chatURI(session),row=this.store.db.prepare('SELECT * FROM steering_intents WHERE id=? AND chat=?').get(id,chat);
+    if(!row||row.status!=='dispatching')return;
+    this.store.transaction(()=>{this.store.db.prepare('UPDATE steering_intents SET status=?,held=1,reason=? WHERE id=?').run(disposition,reason.slice(0,1024),id);this.store.finish(id,disposition==='applied'?'completed':disposition==='held'?'failed':'unknown','steering:'+disposition+': '+reason.slice(0,512));});
   }
   /** Caller holds the session mutex. Never drains held/unknown inputs or replays a receipt. */
   private async drainQueue(session:string) {
@@ -707,12 +769,13 @@ export class AmplifierHost {
   private async admitTurn(record:SessionRecord,channel:string,action:Extract<StateAction,{type:'chat/turnStarted'}>,origin:NonNullable<ActionEnvelope['origin']>,special?:SettledInput) {
     record=this.getRecord(record.uri)!;
     if(this.closing)throw new Error('Host is shutting down');
+    if(this.store.db.prepare('SELECT 1 FROM steering_intents WHERE id=?').get(action.turnId))throw new Error('Command identity is reserved by a steering intent');
     const reservedQueue=this.store.db.prepare('SELECT chat,status FROM queue_intents WHERE id=?').get(action.turnId);
     if(reservedQueue&&(action.queuedMessageId!==action.turnId||reservedQueue.chat!==channel||reservedQueue.status!=='pending'))throw new Error('Command identity is reserved by a queued intent; use queue controls');
     if(channel!==record.chat.resource||!action.turnId||typeof action.message?.text!=='string'||(action.message.origin?.kind!=='user'&&!(special?.operation==='observation.submit'&&action.message.origin?.kind==='systemNotification'))||!Number.isFinite(Date.parse(action.startedAt)))throw new Error('Malformed user turn');
     if(record.state.lifecycle!==SessionLifecycle.Ready)throw new Error('Session creation has not completed; reconcile its outcome before execution');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
-    if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; queued turns and steering are not advertised');
+    if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
     const blocks=this.prompt(action.message),active=await this.ensureAgent(record.uri);
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
@@ -723,7 +786,8 @@ export class AmplifierHost {
       if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
     this.store.transaction(()=>{this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
-    active.busy=true;active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
+    this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
+    active.busy=true;active.generationId=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
     this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,special);
   }
@@ -821,7 +885,8 @@ export class AmplifierHost {
     if(record.chat.activeTurn?.id===messageId){message=record.chat.activeTurn.message;createdAt=record.chat.activeTurn.startedAt;if(Buffer.byteLength(JSON.stringify(message))>maxBytes)fail('oversized');}
     else {
       // The composite unique index selects one turn. Never materialize its potentially huge response.
-      const row=this.store.db.prepare("SELECT length(CAST(json_extract(payload,'$.message') AS BLOB)) AS bytes, CASE WHEN length(CAST(json_extract(payload,'$.message') AS BLOB))<=? THEN json_extract(payload,'$.message') END AS message, json_extract(payload,'$.startedAt') AS created_at FROM turns WHERE chat=? AND turn_id=?").get(maxBytes,record.chat.resource,messageId);
+      const steering=this.store.db.prepare("SELECT length(CAST(message AS BLOB)) bytes,CASE WHEN length(CAST(message AS BLOB))<=? THEN message END message FROM steering_intents WHERE chat=? AND id=? AND status IN ('applied','held','unknown','dispatching')").get(maxBytes,record.chat.resource,messageId);
+      const row:Json|undefined=steering?{...steering,created_at:this.store.receipt(messageId)?.createdAt}:this.store.db.prepare("SELECT length(CAST(json_extract(payload,'$.message') AS BLOB)) AS bytes, CASE WHEN length(CAST(json_extract(payload,'$.message') AS BLOB))<=? THEN json_extract(payload,'$.message') END AS message, json_extract(payload,'$.startedAt') AS created_at FROM turns WHERE chat=? AND turn_id=?").get(maxBytes,record.chat.resource,messageId);
       if(!row)fail('not-indexed');if(Number(row!.bytes)>maxBytes)fail('oversized');
       if(typeof row!.message!=='string')fail('invalid-provenance');message=JSON.parse(String(row!.message));createdAt=String(row!.created_at);
     }
@@ -844,6 +909,10 @@ export class AmplifierHost {
       const questionId=input?.questionId??history?.questionId,scheduledRunId=scheduled?.scheduledRunId??input?.scheduledRunId??history?.scheduledRunId;
       const provenance={createdAt:history?.createdAt??turn.startedAt,inputOrigin:scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??(receipt?.channel===record.chat.resource?'user':'unknown'),...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(history?.via==='call'?{voiceId:history.callId,voiceItemId:history.itemId}:{}),...(history?.authorization?{authorization:history.authorization}:{})};
       if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':turn.message.origin?.kind==='systemNotification'?'system':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
+      for(const steering of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='applied' ORDER BY rowid DESC LIMIT ?").all(record.chat.resource,turn.id,limit).reverse()){
+        const correction=JSON.parse(String(steering.message)),admitted=this.store.receipt(String(steering.id));
+        messages.push({id:String(steering.id),role:'user',text:correction.text.slice(0,5000),truncated:correction.text.length>5000,createdAt:admitted?.createdAt,inputOrigin:'user',activeTurnId:turn.id,delivery:'steering'});
+      }
       const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
       if(text)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
     }
@@ -903,6 +972,10 @@ export class AmplifierHost {
       this.store.finish(turnId,'unknown',(error as Error).message);
       if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:`Execution outcome unknown: ${(error as Error).message}`}}} as StateAction);
     } finally {
+      await Promise.allSettled([...(active.steeringRuns??[])]);
+      for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").all(channel,turnId))this.settleSteering(uri,String(row.id),'unknown','Turn settled without confirmed steering disposition');
+      for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
+      active.generationId=undefined;
       for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.lastUsed=Date.now();
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
@@ -1177,7 +1250,7 @@ export class AmplifierHost {
     session=(await this.record(session)).uri;
     if(this.relocationFence(session))throw new RpcFault(-32011,'Session relocation is fenced; no runtime control was dispatched');
     if(operation==='session.relocate')throw new RpcFault(-32602,'Relocation requires relocateSession admission');
-    const admissionMethod:Record<string,string>={'schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation'};
+    const admissionMethod:Record<string,string>={'steer':'updatePendingQueue','steer.submit':'updatePendingQueue','schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation'};
     if(admissionMethod[operation])throw new RpcFault(-32602,`Execution requires ${admissionMethod[operation]} admission`);
     const execute=async()=>{
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);

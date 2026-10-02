@@ -9,7 +9,7 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},taskState:{version:1,passive:true},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},taskState:{version:1,passive:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
   else if(message.method==='_amplifier/retire'){
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
@@ -47,6 +47,17 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     if(p.args.target.endsWith('/lost')){process.exit(17);continue;}
     reply(message.id,{...result,applied:true});
   }
+  else if(message.method==='_amplifier/native'&&p.operation==='steer.submit'){
+    if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.steering',JSON.stringify(p.args)+'\n');
+    if(!active||active.inputId!==p.args.activeInputId){reply(message.id,{accepted:false,executed:false,reason:'No matching active input'});continue;}
+    const result={accepted:true,inputId:p.args.inputId,activeInputId:p.args.activeInputId,generationId:active.generationId,disposition:'queued'};
+    if(p.args.text==='crash steering'){process.exit(17);continue;}
+    if(p.args.text==='refuse steering'){reply(message.id,{accepted:false,executed:false,reason:'Loop mode unavailable'});continue;}
+    if(p.args.text==='silent steering'){reply(message.id,result);continue;}
+    const disposition=p.args.text==='held steering'?'held':'applied';
+    send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'steering.'+disposition,input_id:p.args.inputId,activeInputId:p.args.activeInputId,target_generation_id:active.generationId,reason:'independent fixture'}}});
+    reply(message.id,result);
+  }
   else if(message.method==='_amplifier/native'&&p.operation==='configuration.snapshot')reply(message.id,{version:1,sourceSessionId:p.sessionId,sourceCwd:process.cwd(),configurationHash:'fixture-native-config'});
   else if(message.method==='_amplifier/session/new'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({creation:p})+'\n');if(process.env.FIXTURE_CLONE_CRASH)process.exit(17);sessions.set(p.sessionId,{});reply(message.id,{sessionId:p.sessionId,configOptions:[],_meta:{'amplifier.dev/native':{creationConfirmed:true,configurationHash:p.source.configurationHash}}});}
   else if(message.method==='session/new'){const sessionId='native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});reply(message.id,{sessionId,...(process.env.FIXTURE_LEGACY?{modes:{currentModeId:'safe',availableModes:[{id:'safe',name:'Safe'},{id:'fast',name:'Fast'}]}}:{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]})});
@@ -62,7 +73,9 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     if(scheduled&&(p.args.taskRevision===99||p.args.questionRevision===99)){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}
     if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({...p,...(process.env.FIXTURE_LOCATIONS?{processCwd:process.cwd()}: {})})+'\n');
     const text=scheduled?(p.args.text??JSON.stringify(p.args.outcome)):p.prompt.filter(b=>b.type==='text').map(b=>b.text).join(' '),id=message.id;
-    active={id,sessionId:p.sessionId,cancelled:false};
+    active={id,sessionId:p.sessionId,cancelled:false,inputId:scheduled?p.args.inputId:p._meta?.['amplifier.dev/command']?.commandId,generationId:'generation-'+id};
+    const started={method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'generation.started',generation_id:active.generationId,activeInputId:active.inputId}}};
+    if(text==='steer-start-late')setTimeout(()=>send(started),100);else send(started);
     void(async()=>{
       const turn=active;
       if(text==='crash'){process.exit(17);return;}
@@ -94,7 +107,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
         for(let i=0;i<20;i++)update(p.sessionId,{sessionUpdate:'usage_update',used:i,size:4096});
         await new Promise(resolve=>setTimeout(resolve,150));
       }
-      if(text==='slow'||text==='queue-hold')await new Promise(resolve=>setTimeout(resolve,text==='slow'?180:1000));
+      if(text==='slow'||text==='queue-hold'||text==='steer-start-late')await new Promise(resolve=>setTimeout(resolve,text==='slow'?180:1000));
       if(text==='client-tool'){
         const requestId=permissionId++;
         const outcome=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'ui.inspect',args:{}}});});

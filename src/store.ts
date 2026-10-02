@@ -53,6 +53,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS creation_keys(identity TEXT PRIMARY KEY,command_id TEXT NOT NULL,uri TEXT NOT NULL,fingerprint TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS queue_intents(id TEXT PRIMARY KEY,chat TEXT NOT NULL,message TEXT,origin TEXT NOT NULL,position INTEGER NOT NULL,status TEXT NOT NULL,held INTEGER NOT NULL DEFAULT 0,reason TEXT,projected INTEGER NOT NULL DEFAULT 1);
       CREATE INDEX IF NOT EXISTS queue_pending ON queue_intents(status,chat,position);
+      CREATE TABLE IF NOT EXISTS steering_intents(id TEXT PRIMARY KEY,chat TEXT NOT NULL,message TEXT,origin TEXT NOT NULL,status TEXT NOT NULL,held INTEGER NOT NULL DEFAULT 0,active_turn_id TEXT,generation_id TEXT,reason TEXT,projected INTEGER NOT NULL DEFAULT 1);
+      CREATE INDEX IF NOT EXISTS steering_pending ON steering_intents(chat,status);
+      CREATE INDEX IF NOT EXISTS steering_turn ON steering_intents(chat,active_turn_id,status);
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);
     `);
@@ -62,6 +65,7 @@ export class Store {
     if(!this.db.prepare('PRAGMA table_info(queue_intents)').all().some(column=>column.name==='projected'))this.db.exec('ALTER TABLE queue_intents ADD COLUMN projected INTEGER NOT NULL DEFAULT 1');
     this.db.exec('CREATE INDEX IF NOT EXISTS queue_projection_pending ON queue_intents(projected)');
     this.db.exec("UPDATE queue_intents SET held=1,reason='host-restarted' WHERE status='pending'");
+    this.db.exec("UPDATE steering_intents SET status='unknown',reason='host-restarted' WHERE status='dispatching'; UPDATE steering_intents SET held=1,reason='host-restarted' WHERE status='pending'");
     this.db.exec('CREATE INDEX IF NOT EXISTS terminals_lifecycle ON terminals(lifecycle,modified DESC)');
     this.replayBytes=Number(this.db.prepare('SELECT coalesce(sum(bytes),0) AS n FROM actions').get()!.n);
     // An interrupted admitted/dispatching command is never sent again automatically.

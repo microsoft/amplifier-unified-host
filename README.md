@@ -462,3 +462,32 @@ task through negotiated `taskState` passive inspection. It never resumes a
 runtime, scans history, or invents an empty task for an unavailable source. The
 result preserves `{available, revision, task, source}` from the native storage
 owner, enforces a 32 KiB task bound, and rejects a changed expected revision.
+
+Standard `chat/pendingMessageSet` / `chat/pendingMessageRemoved` with
+`kind:'steering'` use the same trusted `updatePendingQueue` entrypoint as user
+and agent capability owners. This requires the selected native agent's
+`activeSteering` v1 request-boundary capability. A pending message can be edited,
+replaced or removed before consumption. While idle it stays on disk without
+starting a runtime. Once a generation starts, the host captures its immutable
+turn/generation identity, durably reserves the input ID, removes the pending
+message using the standard AHP action, and invokes negotiated `steer.submit`.
+It never starts a second prompt collector. The mounted loop may still refuse an
+unsupported provider mode; no legacy steering fallback is used.
+
+Applied, held and unknown native outcomes map to durable completed, failed and
+unknown command receipts, respectively; the receipt detail retains the steering
+disposition. After consumption, replace/retract is unavailable because the
+underlying loop cannot prove withdrawal. Duplicate IDs never replay. Pending
+steering targeted at a cancelled/ended turn is held and cannot silently migrate
+to a later turn. Restart also holds pending input; uncertain delivered input
+fences execution. An explicit edit can re-arm an unconsumed held intent. A new ID
+is needed for a distinct request after a consumed intent. Exact message lookup
+preserves admitted steering provenance, and bounded selected context includes
+confirmed applied corrections. No required history is fabricated or discarded.
+
+Pending steering is bounded by 1,024 intents / 16 MiB globally and one editable
+pending message per chat. At most 16 delivery calls and 50 unconfirmed steering
+inputs can belong to an active turn. Identities/receipts remain on disk; restart
+never replays them. Provider-native steering, attachments in steering, and
+retraction of consumed context are explicitly unsupported until their effect
+and attribution contracts are available.

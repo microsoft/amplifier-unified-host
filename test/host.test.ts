@@ -491,7 +491,7 @@ test('question answers use settled common admission, preserve provenance and ref
   const input=await f.host.readUserMessage(session,question.commandId);assert.equal(input.inputOrigin,'question');assert.equal(input.questionId,'q-1');assert.deepEqual(input._meta['amplifier.dev/input'],{inputOrigin:'question',questionId:'q-1',questionRevision:4,answerProvenance:question.answerProvenance});
   const line=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(line.operation,'question.submit');assert.equal(line.args.inputId,question.commandId);assert.equal(line.args.questionRevision,4);assert.deepEqual(line.args.answerProvenance,question.answerProvenance);assert.equal(line.prompt,undefined);
   await assert.rejects(f.host.submitQuestionAnswer(session,question),/already admitted/);await assert.rejects(f.host.nativeControl(session,'question.submit',{}),/submitQuestionAnswer admission/);
-  const slow=randomUUID();await f.host.submitTurn(session,{commandId:slow,text:'slow',clientId:'owner'});const busy={...question,commandId:randomUUID()};assert.deepEqual(await f.host.submitQuestionAnswer(session,busy),{accepted:false,executed:false,reason:'A turn is already running; queued turns and steering are not advertised'});assert.equal(f.host.store.receipt(busy.commandId),undefined);await f.host.waitForTurn(session,slow);
+  const slow=randomUUID();await f.host.submitTurn(session,{commandId:slow,text:'slow',clientId:'owner'});const busy={...question,commandId:randomUUID()};assert.deepEqual(await f.host.submitQuestionAnswer(session,busy),{accepted:false,executed:false,reason:'A turn is already running; use pending message actions'});assert.equal(f.host.store.receipt(busy.commandId),undefined);await f.host.waitForTurn(session,slow);
   const denied={...question,commandId:randomUUID(),questionRevision:99};assert.equal((await f.host.submitQuestionAnswer(session,denied)).accepted,true);assert.equal((await f.host.waitForTurn(session,denied.commandId)).status,'failed');
   const uncertain={...question,commandId:randomUUID(),text:'crash'};assert.equal((await f.host.submitQuestionAnswer(session,uncertain)).accepted,true);assert.equal((await f.host.waitForTurn(session,uncertain.commandId)).status,'unknown');await assert.rejects(f.host.submitQuestionAnswer(session,uncertain),/already admitted/);assert.equal((await readFile(f.log,'utf8')).split('\n').filter(line=>line.includes(uncertain.commandId)).length,1);
  }finally{await f.cleanup();}
@@ -590,5 +590,67 @@ test('persisted task inspection stays passive and refuses a stale source revisio
   assert.equal((await f.host.readTaskState(session,{expectedRevision:String(task.revision)})).revision,task.revision);
   await assert.rejects(f.host.readTaskState(session,{expectedRevision:'stale'}),/revision changed/);
   await assert.rejects(readFile(f.log,'utf8'),/ENOENT/);assert.equal(await readFile(f.log+'.passive','utf8'),'task\ntask\ntask\n');
+ }finally{await f.cleanup();}
+});
+
+test('standard steering stays in its active turn, with durable receipts and no second prompt',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),other=await f.connect(),{session,chat}=await f.create(client);
+  const sub=await client.subscribe(chat,{view:{turns:3}});await other.subscribe(chat,{view:{turns:3}});const seen:any[]=[];void(async()=>{for await(const event of sub.subscription)if(event.type==='action')seen.push(event.params);})();
+  const pending=(id:string,text:string)=>({type:'chat/pendingMessageSet',kind:'steering',id,message:{text,origin:{kind:'user'}}} as any);
+  // Unconsumed idle input is editable/removable and does not start execution.
+  await f.host.updatePendingQueue(session,pending('replace','old'),{clientId:'owner'});
+  await f.host.updatePendingQueue(session,pending('replace','new'),{clientId:'owner'});
+  await f.host.updatePendingQueue(session,{type:'chat/pendingMessageRemoved',kind:'steering',id:'replace'} as any,{clientId:'owner'});
+  await assert.rejects(readFile(f.log,'utf8'),/ENOENT/);
+  other.dispatch(chat,pending('next-boundary','Correct path'));
+  await waitFor(()=>f.host.store.get(session)?.chat.steeringMessage?.id==='next-boundary');
+  const initial=action('queue-hold');client.dispatch(chat,initial);
+  await waitFor(()=>f.host.store.receipt('next-boundary')?.status==='completed');
+  const request=JSON.parse((await readFile(f.log+'.steering','utf8')).trim());assert.equal(request.activeInputId,initial.turnId);assert.equal(request.inputId,'next-boundary');
+  assert.equal((await f.host.readUserMessage(session,'next-boundary')).text,'Correct path');
+  assert.ok((await f.host.readSessionContext(session,5)).messages.some(row=>row.id==='next-boundary'&&row.delivery==='steering'));
+  await assert.rejects(f.host.updatePendingQueue(session,pending('next-boundary','duplicate'),{clientId:'owner'}),/already consumed/);
+  await assert.rejects(f.host.updatePendingQueue(session,{type:'chat/pendingMessageRemoved',kind:'steering',id:'next-boundary'} as any,{clientId:'owner'}),/cannot be retracted/);
+  await assert.rejects(f.host.nativeControl(session,'steer',{text:'bypass'}),/updatePendingQueue/);
+  assert.equal((await f.host.waitForTurn(session,initial.turnId)).completed,true);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);assert.equal(f.host.store.turns(chat).turns.length,1);
+  assert.ok(seen.some(event=>event.action.type==='chat/pendingMessageRemoved'&&event.action.id==='next-boundary'));assert.equal(f.host.store.get(session)?.chat.steeringMessage,undefined);
+ }finally{await f.cleanup();}
+});
+
+test('known held steering is never replayed and unknown steering fences new execution',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'queue-hold',clientId:'owner'});
+  for(const [id,text,status] of [['held','held steering','failed'],['refused','refuse steering','failed']] as const){
+   await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id,message:{text,origin:{kind:'user'}}} as any,{clientId:'owner'});await waitFor(()=>f.host.store.receipt(id)?.status===status);
+  }
+  await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'lost',message:{text:'crash steering',origin:{kind:'user'}}} as any,{clientId:'owner'});
+  await waitFor(()=>f.host.store.receipt('lost')?.status==='unknown');await f.host.waitForTurn(session,commandId);
+  await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'do not replay',clientId:'owner'}),/unknown/);
+  assert.equal((await readFile(f.log+'.steering','utf8')).trim().split('\n').length,3);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});
+
+test('pending steering cancelled before generation readiness stays held across later turns and restart',async()=>{
+ const f=await setup();let restarted:any,closed=false;try{
+  const client=await f.connect(),{session,chat}=await f.create(client),turn=action('steer-start-late');client.dispatch(chat,turn);await waitFor(()=>f.host.store.receipt(turn.turnId));
+  await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'not-delivered',message:{text:'Do not deliver after stop',origin:{kind:'user'}}} as any,{clientId:'owner'});
+  client.dispatch(chat,{type:'chat/turnCancelled',turnId:turn.turnId,duration:0} as any);await f.host.waitForTurn(session,turn.turnId);
+  assert.equal(f.host.store.receipt('not-delivered'),undefined);assert.equal((f.host.store.get(session)?.chat.steeringMessage?.message._meta?.['amplifier.dev/steering'] as any).held,true);
+  const second=randomUUID();await f.host.submitTurn(session,{commandId:second,text:'explicit new work',clientId:'owner'});await f.host.waitForTurn(session,second);await assert.rejects(readFile(f.log+'.steering','utf8'),/ENOENT/);
+  await client.shutdown();await f.host.close();closed=true;restarted=await createHost(f.config);
+  const third=randomUUID();await restarted.submitTurn(session,{commandId:third,text:'explicit after restart',clientId:'owner'});await restarted.waitForTurn(session,third);await assert.rejects(readFile(f.log+'.steering','utf8'),/ENOENT/);
+  assert.equal(restarted.store.get(session).chat.steeringMessage.id,'not-delivered');assert.equal(restarted.store.receipt('not-delivered'),undefined);
+ }finally{if(!closed)await f.cleanup();else{await restarted?.close();await rm(f.dir,{recursive:true,force:true});}}
+});
+
+test('unconfirmed steering remains unknown when its original turn finishes successfully',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),id=randomUUID();await f.host.submitTurn(session,{commandId:id,text:'slow',clientId:'owner'});
+  await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'unconfirmed',message:{text:'silent steering',origin:{kind:'user'}}} as any,{clientId:'owner'});
+  assert.equal((await f.host.waitForTurn(session,id)).completed,true);assert.equal(f.host.store.receipt('unconfirmed')?.status,'unknown');
+  await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'blocked new work',clientId:'owner'}),/unknown/);
  }finally{await f.cleanup();}
 });
