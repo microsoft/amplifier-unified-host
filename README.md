@@ -404,3 +404,29 @@ terminal completed/failed/cancelled/unknown outcome. A lost response is unknown 
 a reused command never repeats delivery. Generic `nativeControl('question.submit')`
 is refused. In-flight answers to a waiting dependent turn require a separate native
 steering lifecycle and are not faked by a competing prompt collector or idle queue.
+
+## Standard pending-message queue
+
+The host implements AHP `chat/pendingMessageSet` with `kind:'queued'`,
+`chat/pendingMessageRemoved`, and `chat/queuedMessagesReordered`. Connected clients
+and trusted capability owners (`updatePendingQueue(session, action, {clientId})`)
+share the same durable queue and session admission mutex. Upserts edit a pending
+message in place; reorder retains IDs omitted by stale clients. Drafts remain local.
+Limits are 50 messages / 1 MiB of stored message payload per session, and 1024 /
+16 MiB across pending queues. Consumed/removed identities leave small tombstones
+without message text and cannot be resurrected or used as a bypass prompt ID.
+
+An idle explicit queue submission starts through ordinary admission. A running turn
+advances the queue only after a confirmed `end_turn` without a cancellation request.
+The resulting standard `chat/turnStarted.queuedMessageId` consumes the pending item;
+its durable receipt and queue consumption commit together before native delivery.
+A crash in the subsequent projection gap removes that pending display on recovery
+and leaves the receipt unknown, without repeating delivery.
+
+Cancel, non-normal completion, uncertain outcome and host restart preserve pending
+messages in a held state. Each published message carries
+`_meta['amplifier.dev/queue']:{held:true,reason}`. An explicit upsert re-arms that
+individual intent; reorder alone does not. A prior unknown execution still blocks
+admission. Newer messages do not silently pass a held head item. Host shutdown
+prevents automatic draining. Active steering remains unavailable until its separate
+native in-flight acknowledgement contract is qualified.

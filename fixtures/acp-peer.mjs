@@ -93,7 +93,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
         for(let i=0;i<20;i++)update(p.sessionId,{sessionUpdate:'usage_update',used:i,size:4096});
         await new Promise(resolve=>setTimeout(resolve,150));
       }
-      if(text==='slow')await new Promise(resolve=>setTimeout(resolve,180));
+      if(text==='slow'||text==='queue-hold')await new Promise(resolve=>setTimeout(resolve,text==='slow'?180:1000));
       if(text==='client-tool'){
         const requestId=permissionId++;
         const outcome=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'ui.inspect',args:{}}});});

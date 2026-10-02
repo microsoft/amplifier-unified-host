@@ -496,3 +496,41 @@ test('question answers use settled common admission, preserve provenance and ref
   const uncertain={...question,commandId:randomUUID(),text:'crash'};assert.equal((await f.host.submitQuestionAnswer(session,uncertain)).accepted,true);assert.equal((await f.host.waitForTurn(session,uncertain.commandId)).status,'unknown');await assert.rejects(f.host.submitQuestionAnswer(session,uncertain),/already admitted/);assert.equal((await readFile(f.log,'utf8')).split('\n').filter(line=>line.includes(uncertain.commandId)).length,1);
  }finally{await f.cleanup();}
 });
+
+test('standard queued messages share two-viewer state, upsert/reorder/cancel and drain exactly once',async()=>{
+ const f=await setup();try{
+  const a=await f.connect(),b=await f.connect(),{session,chat}=await f.create(a),events:any[]=[];const subscription=await b.subscribe(chat,{view:{turns:10}});let state=subscription.result.snapshot!.state as ChatState;void(async()=>{for await(const event of subscription.subscription)if(event.type==='action'){events.push(event.params);if(!event.params.rejectionReason)state=chatReducer(state,event.params.action as any);}})();
+  await a.subscribe(chat,{view:{turns:10}});const initial=action('queue-hold');a.dispatch(chat,initial);await waitFor(()=>f.host.store.receipt(initial.turnId));
+  const first=randomUUID(),second=randomUUID(),removed=randomUUID(),set=(id:string,text:string)=>({type:'chat/pendingMessageSet',kind:'queued',id,message:{text,origin:{kind:'user'}}} as any);
+  a.dispatch(chat,set(first,'original'));a.dispatch(chat,set(second,'second'));a.dispatch(chat,set(removed,'never execute'));await waitFor(()=>state.queuedMessages?.length===3);
+  await assert.rejects(f.host.submitTurn(session,{commandId:first,text:'bypass queued content',clientId:'owner'}),/reserved by a queued intent/);
+  b.dispatch(chat,set(first,'edited'));b.dispatch(chat,{type:'chat/queuedMessagesReordered',order:[second,first]} as any);b.dispatch(chat,{type:'chat/pendingMessageRemoved',kind:'queued',id:removed} as any);await waitFor(()=>state.queuedMessages?.length===2&&state.queuedMessages[0].id===second&&state.queuedMessages[1].message.text==='edited');
+  await waitFor(()=>f.host.store.receipt(first)?.status==='completed');assert.equal(state.queuedMessages,undefined);assert.equal(f.host.store.receipt(second)?.status,'completed');assert.equal(f.host.store.receipt(removed),undefined);
+  const prompts=(await readFile(f.log,'utf8')).trim().split('\n').map(line=>JSON.parse(line).prompt[0].text);assert.deepEqual(prompts,['queue-hold','second','edited']);
+  assert.ok(events.some(e=>e.action.type==='chat/turnStarted'&&e.action.queuedMessageId===second));a.dispatch(chat,set(first,'do not repeat'));a.dispatch(chat,set(removed,'do not resurrect'));await waitFor(()=>events.filter(e=>e.rejectionReason).length>=2);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,3);
+ }finally{await f.cleanup();}
+});
+
+test('cancellation, restart and unknown receipt preserve held queues with explicit re-arm and no replay',async()=>{
+ const f=await setup();let restarted:any;try{
+  const a=await f.connect(),{session,chat}=await f.create(a),initial=action('slow');a.dispatch(chat,initial);await waitFor(()=>f.host.store.receipt(initial.turnId));const id=randomUUID(),queued={type:'chat/pendingMessageSet',kind:'queued',id,message:{text:'held across restart',origin:{kind:'user'}}} as any;
+  await f.host.updatePendingQueue(session,queued,{clientId:'owner'});a.dispatch(chat,{type:'chat/turnCancelled',turnId:initial.turnId,duration:0} as any);await waitFor(()=>f.host.store.receipt(initial.turnId)?.status==='cancelled');assert.equal(f.host.store.receipt(id),undefined);assert.equal((f.host.store.get(session)!.chat.queuedMessages![0].message._meta!['amplifier.dev/queue'] as any).held,true);
+  await a.shutdown();await f.host.close();restarted=await createHost(f.config);assert.equal(restarted.diagnostics().activeAgents,0);await new Promise(r=>setTimeout(r,30));assert.equal(restarted.store.receipt(id),undefined);assert.equal(restarted.store.get(session).chat.queuedMessages[0].message._meta['amplifier.dev/queue'].reason,'host-restarted');
+  await restarted.updatePendingQueue(session,queued,{clientId:'owner'});assert.equal((await restarted.waitForTurn(session,id)).status,'completed');
+  const crash=randomUUID();await restarted.submitTurn(session,{commandId:crash,text:'crash',clientId:'owner'});assert.equal((await restarted.waitForTurn(session,crash)).status,'unknown');const afterCrash={...queued,id:randomUUID()};await restarted.updatePendingQueue(session,afterCrash,{clientId:'owner'});assert.equal(restarted.store.receipt(afterCrash.id),undefined);assert.equal(restarted.store.get(session).chat.queuedMessages[0].message._meta['amplifier.dev/queue'].held,true);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,3);
+ }finally{if(restarted)await restarted.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
+});
+
+test('pending queue count and bytes are bounded; admission crash recovery removes consumed projection without replay',async()=>{
+ const f=await setup();let restarted:any;try{
+  const a=await f.connect(),{session,chat}=await f.create(a),turn=action('queue-hold');a.dispatch(chat,turn);await waitFor(()=>f.host.store.receipt(turn.turnId));
+  const set=(id:string,text:string)=>({type:'chat/pendingMessageSet',kind:'queued',id,message:{text,origin:{kind:'user'}}} as any);
+  await assert.rejects(f.host.updatePendingQueue(session,set(randomUUID(),'x'.repeat(1024*1024)),{clientId:'owner'}),/capacity/);
+  for(let i=0;i<50;i++)await f.host.updatePendingQueue(session,set(randomUUID(),'queued '+i),{clientId:'owner'});await assert.rejects(f.host.updatePendingQueue(session,set(randomUUID(),'overflow'),{clientId:'owner'}),/capacity/);assert.equal(f.host.store.get(session)!.chat.queuedMessages!.length,50);
+  await a.shutdown();await f.host.close();// Reopen the durable store only through a new host.
+  restarted=await createHost(f.config);const id=restarted.store.get(session).chat.queuedMessages[0].id;
+  restarted.store.db.prepare("UPDATE queue_intents SET status='consumed',projected=0,message=NULL WHERE id=?").run(id);restarted.store.admission(chat,{simulated:'crash after admission'},id,'owner',-1000);await restarted.close();restarted=await createHost(f.config);
+  assert.equal(restarted.store.receipt(id).status,'unknown');assert.ok(!restarted.store.get(session).chat.queuedMessages.some((message:any)=>message.id===id));assert.equal(restarted.diagnostics().activeAgents,0);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{if(restarted)await restarted.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
+});

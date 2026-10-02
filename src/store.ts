@@ -51,12 +51,17 @@ export class Store {
       CREATE INDEX IF NOT EXISTS relocations_source ON relocations(source,status);
       CREATE INDEX IF NOT EXISTS relocations_target ON relocations(target,status);
       CREATE TABLE IF NOT EXISTS creation_keys(identity TEXT PRIMARY KEY,command_id TEXT NOT NULL,uri TEXT NOT NULL,fingerprint TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS queue_intents(id TEXT PRIMARY KEY,chat TEXT NOT NULL,message TEXT,origin TEXT NOT NULL,position INTEGER NOT NULL,status TEXT NOT NULL,held INTEGER NOT NULL DEFAULT 0,reason TEXT,projected INTEGER NOT NULL DEFAULT 1);
+      CREATE INDEX IF NOT EXISTS queue_pending ON queue_intents(status,chat,position);
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);
     `);
     if(!this.db.prepare('PRAGMA table_info(terminals)').all().some(column=>column.name==='lifecycle'))this.db.exec("ALTER TABLE terminals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'exited'; UPDATE terminals SET lifecycle=json_extract(payload,'$.lifecycle.status');");
     if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='execution_cwd'))this.db.exec('ALTER TABLE sessions ADD COLUMN execution_cwd TEXT; ALTER TABLE sessions ADD COLUMN native_location_revision INTEGER NOT NULL DEFAULT 0; UPDATE sessions SET execution_cwd=cwd');
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_execution ON sessions(execution_cwd); CREATE INDEX IF NOT EXISTS sessions_history ON sessions(cwd); UPDATE relocations SET status='unknown' WHERE status='admitted';");
+    if(!this.db.prepare('PRAGMA table_info(queue_intents)').all().some(column=>column.name==='projected'))this.db.exec('ALTER TABLE queue_intents ADD COLUMN projected INTEGER NOT NULL DEFAULT 1');
+    this.db.exec('CREATE INDEX IF NOT EXISTS queue_projection_pending ON queue_intents(projected)');
+    this.db.exec("UPDATE queue_intents SET held=1,reason='host-restarted' WHERE status='pending'");
     this.db.exec('CREATE INDEX IF NOT EXISTS terminals_lifecycle ON terminals(lifecycle,modified DESC)');
     this.replayBytes=Number(this.db.prepare('SELECT coalesce(sum(bytes),0) AS n FROM actions').get()!.n);
     // An interrupted admitted/dispatching command is never sent again automatically.
