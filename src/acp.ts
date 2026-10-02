@@ -11,6 +11,7 @@ export interface AgentHandlers {
   permission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
   hostRequest?(method: string, params: Record<string,unknown>): Promise<Record<string,unknown>>;
   nativeEvent?(params:Record<string,unknown>):Promise<void>;
+  hostCapabilities?:Record<string,unknown>;
   terminal?(event:{terminalId:string;kind:'created'|'data'|'exited';title?:string;cwd?:string;data?:string;exitCode?:number}):void;
 }
 interface Terminal {
@@ -101,7 +102,7 @@ export class AcpProcess {
     return canonical;
   }
   async initialize() {
-    this.initialized=await this.client.initialize({protocolVersion:1,clientInfo:{name:'amplifier-unified-host',version:'0.1.0'},clientCapabilities:{fs:{readTextFile:true,writeTextFile:true},terminal:true,_meta:{'amplifier.dev/native':{version:1},...(this.handlers.hostRequest?{'amplifier.dev/host':{version:1}}:{})}}});
+    this.initialized=await this.client.initialize({protocolVersion:1,clientInfo:{name:'amplifier-unified-host',version:'0.1.0'},clientCapabilities:{fs:{readTextFile:true,writeTextFile:true},terminal:true,_meta:{'amplifier.dev/native':{version:1},...(this.handlers.hostRequest?{'amplifier.dev/host':{...this.handlers.hostCapabilities,version:1}}:{})}}});
     if(this.initialized.protocolVersion!==1)throw new Error('Agent did not negotiate stable ACP version 1');
     return this.initialized;
   }

@@ -144,6 +144,25 @@ is a separate capability integration, not claimed by this package.
 Capability owners must invoke it through their admitted, authorized action path.
 It is a process-local provider API, not an unguarded network RPC endpoint.
 
+Trusted distribution capabilities share the same admission through
+`invokeCapability(request, {actorId, clientId?, origin})`. Origin is supplied by
+the authenticated entry point (`agent` or `ui`), never an action argument; MCP
+owners use it to enforce model-visible versus app-visible tools. Native callbacks
+receive only capabilities actually supplied in `nativeHostCapabilities`.
+
+Media and other user-authorized inputs use `submitTurn` with a stable command ID,
+then `waitForTurn` to obtain its actual bounded result. Timeout leaves admitted
+work running and does not resubmit. `readSessionContext` reads a selected bounded
+window without expanding another subscriber's history. `observeSession` returns
+an explicit unsubscribe and limits consumers and their event queues. Consumers
+must coalesce context refreshes instead of reading history on every token.
+`invalidateNativeHistory` makes externally recorded native messages available
+on the next history read; live voice projections use their scoped capability.
+
+Optional `clientMetadata` contributes bounded initialization metadata. The
+distribution may advertise a client-bound, read-only migration resource; the
+generic host does not import old client state, drafts or browser storage.
+
 ## Verification boundary
 
 The tests use the official AHP TypeScript client and an independent JSON-RPC ACP

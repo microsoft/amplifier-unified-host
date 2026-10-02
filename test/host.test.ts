@@ -23,6 +23,22 @@ async function setup(options:any={}) {
 function action(text:string,turnId=randomUUID()):any{return {type:'chat/turnStarted',turnId,startedAt:new Date().toISOString(),message:{text,origin:{kind:'user'}}};}
 async function waitFor(predicate:()=>unknown,timeout=5000){const deadline=Date.now()+timeout;while(Date.now()<deadline){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,10));}throw new Error('Timed out');}
 
+test('scoped capability submission uses ordinary admission and observers cannot widen unrelated histories',async()=>{
+ const f=await setup();let release:(()=>void)|undefined;try{
+  const client=await f.connect(),one=await f.create(client),two=await f.create(client),events:any[]=[];
+  release=await f.host.observeSession(one.session,event=>{events.push(event);});
+  const commandId=randomUUID();const accepted=await f.host.submitTurn(one.session,{commandId,text:'media delegation',clientId:'owned-media-client'});assert.equal(accepted.accepted,true);
+  const outcome=await f.host.waitForTurn(one.session,commandId);assert.equal(outcome.completed,true);assert.equal(outcome.workContinues,false);assert.match(outcome.text,/Echo: media delegation/);
+  await assert.rejects(f.host.waitForTurn(two.session,commandId),/No admitted turn/);await waitFor(()=>events.some(event=>event.action.type==='chat/turnComplete'));
+  await assert.rejects(f.host.submitTurn(one.session,{commandId,text:'media delegation',clientId:'owned-media-client'}),/already admitted/);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+  const selected=await f.host.readSessionContext(one.session,2);assert.match(selected.messages.at(-1)!.text,/Echo: media delegation/);assert.equal(selected.messages.length,2);
+  assert.equal((await f.host.readSessionContext(two.session,2)).messages.length,0);
+  assert.ok(events.every(event=>event.channel===one.session||event.channel===one.chat));assert.ok(events.every(event=>!event.origin||event.origin.clientSeq>=0));
+  release();release=undefined;const count=events.length,id=randomUUID();await f.host.submitTurn(one.session,{commandId:id,text:'after observer left',clientId:'owned-media-client'});await waitFor(()=>f.host.store.receipt(id)?.status==='completed');assert.equal(events.length,count);
+ }finally{release?.();await f.cleanup();}
+});
+
 test('official AHP client, two viewers, streaming reducer and durable admission',async()=>{
   const f=await setup();try {
     const a=await f.connect(),b=await f.connect(),{chat}=await f.create(a);
