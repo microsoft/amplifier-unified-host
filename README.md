@@ -430,3 +430,17 @@ individual intent; reorder alone does not. A prior unknown execution still block
 admission. Newer messages do not silently pass a held head item. Host shutdown
 prevents automatic draining. Active steering remains unavailable until its separate
 native in-flight acknowledgement contract is qualified.
+
+## Typed observation admission
+
+`submitObservation(session,{commandId,watchId,taskId,taskRevision,outcome,
+expectedExecutionRevision,expectedInterruptionRevision,expectedConfigurationHash})`
+requires the same atomic expected host revisions as scheduled work. `outcome` is a
+bounded JSON object (64 KiB), not prompt text. Native `observationTurns` negotiation
+must advertise settled completion; the native watch authority, active task CAS,
+finite iteration and tool denial remain in force. The host projects this as a
+standard `systemNotification` message with `inputOrigin:'observation'`, and exact
+user-consent lookup rejects it as non-user. It is never routed through an ordinary
+prompt, even when the engine lacks the extension. Known busy/stale preflight refuses
+without execution; terminal refusal, completion or uncertainty is recorded in the
+same durable receipts observed by `waitForTurn`. Duplicate IDs never replay.

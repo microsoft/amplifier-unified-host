@@ -55,7 +55,7 @@ export interface HostConfig {
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
-interface SettledInput {operation:'schedule.submit'|'question.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
+interface SettledInput {operation:'schedule.submit'|'question.submit'|'observation.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
 interface Active {observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
@@ -687,7 +687,7 @@ export class AmplifierHost {
     if(this.closing)throw new Error('Host is shutting down');
     const reservedQueue=this.store.db.prepare('SELECT chat,status FROM queue_intents WHERE id=?').get(action.turnId);
     if(reservedQueue&&(action.queuedMessageId!==action.turnId||reservedQueue.chat!==channel||reservedQueue.status!=='pending'))throw new Error('Command identity is reserved by a queued intent; use queue controls');
-    if(channel!==record.chat.resource||!action.turnId||typeof action.message?.text!=='string'||action.message.origin?.kind!=='user'||!Number.isFinite(Date.parse(action.startedAt)))throw new Error('Malformed user turn');
+    if(channel!==record.chat.resource||!action.turnId||typeof action.message?.text!=='string'||(action.message.origin?.kind!=='user'&&!(special?.operation==='observation.submit'&&action.message.origin?.kind==='systemNotification'))||!Number.isFinite(Date.parse(action.startedAt)))throw new Error('Malformed user turn');
     if(record.state.lifecycle!==SessionLifecycle.Ready)throw new Error('Session creation has not completed; reconcile its outcome before execution');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; queued turns and steering are not advertised');
@@ -696,7 +696,7 @@ export class AmplifierHost {
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
     if(special){
-      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':'questionTurns'];
+      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':special.operation==='question.submit'?'questionTurns':'observationTurns'];
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
       if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
@@ -765,6 +765,19 @@ export class AmplifierHost {
       }catch(error){if(this.store.receipt(input.commandId))throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});return {accepted:false,executed:false,reason:(error as Error).message};}
     });
   }
+  /** A finite typed observation, never a user prompt or authority to execute embedded instructions. */
+  async submitObservation(session:string,input:{commandId:string;watchId:string;taskId:string;taskRevision:number;outcome:Json;expectedExecutionRevision:number;expectedInterruptionRevision:number;expectedConfigurationHash:string}) {
+    if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||![input.watchId,input.taskId].every(id=>typeof id==='string'&&id.length>0&&id.length<=200)||![input.taskRevision,input.expectedExecutionRevision,input.expectedInterruptionRevision].every(value=>Number.isSafeInteger(value)&&value>=0)||typeof input.expectedConfigurationHash!=='string'||!input.outcome||typeof input.outcome!=='object'||Array.isArray(input.outcome)||Buffer.byteLength(JSON.stringify(input.outcome))>65536)throw new RpcFault(-32602,'Bounded typed observation and expected admission revisions required');
+    const record=await this.record(session);
+    return this.withLock(record.uri,async()=>{
+      if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Observation command already admitted; inspect its receipt without replay');
+      try{
+        const metadata={inputOrigin:'observation',watchId:input.watchId,taskId:input.taskId,taskRevision:input.taskRevision};
+        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:JSON.stringify({contract:'amplifier.observation.v1',watchId:input.watchId,result:input.outcome}),origin:{kind:'systemNotification'},_meta:{'amplifier.dev/input':metadata}}} as any,{clientId:'host:observation',clientSeq:this.store.extensionSequence('host:observation')},{operation:'observation.submit',args:{watchId:input.watchId,taskId:input.taskId,taskRevision:input.taskRevision,outcome:input.outcome},expected:{executionRevision:input.expectedExecutionRevision,interruptionRevision:input.expectedInterruptionRevision,configurationHash:input.expectedConfigurationHash}});
+        return {accepted:true,turnId:input.commandId,receipt:this.store.receipt(input.commandId)};
+      }catch(error){if(this.store.receipt(input.commandId))throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});return {accepted:false,executed:false,reason:(error as Error).message};}
+    });
+  }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
   async waitForTurn(session:string,commandId:string,timeoutMs=600000) {
     const record=await this.record(session),receipt=this.store.receipt(commandId);
@@ -806,7 +819,7 @@ export class AmplifierHost {
       const history=turn.message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=turn.message._meta?.['amplifier.dev/scheduled'] as Json|undefined,input=turn.message._meta?.['amplifier.dev/input'] as Json|undefined,receipt=this.store.receipt(turn.id);
       const questionId=input?.questionId??history?.questionId,scheduledRunId=scheduled?.scheduledRunId??input?.scheduledRunId??history?.scheduledRunId;
       const provenance={createdAt:history?.createdAt??turn.startedAt,inputOrigin:scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??(receipt?.channel===record.chat.resource?'user':'unknown'),...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(history?.via==='call'?{voiceId:history.callId,voiceItemId:history.itemId}:{}),...(history?.authorization?{authorization:history.authorization}:{})};
-      if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
+      if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':turn.message.origin?.kind==='systemNotification'?'system':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
       const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
       if(text)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
     }
@@ -1127,7 +1140,8 @@ export class AmplifierHost {
     session=(await this.record(session)).uri;
     if(this.relocationFence(session))throw new RpcFault(-32011,'Session relocation is fenced; no runtime control was dispatched');
     if(operation==='session.relocate')throw new RpcFault(-32602,'Relocation requires relocateSession admission');
-    if(operation==='schedule.submit'||operation==='question.submit')throw new RpcFault(-32602,'Execution requires submitScheduled or submitQuestionAnswer admission');
+    const admissionMethod:Record<string,string>={'schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation'};
+    if(admissionMethod[operation])throw new RpcFault(-32602,`Execution requires ${admissionMethod[operation]} admission`);
     const execute=async()=>{
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
       if(!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32008,'No existing owned native runtime; no process was started');

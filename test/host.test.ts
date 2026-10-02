@@ -534,3 +534,13 @@ test('pending queue count and bytes are bounded; admission crash recovery remove
   assert.equal(restarted.store.receipt(id).status,'unknown');assert.ok(!restarted.store.get(session).chat.queuedMessages.some((message:any)=>message.id===id));assert.equal(restarted.diagnostics().activeAgents,0);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
  }finally{if(restarted)await restarted.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
 });
+
+test('typed observations share revision admission and remain system input rather than human consent',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),before=await f.host.inspectSession(session),input={commandId:randomUUID(),watchId:'watch-1',taskId:'task-1',taskRevision:3,outcome:{status:'changed',evidence:'untrusted observation text'},expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash};
+  assert.equal((await f.host.submitObservation(session,input)).accepted,true);assert.equal((await f.host.waitForTurn(session,input.commandId)).status,'completed');
+  const wire=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(wire.operation,'observation.submit');assert.deepEqual(wire.args.outcome,input.outcome);assert.equal(wire.args.text,undefined);assert.equal(wire.prompt,undefined);
+  const context=await f.host.readSessionContext(session,2);assert.equal(context.messages[0].role,'system');assert.equal(context.messages[0].inputOrigin,'observation');await assert.rejects(f.host.readUserMessage(session,input.commandId),(e:any)=>e.reason==='not-user');
+  const stale=await f.host.submitObservation(session,{...input,commandId:randomUUID()});assert.equal(stale.accepted,false);assert.equal(stale.executed,false);assert.match(stale.reason!,/revisions changed/);await assert.rejects(f.host.submitObservation(session,input),/already admitted/);await assert.rejects(f.host.nativeControl(session,'observation.submit',{}),/submitObservation admission/);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});

@@ -104,3 +104,15 @@ test('actual Core/Foundation question admission preserves canonical answer prove
   await assert.rejects(host.submitQuestionAnswer(session,answer),/already admitted/);assert.equal(proofs.length,1);
  }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
 });
+
+test('actual Core/Foundation typed observation uses finite native admission and settles its authoritative outcome',{skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-observation-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!),{randomUUID}=await import('node:crypto');let allow=false,calls=0;
+ const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}],nativeHostCapabilities:{version:1,features:{observation:true}},nativeHostRequest:async(_context,request)=>{assert.equal(request.operation,'observation.admit');calls++;return {admitted:allow,reason:allow?undefined:'Saved watch changed'};}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'observation-integration',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID();await client.request('createSession',{channel:session,provider:'amplifier',workingDirectories:[pathToFileURL(workspace).href]});
+  const created=await host.nativeControl(session,'task.create',{objective:'Finite typed observation qualification',maxTurns:3,commandId:randomUUID(),expectedRevision:0}),task=created.task;
+  const submit=async()=>{const current=await host.inspectSession(session),input={commandId:randomUUID(),watchId:'fixture-watch',taskId:task.id,taskRevision:task.revision,outcome:{status:'changed',summary:'Observed artifact changed'},expectedExecutionRevision:current.executionRevision,expectedInterruptionRevision:current.interruptionRevision,expectedConfigurationHash:current.configurationHash};assert.equal((await host.submitObservation(session,input)).accepted,true);return {input,result:await host.waitForTurn(session,input.commandId)};};
+  const denied=await submit();assert.equal(denied.result.status,'failed');allow=true;const accepted=await submit();assert.equal(accepted.result.status,'completed');assert.match(accepted.result.text,/Native graph reply/);assert.equal(calls,2);
+  const context=await host.readSessionContext(session,2);assert.equal(context.messages[0].inputOrigin,'observation');assert.equal(context.messages[0].role,'system');await assert.rejects(host.readUserMessage(session,accepted.input.commandId),(e:any)=>e.reason==='not-user');await assert.rejects(host.submitObservation(session,accepted.input),/already admitted/);assert.equal(calls,2);
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});
