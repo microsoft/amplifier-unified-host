@@ -581,3 +581,14 @@ test('turn settlement callback follows durable receipt and lock release, isolate
   for(const client of f.clients)await client.shutdown();await rm(f.dir,{recursive:true,force:true});
  }
 });
+
+test('persisted task inspection stays passive and refuses a stale source revision',async()=>{
+ const f=await setup();try{
+  const timestamp=new Date().toISOString(),session='ahp-session:/cold-task';
+  f.host.config.catalog={list:async()=>({items:[]}),get:async()=>({uri:session,engineId:'fixture',nativeSessionId:'native-task',workingDirectory:f.dir,title:'Task',createdAt:timestamp,modifiedAt:timestamp}),upsert:async()=>{}};
+  const task=await f.host.readTaskState(session);assert.equal(task.source,'persisted-native-controls');assert.equal((task.task as any).revision,7);assert.equal(task.available,true);assert.equal(f.host.diagnostics().activeAgents,0);
+  assert.equal((await f.host.readTaskState(session,{expectedRevision:String(task.revision)})).revision,task.revision);
+  await assert.rejects(f.host.readTaskState(session,{expectedRevision:'stale'}),/revision changed/);
+  await assert.rejects(readFile(f.log,'utf8'),/ENOENT/);assert.equal(await readFile(f.log+'.passive','utf8'),'task\ntask\ntask\n');
+ }finally{await f.cleanup();}
+});

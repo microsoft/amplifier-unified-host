@@ -456,3 +456,9 @@ Callbacks may use public host APIs and must complete their own bounded work.
 Shutdown drains already accepted callbacks. `readSessionContext` includes the
 current admitted active input in its bounded selected window; provenance checks
 still use exact `readUserMessage`, never a truncated context row.
+
+`readTaskState(session, {expectedRevision?})` reads the selected agent's persisted
+task through negotiated `taskState` passive inspection. It never resumes a
+runtime, scans history, or invents an empty task for an unavailable source. The
+result preserves `{available, revision, task, source}` from the native storage
+owner, enforces a 32 KiB task bound, and rejects a changed expected revision.

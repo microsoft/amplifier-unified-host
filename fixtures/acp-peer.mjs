@@ -9,7 +9,7 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},taskState:{version:1,passive:true},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
   else if(message.method==='_amplifier/retire'){
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
@@ -27,6 +27,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.runtime.loss'){
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});setTimeout(()=>process.exit(17),20);
   }
+  else if(message.method==='_amplifier/task/inspect'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.passive','task\n');reply(message.id,{available:true,revision:'task-revision',task:{id:'task-1',revision:7,objective:'Bounded persisted task'},source:'persisted-native-controls'});}
   else if(message.method==='_amplifier/history/inspect'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.passive','inspect\n');reply(message.id,{available:!!process.env.FIXTURE_HISTORY,revision:process.env.FIXTURE_HISTORY?'fixture-revision':null,diagnostics:[]});}
   else if(message.method==='_amplifier/history'){
     if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.passive','page\n');

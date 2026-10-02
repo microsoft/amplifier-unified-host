@@ -280,6 +280,22 @@ export class AmplifierHost {
       return await agent.client.extMethod(operation==='inspect'?'_amplifier/history/inspect':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,...params});
     }finally{this.passiveReads--;await agent.retire();}
   }
+  /** Selected persisted task authority; never mounts or resumes the native runtime. */
+  async readTaskState(session:string,input:{expectedRevision?:string}={}) {
+    if(input.expectedRevision!==undefined&&(typeof input.expectedRevision!=='string'||!input.expectedRevision||input.expectedRevision.length>512))throw new RpcFault(-32602,'Bounded expected task source revision required');
+    const record=await this.record(session),engine=this.config.engines.find(engine=>engine.id===record.engineId);
+    if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Passive native task state is unavailable');
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
+    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}})});
+    try{
+      const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.taskState;
+      if(capability?.version!==1||capability.passive!==true)throw new RpcFault(-32601,'Agent does not advertise passive persisted task state');
+      const result=await agent.client.extMethod('_amplifier/task/inspect',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,...input});
+      if(typeof result.available!=='boolean'||result.source!=='persisted-native-controls'||(result.revision!==null&&(typeof result.revision!=='string'||result.revision.length>512))||Buffer.byteLength(JSON.stringify(result))>65536||result.task!==null&&(typeof result.task!=='object'||Array.isArray(result.task)||Buffer.byteLength(JSON.stringify(result.task))>32768))throw new RpcFault(-32000,'Invalid or oversized persisted task state');
+      if(input.expectedRevision!==undefined&&result.revision!==input.expectedRevision)throw new RpcFault(-32011,'Persisted task source revision changed');
+      return result;
+    }finally{this.passiveReads--;await agent.retire();}
+  }
   /** Storage-owner stat only. Missing/unsupported history is explicit, never an empty success. */
   async inspectRecallSource(id:string) {
     const {source,record}=await this.recallSource(id),result=await this.passiveRecall(record,'inspect');
