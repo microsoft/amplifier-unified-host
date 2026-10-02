@@ -1,0 +1,42 @@
+{
+  "name": "@amplifier/unified-host",
+  "version": "0.1.0",
+  "description": "Generic durable AHP host for ACP agents",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "tsc --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.5.0",
+    "@microsoft/agent-host-protocol": "^0.9.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  },
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "bin": {
+    "amplifier-unified-host": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22.16"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}
