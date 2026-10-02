@@ -27,3 +27,25 @@ test('independent catalog process + real Amplifier passive ACP history, with no 
     assert.equal(host.diagnostics().activeAgents,0);assert.equal(await readFile(transcript,'utf8'),source);
   } finally {await client.shutdown();await host.close();await rm(temp,{recursive:true,force:true});}
 });
+
+test('real Core/Foundation scheduled work and exact source configuration clone use public host admission', {skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-schedule-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!);
+ const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}]});
+ const transport=await WebSocketTransport.connect(host.url),client=new AhpClient(transport);client.connect();
+ try{
+  await client.initialize({clientId:'scheduled-interop',protocolVersions:['0.9.0']});
+  const {randomUUID}=await import('node:crypto'),session='ahp-session:/'+randomUUID();
+  await client.request('createSession',{channel:session,workingDirectories:[new URL('file://'+workspace).href]});
+  await host.nativeControl(session,'budget.set',{contextTokens:4321});
+  const made=await host.nativeControl(session,'task.create',{objective:'Finite offline qualification',maxTurns:3,commandId:'qualification-task',expectedRevision:0}),task=made.task;
+  const before=await host.inspectSession(session),commandId=randomUUID();
+  const accepted=await host.submitScheduled(session,{commandId,text:'Finite offline monitor',taskId:task.id,taskRevision:task.revision,kind:'monitor',expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash});
+  assert.equal(accepted.accepted,true);
+  const outcome=await host.waitForTurn(session,commandId,30000);assert.equal(outcome.completed,true,JSON.stringify(outcome));assert.match(outcome.text,/Native graph reply/);
+  const selected=await host.readSessionContext(session);assert.equal(selected.messages[0].inputOrigin,'scheduled');
+  const after=await host.inspectSession(session),created=await host.createSession({commandId:randomUUID(),idempotencyKey:randomUUID(),sourceSession:session,expectedConfigurationHash:after.configurationHash,title:'Configured clone'});
+  assert.equal(created.creationConfirmed,true);assert.equal((await host.nativeControl(created.uri,'task.get',{})).task,null);
+  const budget=await host.nativeControl(created.uri,'budget.get',{});assert.equal(budget.contextTokens??budget.budget?.contextTokens,4321);
+  assert.equal((await host.readSessionContext(created.uri)).messages.length,0);
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});

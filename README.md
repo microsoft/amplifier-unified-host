@@ -21,7 +21,7 @@ node dist/cli.js --config /absolute/host.json
 
 Installed executable: `amplifier-unified-host --config /absolute/host.json`.
 The published API is `createHost(config)` and the returned host's `url`,
-`inspectSession`, `nativeControl`, `invokeClientTool`, `invalidateCapability`,
+`inspectSession`, `createSession`, `submitScheduled`, `nativeControl`, `invokeClientTool`, `invalidateCapability`,
 `diagnostics`, and `close` methods. `npm pack` produces a standalone artifact.
 
 ```json
@@ -143,6 +143,8 @@ is a separate capability integration, not claimed by this package.
 `nativeControl` uses the negotiated ACP extension, with no native runtime import.
 Capability owners must invoke it through their admitted, authorized action path.
 It is a process-local provider API, not an unguarded network RPC endpoint.
+`nativeControlExisting` refuses cold or retired runtimes without starting a process;
+operation write/cancel uses this seam to preserve original runtime ownership.
 
 Trusted distribution capabilities share the same admission through
 `invokeCapability(request, {actorId, clientId?, origin})`. Origin is supplied by
@@ -162,6 +164,41 @@ on the next history read; live voice projections use their scoped capability.
 Optional `clientMetadata` contributes bounded initialization metadata. The
 distribution may advertise a client-bound, read-only migration resource; the
 generic host does not import old client state, drafts or browser storage.
+
+## Scheduled and source-configured admission
+
+`inspectSession(uri)` reads selected metadata without starting an agent, including
+`executionRevision`, `interruptionRevision` and `configurationHash`. Revisions
+are durable and shared with standard user turn, cancellation and configuration
+actions. The hash describes host-observed configuration and the trusted engine
+configuration; it does not claim detection of arbitrary out-of-band native edits.
+
+`submitScheduled(uri, {commandId, text, taskId, taskRevision, kind,
+expectedExecutionRevision, expectedInterruptionRevision,
+expectedConfigurationHash, scheduledRunId?})` compares all three expected values
+inside the ordinary session admission lock. `kind` is `task` or `monitor`.
+Its `{accepted:true, turnId, receipt}` confirms durable **host admission**;
+`waitForTurn` or the receipt supplies the later conclusive native result.
+The negotiated native `schedule.submit` validates saved task revision, idle state
+and continuation policy, emits normal ACP updates, and returns only on settlement.
+A pre-execution native rejection becomes a failed receipt; uncertain transport
+outcomes become unknown. No path substitutes an ordinary prompt, resends an input,
+or bypasses stop ordering. Generic engines without this extension refuse it.
+
+`createSession({commandId, idempotencyKey, sourceSession,
+expectedConfigurationHash, title?})` captures an opaque native configuration
+reference, reserves a stable destination identity and uses the same creation
+path as standard AHP `createSession`. The native storage owner clones the exact
+configuration into the same workspace; no transcript, tasks or goals are copied.
+Configuration references and actual engine state remain behind ACP. Completed
+identical calls return `{uri, creationConfirmed:true, receipt}`; changed arguments
+or uncertain creation never trigger another native creation. Native configuration
+cloning must be explicitly advertised. These APIs are trusted capability-provider
+seams, not new unguarded network methods.
+
+`readSessionContext` includes stable IDs, input provenance, creation time and an
+explicit truncation marker. It reads at most 50 selected messages; callers cannot
+treat missing older authorization as proof that authorization never existed.
 
 ## Verification boundary
 

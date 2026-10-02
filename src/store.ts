@@ -45,6 +45,8 @@ export class Store {
       DROP INDEX IF EXISTS receipt_origin;
       CREATE INDEX IF NOT EXISTS receipt_origin_lookup ON receipts(client_id,client_seq);
       CREATE TABLE IF NOT EXISTS terminals(uri TEXT PRIMARY KEY,session TEXT NOT NULL,modified TEXT NOT NULL,payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS session_admission(uri TEXT PRIMARY KEY,execution INTEGER NOT NULL DEFAULT 0,interruption INTEGER NOT NULL DEFAULT 0,configuration INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS creation_keys(identity TEXT PRIMARY KEY,command_id TEXT NOT NULL,uri TEXT NOT NULL,fingerprint TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);
     `);
@@ -145,6 +147,14 @@ export class Store {
   }
   unknown(channel: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM receipts WHERE channel=? AND json_extract(payload,'$.status')='unknown' LIMIT 1").get(channel);
+  }
+  revisions(uri:string):{executionRevision:number;interruptionRevision:number;configurationRevision:number} {
+    const row=this.db.prepare('SELECT * FROM session_admission WHERE uri=?').get(uri);
+    return {executionRevision:Number(row?.execution??0),interruptionRevision:Number(row?.interruption??0),configurationRevision:Number(row?.configuration??0)};
+  }
+  bump(uri:string,kind:'execution'|'interruption'|'configuration') {
+    this.db.prepare('INSERT OR IGNORE INTO session_admission(uri) VALUES(?)').run(uri);
+    this.db.prepare(`UPDATE session_admission SET ${kind}=${kind}+1 WHERE uri=?`).run(uri);
   }
   close() { this.db.close();closeSync(this.lease!);if(JSON.parse(readFileSync(this.leasePath,'utf8')).incarnation===this.incarnation)unlinkSync(this.leasePath); }
 }

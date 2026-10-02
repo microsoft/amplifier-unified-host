@@ -132,6 +132,7 @@ test('server restart preserves history/native identity and marks an uncompleted 
     const identity=f.host.store.get(session)!.nativeSessionId;
     f.host.store.transaction(()=>f.host.store.admission(chat,action('ambiguous','uncertain'),'uncertain','offline-client',99));
     await a.shutdown();await f.host.close();replacement=await createHost(f.config);
+    await assert.rejects(replacement.nativeControlExisting(session,'operations.write',{operationId:'old',text:'must not restart'}),/No existing owned native runtime/);assert.equal(replacement.diagnostics().activeAgents,0);
     assert.equal(replacement.store.get(session).nativeSessionId,identity);assert.equal(replacement.store.turns(chat).turns.length,1);assert.equal(replacement.store.receipt('uncertain').status,'unknown');
     assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
   }finally{if(replacement)await replacement.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
@@ -207,4 +208,66 @@ test('streaming appends narrow durable events instead of rewriting the active re
     assert.ok(checkpointWrites<15,`Unexpected full checkpoint writes: ${checkpointWrites}`);assert.ok(checkpointBytes<30000);assert.equal((f.host.store.turns(chat).turns[0].responseParts[0] as any).content.length,100);
     assert.equal(Number(f.host.store.db.prepare('SELECT count(*) AS n FROM active_events').get()!.n),0);
   }finally{await f.cleanup();}
+});
+
+
+test('scheduled admission compares durable revisions, shares stop lifecycle, and never becomes a plain prompt',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session,chat}=await f.create(client);await client.subscribe(chat,{view:{turns:10}});
+  const before=await f.host.inspectSession(session);
+  const input={commandId:randomUUID(),text:'slow',taskId:'task',taskRevision:1,kind:'monitor' as const,expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash};
+  const [first,second]=await Promise.all([f.host.submitScheduled(session,input),f.host.submitScheduled(session,{...input,commandId:randomUUID()})]);
+  assert.equal(first.accepted,true);assert.equal(second.accepted,false);
+  client.dispatch(chat,{type:'chat/turnCancelled',turnId:input.commandId,duration:0});
+  await waitFor(()=>f.host.store.receipt(input.commandId)?.status==='cancelled');
+  const after=await f.host.inspectSession(session);assert.equal(after.executionRevision,before.executionRevision+1);assert.equal(after.interruptionRevision,before.interruptionRevision+1);
+  const stale=await f.host.submitScheduled(session,{...input,commandId:randomUUID()});assert.equal(stale.accepted,false);
+  await assert.rejects(f.host.submitScheduled(session,input),/already admitted/);
+  await assert.rejects(f.host.nativeControl(session,'schedule.submit',{}),/submitScheduled/);
+  const recorded=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(recorded.operation,'schedule.submit');assert.equal(recorded.args.inputId,input.commandId);assert.equal(recorded.args.taskRevision,1);
+  const context=await f.host.readSessionContext(session);assert.equal(context.messages[0].inputOrigin,'scheduled');assert.equal(context.messages[0].scheduledRunId,input.commandId);
+  const rejectedId=randomUUID();assert.equal((await f.host.submitScheduled(session,{...input,commandId:rejectedId,taskRevision:99,expectedExecutionRevision:after.executionRevision,expectedInterruptionRevision:after.interruptionRevision})).accepted,true);
+  await waitFor(()=>f.host.store.receipt(rejectedId)?.status==='failed');
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});
+
+test('source-config creation shares durable creation and rejects changed or uncertain reuse',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),before=await f.host.inspectSession(session);
+  const input={commandId:randomUUID(),idempotencyKey:'scheduled-once',sourceSession:session,expectedConfigurationHash:before.configurationHash,title:'Created task'};
+  const created=await f.host.createSession(input);assert.equal(created.creationConfirmed,true);assert.equal((await f.host.inspectSession(created.uri)).title,'Created task');
+  assert.equal((await f.host.createSession(input)).uri,created.uri);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+  await assert.rejects(f.host.createSession({...input,title:'different'}),/reused/);
+  await client.subscribe(session);client.dispatch(session,{type:'session/configChanged',config:{mode:'fast'}});
+  await waitFor(()=>f.host.store.get(session)?.state.config?.values?.mode==='fast');
+  await assert.rejects(f.host.createSession({...input,commandId:randomUUID(),idempotencyKey:'after-change'}),/configuration changed/);
+  assert.equal((await f.host.submitScheduled(session,{commandId:randomUUID(),text:'must not execute',taskId:'t',taskRevision:1,kind:'task',expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash})).accepted,false);
+ }finally{await f.cleanup();}
+});
+
+test('lost native creation response remains unknown and is never sent again',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client);f.config.engines[0].env.FIXTURE_CLONE_CRASH='1';
+  const before=await f.host.inspectSession(session),input={commandId:randomUUID(),idempotencyKey:'lost-once',sourceSession:session,expectedConfigurationHash:before.configurationHash};
+  await assert.rejects(f.host.createSession(input));assert.equal(f.host.store.receipt(input.commandId)?.status,'unknown');
+  await assert.rejects(f.host.createSession(input),/unknown or incomplete/);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});
+
+
+test('scheduled revisions and unknown creation receipts survive host restart without native replay',async()=>{
+ const f=await setup();let replacement:any;try{
+  const client=await f.connect(),{session,chat}=await f.create(client),before=await f.host.inspectSession(session);
+  const input={commandId:randomUUID(),text:'finished',taskId:'t',taskRevision:1,kind:'task' as const,expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash};
+  await f.host.submitScheduled(session,input);await waitFor(()=>f.host.store.receipt(input.commandId)?.status==='completed');
+  const revision=(await f.host.inspectSession(session)).executionRevision;
+  const pending=randomUUID();f.host.store.transaction(()=>{f.host.store.admission(chat,{scheduled:true},pending,'host:schedule',-99);f.host.store.bump(session,'execution');});
+  await client.shutdown();await f.host.close();replacement=await createHost(f.config);
+  assert.equal((await replacement.inspectSession(session)).executionRevision,revision+1);
+  assert.equal(replacement.store.receipt(pending).status,'unknown');
+  assert.equal((await replacement.submitScheduled(session,{...input,commandId:randomUUID()})).accepted,false);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{if(replacement)await replacement.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
 });

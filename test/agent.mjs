@@ -8,18 +8,22 @@ const reply=(id,result)=>send({id,result});
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined){pending.get(message.id)?.(message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
   else if(message.method==='_amplifier/history'){
     const groups=JSON.parse(readFileSync(process.env.FIXTURE_HISTORY,'utf8'));const end=p.cursor?Number(p.cursor):groups.length,start=Math.max(0,end-p.limit);
     reply(message.id,{turnGroups:groups.slice(start,end),revision:'fixture-revision',diagnostics:[],nextCursor:start?String(start):null});
   }
+  else if(message.method==='_amplifier/native'&&p.operation==='configuration.snapshot')reply(message.id,{version:1,sourceSessionId:p.sessionId,sourceCwd:process.cwd(),configurationHash:'fixture-native-config'});
+  else if(message.method==='_amplifier/session/new'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({creation:p})+'\n');if(process.env.FIXTURE_CLONE_CRASH)process.exit(17);sessions.set(p.sessionId,{});reply(message.id,{sessionId:p.sessionId,configOptions:[],_meta:{'amplifier.dev/native':{creationConfirmed:true,configurationHash:p.source.configurationHash}}});}
   else if(message.method==='session/new'){const sessionId='native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});reply(message.id,{sessionId,configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});}
   else if(message.method==='session/resume'||message.method==='session/load'){sessions.set(p.sessionId,{});reply(message.id,{configOptions:[]});}
   else if(message.method==='session/set_config_option')reply(message.id,{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:p.value,options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});
   else if(message.method==='session/close')reply(message.id,{});
-  else if(message.method==='session/prompt'){
+  else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&p.operation==='schedule.submit'){
+    const scheduled=message.method==='_amplifier/native';
+    if(scheduled&&p.args.taskRevision===99){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}
     if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify(p)+'\n');
-    const text=p.prompt.filter(b=>b.type==='text').map(b=>b.text).join(' '),id=message.id;
+    const text=scheduled?p.args.text:p.prompt.filter(b=>b.type==='text').map(b=>b.text).join(' '),id=message.id;
     active={id,sessionId:p.sessionId,cancelled:false};
     void(async()=>{
       const turn=active;
@@ -43,7 +47,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       }
       if(text==='many')for(let i=0;i<100;i++)update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'x'}});
       else update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Echo: '+text}});
-      reply(id,{stopReason:turn.cancelled?'cancelled':'end_turn'});
+      reply(id,{...(scheduled?{accepted:true,inputId:p.args.inputId}:{}),stopReason:turn.cancelled?'cancelled':'end_turn'});
     })();
   } else if(message.method==='session/cancel'){if(active)active.cancelled=true;}
   else if(message.id!==undefined)send({id:message.id,error:{code:-32601,message:'Unsupported'}});

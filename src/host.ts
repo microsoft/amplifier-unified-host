@@ -304,7 +304,7 @@ export class AmplifierHost {
         if(rows.length>limit){nextCursor=randomUUID();const last=items.at(-1)!;peer.cursors.set(nextCursor,{modified:last.modifiedAt,uri:last.resource});if(peer.cursors.size>256)peer.cursors.delete(peer.cursors.keys().next().value!);}
         return {items,nextCursor};
       }
-      case 'createSession':return this.createSession(p);
+      case 'createSession':return this.createSessionResource(p);
       case 'fetchTurns': {
         const record=await this.record(p.channel);if(p.channel!==record.chat.resource)throw new RpcFault(-32602,'fetchTurns requires chat channel');
         const native=this.nativeCursors.get(p.cursor);
@@ -353,7 +353,7 @@ export class AmplifierHost {
       default:throw new RpcFault(-32601,`Unsupported AHP method: ${method}`);
     }
   }
-  private async createSession(p:Json) {
+  private async createSessionResource(p:Json,creation?:{sessionId:string;source:Json;commandId:string}) {
     if(typeof p.channel!=='string'||!/^ahp-session:\/[A-Za-z0-9_-]{1,200}$/.test(p.channel))throw new RpcFault(-32602,'Invalid client-chosen session URI');
     return this.withLock(p.channel,async()=>{
       if(this.getRecord(p.channel))throw new RpcFault(-32003,'Session already exists');
@@ -361,18 +361,21 @@ export class AmplifierHost {
       const cwd=await this.workspace(p.workingDirectories?.[0]);
       if(p.activeClient)throw new RpcFault(-32602,'Register active client tools after subscribing to the new session');
       if(Object.keys(p.config??{}).length)throw new RpcFault(-32602,'Creation configuration is not advertised; use negotiated session selectors');
-      const timestamp=now(),chat:ChatState={resource:chatURI(p.channel),title:'New conversation',status:1,modifiedAt:timestamp,turns:[]};
+      const creationCommand=creation?.commandId??'create:'+p.channel;
+      this.store.transaction(()=>this.store.admission(p.channel,{kind:'session.create',params:p},creationCommand,'host:creation',this.store.extensionSequence('host:creation')));
+      const timestamp=now(),chat:ChatState={resource:chatURI(p.channel),title:p.title??'New conversation',status:1,modifiedAt:timestamp,turns:[]};
       const summary:SessionSummary={resource:p.channel,provider:engine.id,title:chat.title,status:1,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(cwd).href]};
       const state:SessionState={provider:engine.id,title:chat.title,status:1,lifecycle:SessionLifecycle.Creating,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories};
       this.store.save({uri:p.channel,engineId:engine.id,workingDirectory:cwd,summary,state,chat});
       this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);
       this.notify('root/sessionAdded',{channel:ROOT,summary});
-      try {await this.ensureAgent(p.channel);this.emit(p.channel,{type:'session/ready'} as StateAction);}
-      catch(error){this.emit(p.channel,{type:'session/creationFailed',error:{message:(error as Error).message}} as StateAction);throw error;}
+      this.store.finish(creationCommand,'dispatching');
+      try {await this.ensureAgent(p.channel,creation);this.emit(p.channel,{type:'session/ready'} as StateAction);this.store.finish(creationCommand,'completed');}
+      catch(error){this.store.finish(creationCommand,'unknown',(error as Error).message);this.emit(p.channel,{type:'session/creationFailed',error:{message:(error as Error).message}} as StateAction);throw error;}
       await this.syncCatalog(this.getRecord(p.channel)!);return null;
     });
   }
-  private async ensureAgent(uri:string):Promise<Active> {
+  private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
     const existing=this.active.get(uri);if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
@@ -407,7 +410,7 @@ export class AmplifierHost {
           return this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId,workingDirectory:record.workingDirectory},params);
         }}:{}),
       });active.agent=agent;this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId);const fresh=this.getRecord(uri)!;fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[]}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??[]);return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation);const fresh=this.getRecord(uri)!;fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[]}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??[]);return active;}
       catch(error){this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
   }
@@ -479,6 +482,7 @@ export class AmplifierHost {
           const active=this.active.get(record.uri);
           if(!active?.busy||active.turnId!==action.turnId)throw new Error('No matching active turn');
           if(active.cancel)throw new Error('Cancellation already requested');
+          this.store.bump(record.uri,'interruption');
           active.cancel={action,origin};
           for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();
           await active.agent.client.cancel({sessionId:active.agent.nativeId!});
@@ -512,7 +516,8 @@ export class AmplifierHost {
       });
     } catch(error) {this.emit(p.channel,action,origin,(error as Error).message);}
   }
-  private async admitTurn(record:SessionRecord,channel:string,action:Extract<StateAction,{type:'chat/turnStarted'}>,origin:NonNullable<ActionEnvelope['origin']>) {
+  private async admitTurn(record:SessionRecord,channel:string,action:Extract<StateAction,{type:'chat/turnStarted'}>,origin:NonNullable<ActionEnvelope['origin']>,scheduled?:Json) {
+    record=this.getRecord(record.uri)!;
     if(channel!==record.chat.resource||!action.turnId||typeof action.message?.text!=='string'||action.message.origin?.kind!=='user'||!Number.isFinite(Date.parse(action.startedAt)))throw new Error('Malformed user turn');
     if(record.state.lifecycle!==SessionLifecycle.Ready)throw new Error('Session creation has not completed; reconcile its outcome before execution');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
@@ -520,9 +525,14 @@ export class AmplifierHost {
     const blocks=this.prompt(action.message),active=await this.ensureAgent(record.uri);
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
-    this.store.transaction(()=>this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq));
+    if(scheduled){
+      if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.scheduledTurns?.version!==1)throw new Error('Agent does not advertise settled scheduled turns');
+      const current=await this.inspectSession(record.uri);
+      if(current.interruptionRevision!==scheduled.expectedInterruptionRevision||current.executionRevision!==scheduled.expectedExecutionRevision||current.configurationHash!==scheduled.expectedConfigurationHash)throw new Error('Scheduled admission revisions changed');
+    }
+    this.store.transaction(()=>{this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);this.store.bump(record.uri,'execution');});
     active.busy=true;active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();
-    this.emit(channel,action,origin.clientSeq>=0?origin:undefined);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks);
+    this.emit(channel,action,origin.clientSeq>=0?origin:undefined);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,scheduled);
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */
   async submitTurn(session:string,input:{commandId:string;text:string;clientId:string;attachments?:Message['attachments']}) {
@@ -531,6 +541,45 @@ export class AmplifierHost {
     const record=await this.record(session);
     await this.withLock(record.uri,async()=>{if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Command already admitted; inspect its durable receipt before new work');await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:'user'},...(input.attachments?{attachments:input.attachments}:{})}} as any,{clientId:input.clientId,clientSeq:this.store.extensionSequence(input.clientId)});});
     return {accepted:true,inputId:input.commandId,sessionId:record.uri,delivery:'sending',receipt:this.store.receipt(input.commandId)};
+  }
+  /** Durable common creation for a configured source; no native history or goals are copied. */
+  async createSession(input:{commandId:string;idempotencyKey:string;sourceSession:string;expectedConfigurationHash:string;title?:string}) {
+    if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.idempotencyKey!=='string'||!input.idempotencyKey||input.idempotencyKey.length>512||typeof input.expectedConfigurationHash!=='string'||(input.title!==undefined&&(typeof input.title!=='string'||input.title.length>1000)))throw new RpcFault(-32602,'Bounded creation identity and expected configuration required');
+    const source=await this.record(input.sourceSession),identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
+    const nativeId=identity.slice(0,8)+'-'+identity.slice(8,12)+'-5'+identity.slice(13,16)+'-a'+identity.slice(17,20)+'-'+identity.slice(20,32),uri='ahp-session:/'+nativeId;
+    const fingerprint=createHash('sha256').update(JSON.stringify(input)).digest('hex');
+    return this.withLock(source.uri,async()=>{
+      const prior=this.store.db.prepare('SELECT * FROM creation_keys WHERE identity=?').get(identity);
+      if(prior){
+        if(prior.fingerprint!==fingerprint)throw new RpcFault(-32011,'Creation identity reused with different content');
+        const receipt=this.store.receipt(String(prior.command_id)),record=this.getRecord(uri);
+        if(receipt?.status==='completed'&&record?.state.lifecycle===SessionLifecycle.Ready)return {uri,creationConfirmed:true as const,receipt};
+        throw new RpcFault(-32011,'Creation outcome unknown or incomplete; it must not be automatically repeated');
+      }
+      if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed');
+      const active=await this.ensureAgent(source.uri);
+      if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.configurationClone?.version!==1)throw new RpcFault(-32601,'Agent does not advertise exact configuration cloning');
+      if(active.busy)throw new RpcFault(-32011,'Source must be idle while its configuration is captured');
+      const snapshot=await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'configuration.snapshot',args:{}});
+      if(snapshot.version!==1||snapshot.sourceSessionId!==active.agent.nativeId||snapshot.sourceCwd!==source.workingDirectory||typeof snapshot.configurationHash!=='string'||Buffer.byteLength(JSON.stringify(snapshot))>65536)throw new RpcFault(-32000,'Invalid native configuration snapshot reference');
+      if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed while preparing creation');
+      this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);
+      await this.createSessionResource({channel:uri,provider:source.engineId,workingDirectories:[pathToFileURL(source.workingDirectory).href],title:input.title},{sessionId:nativeId,source:snapshot,commandId:input.commandId});
+      return {uri,creationConfirmed:true as const,receipt:this.store.receipt(input.commandId)};
+    });
+  }
+  /** Compare-and-admit scheduled work under the same session lock as user turns and stop. */
+  async submitScheduled(session:string,input:{commandId:string;text:string;taskId:string;taskRevision:number;kind:'task'|'monitor';expectedInterruptionRevision:number;expectedExecutionRevision:number;expectedConfigurationHash:string;scheduledRunId?:string}) {
+    if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.text!=='string'||Buffer.byteLength(input.text)>1024*1024||typeof input.taskId!=='string'||!input.taskId||input.taskId.length>512||!['task','monitor'].includes(input.kind)||![input.taskRevision,input.expectedInterruptionRevision,input.expectedExecutionRevision].every(n=>Number.isSafeInteger(n)&&n>=0)||typeof input.expectedConfigurationHash!=='string')throw new RpcFault(-32602,'Malformed bounded scheduled admission');
+    const record=await this.record(session);
+    return this.withLock(record.uri,async()=>{
+      if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Scheduled command already admitted; inspect its receipt without replay');
+      try {
+        const meta={inputOrigin:'scheduled',scheduledRunId:input.scheduledRunId??input.commandId,taskId:input.taskId,taskRevision:input.taskRevision,kind:input.kind};
+        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:'user'},_meta:{'amplifier.dev/scheduled':meta}}} as any,{clientId:'host:schedule',clientSeq:this.store.extensionSequence('host:schedule')},input);
+        return {accepted:true,turnId:input.commandId,receipt:this.store.receipt(input.commandId)};
+      }catch(error){if(this.store.receipt(input.commandId))throw error;return {accepted:false,reason:(error as Error).message};}
+    });
   }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
   async waitForTurn(session:string,commandId:string,timeoutMs=600000) {
@@ -548,8 +597,14 @@ export class AmplifierHost {
   async readSessionContext(session:string,limit=12) {
     limit=bounded(limit,12,50);const record=await this.record(session);let turns=this.store.turns(record.chat.resource,limit).turns;
     if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native'){const native=await this.nativeHistory(record,limit),ids=new Set(turns.map(t=>t.id));turns=[...native.turns.filter(t=>!ids.has(t.id)),...turns].slice(-limit);}
-    const messages:Array<{id:string;role:string;text:string}>=[];
-    for(const turn of turns){if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':'user',text:turn.message.text.slice(0,5000)});const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');if(text)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000)});}
+    const messages:Json[]=[];
+    for(const turn of turns){
+      const history=turn.message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=turn.message._meta?.['amplifier.dev/scheduled'] as Json|undefined;
+      const provenance={createdAt:turn.startedAt,inputOrigin:scheduled?.inputOrigin??(history?.via==='call'?'voice':'user'),...(scheduled?{scheduledRunId:scheduled.scheduledRunId}:{}),...(history?.via==='call'?{voiceId:history.callId,voiceItemId:history.itemId}:{})};
+      if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
+      const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
+      if(text)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
+    }
     return {...await this.inspectSession(session),status:record.chat.status,messages:messages.slice(-limit),recentLimit:limit};
   }
   /** Native-only recordings become available on the next standard history read. */
@@ -585,10 +640,16 @@ export class AmplifierHost {
       if(block.type==='resource'&&!capabilities?.embeddedContext)throw new Error('Agent did not advertise embedded context');
     }
   }
-  private async run(uri:string,active:Active,blocks:ContentBlock[]) {
+  private async run(uri:string,active:Active,blocks:ContentBlock[],scheduled?:Json) {
     const channel=chatURI(uri),turnId=active.turnId!;
     try {
-      const response=await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
+      const response:Json=scheduled?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'schedule.submit',args:{taskId:scheduled.taskId,taskRevision:scheduled.taskRevision,inputId:turnId,text:scheduled.text,kind:scheduled.kind,interruptionRevision:scheduled.expectedInterruptionRevision}}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
+      if(scheduled&&response.accepted!==true){
+        if(response.accepted!==false)throw new Error('Native scheduled outcome was not conclusive');
+        await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native schedule rejected'));
+        this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:String(response.reason??'Native schedule rejected before execution')}}} as StateAction);return;
+      }
+      if(typeof response.stopReason!=='string')throw new Error('Native execution did not provide a settled stop reason');
       await active.updates;
       if(active.cancel&&response.stopReason!=='cancelled')this.emit(channel,active.cancel.action,active.cancel.origin,'Turn finished before cancellation took effect');
       if(this.getRecord(uri)!.chat.activeTurn) this.emit(channel,{type:response.stopReason==='cancelled'?'chat/turnCancelled':'chat/turnComplete',turnId,duration:Date.now()-active.started!,_meta:{'amplifier.dev/acp':{stopReason:response.stopReason}}} as StateAction,response.stopReason==='cancelled'?active.cancel?.origin:undefined);
@@ -605,6 +666,7 @@ export class AmplifierHost {
     const record=this.getRecord(uri)!;
     const properties:Record<string,any>={},values:Record<string,unknown>={};
     for(const option of options) {if(option.type!=='select')continue;const choices=(option.options??[]).flatMap((o:any)=>o.options??[o]);properties[option.id]={type:'string',title:option.name,description:option.description,enum:choices.map((o:any)=>o.value),enumLabels:choices.map((o:any)=>o.name),sessionMutable:true};values[option.id]=option.currentValue;}
+    if(JSON.stringify(record.state.config?.values??{})!==JSON.stringify(values))this.store.bump(uri,'configuration');
     record.state.config={schema:{type:'object',properties},values};record.state._meta={...record.state._meta,'amplifier.dev/acp':{...(record.state._meta?.['amplifier.dev/acp'] as Json),configOptions:options}};this.store.save(record);
     this.emit(uri,{type:'session/metaChanged',_meta:record.state._meta} as StateAction);
     this.emit(uri,{type:'session/configChanged',config:values,replace:true} as StateAction);
@@ -678,7 +740,12 @@ export class AmplifierHost {
     }
   }
   diagnostics(){return {clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
-  async inspectSession(session:string) {const record=await this.record(session);return {session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,activeTurnId:record.chat.activeTurn?.id};}
+  async inspectSession(session:string) {
+    const record=await this.record(session),revisions=this.store.revisions(record.uri);
+    const engine=this.config.engines.find(e=>e.id===record.engineId);
+    const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,activeTurnId:record.chat.activeTurn?.id,status:record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+  }
   /** Advertised tools only: no client drafts, DOM, editing buffers or rendered state. */
   async listClientTools(session:string) {const record=await this.record(session);return structuredClone(record.state.activeClients);}
   /** Shared admission path for authenticated clients and trusted native-host callbacks. */
@@ -717,11 +784,20 @@ export class AmplifierHost {
     return result;
   }
   /** Used by capability owners; all native controls retain the ACP execution boundary. */
-  async nativeControl(session:string,operation:string,args:Json):Promise<Json> {
-    const active=await this.ensureAgent(session);
-    if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.version!==1)throw new RpcFault(-32601,'Native control extension not negotiated');
-    active.controlDepth=(active.controlDepth??0)+1;
-    try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args});}finally{active.controlDepth--;}
+  async nativeControlExisting(session:string,operation:string,args:Json):Promise<Json> {return this.nativeControl(session,operation,args,{requireExisting:true});}
+  async nativeControl(session:string,operation:string,args:Json,options:{requireExisting?:boolean}={}):Promise<Json> {
+    session=(await this.record(session)).uri;
+    if(operation==='schedule.submit')throw new RpcFault(-32602,'Scheduled execution requires submitScheduled admission');
+    const execute=async()=>{
+      const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
+      if(!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32008,'No existing owned native runtime; no process was started');
+      if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.version!==1)throw new RpcFault(-32601,'Native control extension not negotiated');
+      if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
+      if(['worker.stop','operations.cancel'].includes(operation))this.store.bump(session,'interruption');
+      active.controlDepth=(active.controlDepth??0)+1;
+      try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args});}finally{active.controlDepth--;}
+    };
+    return ['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota','worker.stop','operations.cancel'].includes(operation)?this.withLock(session,execute):execute();
   }
   async close() {
     clearInterval(this.retireTimer);

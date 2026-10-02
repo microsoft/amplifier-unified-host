@@ -106,7 +106,7 @@ export class AcpProcess {
     if(this.initialized.protocolVersion!==1)throw new Error('Agent did not negotiate stable ACP version 1');
     return this.initialized;
   }
-  async start(nativeId?:string) {
+  async start(nativeId?:string,creation?:{sessionId:string;source:Record<string,unknown>;commandId:string}) {
     await this.initialize();
     this.loading=!!nativeId;
     try {
@@ -115,6 +115,12 @@ export class AcpProcess {
         if(this.initialized.agentCapabilities?.sessionCapabilities?.resume) return await this.client.resumeSession({sessionId:nativeId,cwd:this.cwd,mcpServers:[]});
         if(this.initialized.agentCapabilities?.loadSession) return await this.client.loadSession({sessionId:nativeId,cwd:this.cwd,mcpServers:[]});
         throw new Error('Agent cannot resume this native session; history remains readable');
+      }
+      if(creation){
+        if((this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.configurationClone?.version!==1)throw new Error('Agent does not advertise exact configuration cloning');
+        const created=await this.client.extMethod('_amplifier/session/new',{...creation,cwd:this.cwd,mcpServers:[]});
+        if(created.sessionId!==creation.sessionId||(created._meta as any)?.['amplifier.dev/native']?.creationConfirmed!==true)throw new Error('Native creation was not conclusively confirmed');
+        this.nativeId=String(created.sessionId);return created as {sessionId:string;configOptions?:any[]};
       }
       const created=await this.client.newSession({cwd:this.cwd,mcpServers:[]});this.nativeId=created.sessionId;return created;
     } finally {this.loading=false;}
