@@ -58,8 +58,8 @@ export interface HostConfig {
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
-interface SettledInput {operation:'schedule.submit'|'question.submit'|'observation.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
+interface Active {pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -111,7 +111,7 @@ export class AmplifierHost {
     // End interrupted projections without replaying the accepted command or past tool work.
     for(const row of this.store.db.prepare("SELECT uri FROM sessions WHERE json_extract(chat,'$.activeTurn') IS NOT NULL").all()) {
       const record=this.getRecord(row.uri as string)!;
-      this.emit(record.chat.resource,{type:'chat/error',turnId:record.chat.activeTurn!.id,duration:0,part:{kind:'error',error:{message:'Host interrupted; execution outcome is unknown. Native history must be reconciled before continuing.'}}} as StateAction);
+      this.emit(record.chat.resource,{type:'chat/error',turnId:record.chat.activeTurn!.id,duration:0,part:{kind:'error',error:{errorType:'HOST_OUTCOME_UNKNOWN',message:'Host interrupted; execution outcome is unknown. Native history must be reconciled before continuing.'}}} as StateAction);
     }
     for(const row of this.store.db.prepare("SELECT chat,id FROM queue_intents WHERE projected=0").all()){this.emit(String(row.chat),{type:'chat/pendingMessageRemoved',kind:'queued',id:String(row.id)} as PendingQueueAction);this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(row.id);}
     for(const row of this.store.db.prepare("SELECT DISTINCT chat FROM queue_intents WHERE status='pending'").all())this.holdQueue(String(row.chat),'host-restarted');
@@ -341,7 +341,7 @@ export class AmplifierHost {
           let state=chatReducer({...record.chat,turns:[],activeTurn:undefined},{type:'chat/turnStarted',turnId:group.id,startedAt:group.startedAt??record.summary.createdAt,message} as any);
           const active:Active={agent,busy:true,lastUsed:0,turnId:group.id,tools:new Set(),permissions:new Map()};
           for(const update of group.updates)await this.update(record.uri,{sessionId:record.nativeSessionId,update} as SessionNotification,{active,emit:action=>{state=chatReducer(state,action as any);}});
-          const action=group.recordedOnly||group.state==='complete'?{type:'chat/turnComplete',turnId:group.id,duration:0}:{type:'chat/error',turnId:group.id,duration:0,part:{kind:'error',error:{code:'NATIVE_OUTCOME_UNKNOWN',message:'Historical content is preserved; its execution outcome was not recorded.'}}};
+          const action=group.recordedOnly||group.state==='complete'?{type:'chat/turnComplete',turnId:group.id,duration:0}:{type:'chat/error',turnId:group.id,duration:0,part:{kind:'error',error:{errorType:'NATIVE_OUTCOME_UNKNOWN',message:'Historical content is preserved; its execution outcome was not recorded.'}}};
           state=chatReducer(state,action as any);page.push(...state.turns);
         }
         turns=[...page,...turns];next=result.nextCursor??undefined;
@@ -484,7 +484,7 @@ export class AmplifierHost {
       this.notify('root/sessionAdded',{channel:ROOT,summary});
       this.store.finish(creationCommand,'dispatching');
       try {await this.ensureAgent(p.channel,creation);this.emit(p.channel,{type:'session/ready'} as StateAction);this.store.finish(creationCommand,'completed');}
-      catch(error){this.store.finish(creationCommand,'unknown',(error as Error).message);this.emit(p.channel,{type:'session/creationFailed',error:{message:(error as Error).message}} as StateAction);throw error;}
+      catch(error){this.store.finish(creationCommand,'unknown',(error as Error).message);this.emit(p.channel,{type:'session/creationFailed',error:{errorType:'SESSION_CREATION_FAILED',message:(error as Error).message}} as StateAction);throw error;}
       await this.syncCatalog(this.getRecord(p.channel)!);return null;
     });
   }
@@ -514,6 +514,7 @@ export class AmplifierHost {
         nativeEvent:async params=>{
           const event=params.event as Json|undefined;
           if(event) this.steeringEvent(uri,active,event);
+          if(active.busy&&((event?.type==='input.accepted'&&event.input_id===active.turnId)||(event?.type==='generation.started'&&event.activeInputId===active.turnId)))this.projectPendingTurn(uri,active);
           if(event?.type==='runtime.ready')active.stopNotified=false;
           if(event?.type==='runtime.closed')this.notifyAgentStopped(uri,active,active.retireReason??'runtime-closed');
           if(event?.type==='history.persisted'&&typeof event.metadataPath==='string'&&isAbsolute(event.metadataPath)&&basename(event.metadataPath)==='metadata.json') {
@@ -782,7 +783,8 @@ export class AmplifierHost {
     if(this.store.db.prepare("SELECT 1 FROM steering_intents WHERE chat=? AND status='dispatching' LIMIT 1").get(channel))throw new Error('A prior steering disposition is pending; wait for its receipt');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
-    const blocks=this.prompt(action.message),active=await this.ensureAgent(record.uri);
+    const blocks=this.prompt(action.message),active=special?.operation==='observation.submit'?this.active.get(record.uri):await this.ensureAgent(record.uri);
+    if(!active||active.agent.closed||special?.operation==='observation.submit'&&active.stopNotified)throw new RpcFault(-32008,'waiting_worker',{executed:false});
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
@@ -791,11 +793,11 @@ export class AmplifierHost {
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
       if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
-    this.store.transaction(()=>{this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
+    this.store.transaction(()=>{if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
     active.busy=true;active.generationId=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
-    this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,special);
+    if(special?.operation==='observation.submit'){active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};active.observationAdmission={inputId:action.turnId,watchId:special.args.watchId,taskId:special.args.taskId,taskRevision:special.args.taskRevision,outcomeDigest:createHash('sha256').update(JSON.stringify(special.args.outcome)).digest('hex'),expectedExecutionRevision:special.expected!.executionRevision,expectedInterruptionRevision:special.expected!.interruptionRevision,expectedConfigurationHash:special.expected!.configurationHash,admittedExecutionRevision:this.store.revisions(record.uri).executionRevision};this.store.annotateReceipt(action.turnId,{observationAdmission:active.observationAdmission});}else this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,special);
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */
   async submitTurn(session:string,input:{commandId:string;text:string;clientId:string;attachments?:Message['attachments']}) {
@@ -862,12 +864,13 @@ export class AmplifierHost {
     if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||![input.watchId,input.taskId].every(id=>typeof id==='string'&&id.length>0&&id.length<=200)||![input.taskRevision,input.expectedExecutionRevision,input.expectedInterruptionRevision].every(value=>Number.isSafeInteger(value)&&value>=0)||typeof input.expectedConfigurationHash!=='string'||!input.outcome||typeof input.outcome!=='object'||Array.isArray(input.outcome)||Buffer.byteLength(JSON.stringify(input.outcome))>65536)throw new RpcFault(-32602,'Bounded typed observation and expected admission revisions required');
     const record=await this.record(session);
     return this.withLock(record.uri,async()=>{
-      if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Observation command already admitted; inspect its receipt without replay');
+      const requestSignature=createHash('sha256').update(JSON.stringify([input.commandId,input.watchId,input.taskId,input.taskRevision,input.outcome])).digest('hex'),prior=this.store.receipt(input.commandId);
+      if(prior&&(prior.channel!==record.chat.resource||prior.status!=='failed'||prior.retryEligibility!=='waiting_worker'||prior.requestSignature!==requestSignature))throw new RpcFault(-32011,'Observation command already admitted; only an exact explicitly retryable no-effect refusal may be retried');
       try{
         const metadata={inputOrigin:'observation',watchId:input.watchId,taskId:input.taskId,taskRevision:input.taskRevision};
-        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:JSON.stringify({contract:'amplifier.observation.v1',watchId:input.watchId,result:input.outcome}),origin:{kind:'systemNotification'},_meta:{'amplifier.dev/input':metadata}}} as any,{clientId:'host:observation',clientSeq:this.store.extensionSequence('host:observation')},{operation:'observation.submit',args:{watchId:input.watchId,taskId:input.taskId,taskRevision:input.taskRevision,outcome:input.outcome},expected:{executionRevision:input.expectedExecutionRevision,interruptionRevision:input.expectedInterruptionRevision,configurationHash:input.expectedConfigurationHash}});
+        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:JSON.stringify({contract:'amplifier.observation.v1',watchId:input.watchId,result:input.outcome}),origin:{kind:'systemNotification'},_meta:{'amplifier.dev/input':metadata}}} as any,{clientId:'host:observation',clientSeq:this.store.extensionSequence('host:observation')},{operation:'observation.submit',requestSignature,args:{watchId:input.watchId,taskId:input.taskId,taskRevision:input.taskRevision,outcome:input.outcome},expected:{executionRevision:input.expectedExecutionRevision,interruptionRevision:input.expectedInterruptionRevision,configurationHash:input.expectedConfigurationHash}});
         return {accepted:true,turnId:input.commandId,receipt:this.store.receipt(input.commandId)};
-      }catch(error){if(this.store.receipt(input.commandId))throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});return {accepted:false,executed:false,reason:(error as Error).message};}
+      }catch(error){const current=this.store.receipt(input.commandId);if(current&&current.retryEligibility!=='waiting_worker')throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});return {accepted:false,executed:false,reason:(error as Error).message,...(current?.retryEligibility?{receipt:current}: {})};}
     });
   }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
@@ -880,7 +883,7 @@ export class AmplifierHost {
     const current=this.store.receipt(commandId)!,row=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,commandId);
     const turn=row?JSON.parse(row.payload as string):undefined;
     const text=(turn?.responseParts??[]).filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n').slice(0,50000);
-    return {generation_id:commandId,status:current.status,completed:current.status==='completed',text,detail:current.detail,workContinues:['admitted','dispatching'].includes(current.status)};
+    return {generation_id:commandId,status:current.status,completed:current.status==='completed',text,detail:current.detail,...(current.retryEligibility?{executed:false,retryEligibility:current.retryEligibility,observationAdmission:current.observationAdmission}:{}),workContinues:['admitted','dispatching'].includes(current.status)};
   }
   /** Exact host-indexed input, never a recent-window search or eager native transcript read. */
   async readUserMessage(session:string,messageId:string,options:{maxBytes?:number}={}):Promise<Json> {
@@ -957,26 +960,37 @@ export class AmplifierHost {
       if(block.type==='resource'&&!capabilities?.embeddedContext)throw new Error('Agent did not advertise embedded context');
     }
   }
+  private projectPendingTurn(uri:string,active:Active) {
+    if(!active.pendingTurn)return;
+    const pending=active.pendingTurn;active.pendingTurn=undefined;this.emit(chatURI(uri),pending.action,pending.origin);
+  }
   private async run(uri:string,active:Active,blocks:ContentBlock[],special?:SettledInput) {
     const channel=chatURI(uri),turnId=active.turnId!;let drain=false;
-    const message=this.getRecord(uri)!.chat.activeTurn!.message,meta=message._meta as Json|undefined;
+    const message=(active.pendingTurn?.action.message??this.getRecord(uri)!.chat.activeTurn!.message),meta=message._meta as Json|undefined;
     const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
-      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId}}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
+      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},...(special.operation==='observation.submit'?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
         await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
-        this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:String(response.reason??'Native input rejected before execution')}}} as StateAction);return;
+        if(special.operation==='observation.submit'&&!active.pendingTurn)throw new Error('Native refused observation after execution evidence');
+        if(special.operation==='observation.submit'&&response.executed===false&&response.reason==='waiting_worker')this.store.annotateReceipt(turnId,{retryEligibility:'waiting_worker'});
+        if(!active.pendingTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'INPUT_REJECTED',message:String(response.reason??'Native input rejected before execution')}}} as StateAction);return;
       }
       if(typeof response.stopReason!=='string')throw new Error('Native execution did not provide a settled stop reason');
-      await active.updates;
+      await active.updates;this.projectPendingTurn(uri,active);
       if(response.usage&&this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/usage',turnId,usage:{inputTokens:response.usage.inputTokens,outputTokens:response.usage.outputTokens,cacheReadTokens:response.usage.cachedReadTokens??undefined,_meta:{'amplifier.dev/acp':{usage:response.usage,experimental:true}}}} as StateAction);
       if(active.cancel&&response.stopReason!=='cancelled')this.emit(channel,active.cancel.action,active.cancel.origin,'Turn finished before cancellation took effect');
       if(this.getRecord(uri)!.chat.activeTurn) this.emit(channel,{type:response.stopReason==='cancelled'?'chat/turnCancelled':'chat/turnComplete',turnId,duration:Date.now()-active.started!,_meta:{'amplifier.dev/acp':{stopReason:response.stopReason}}} as StateAction,response.stopReason==='cancelled'?active.cancel?.origin:undefined);
       this.store.finish(turnId,response.stopReason==='cancelled'?'cancelled':'completed',response.stopReason);drain=response.stopReason==='end_turn'&&!active.cancel;
     } catch(error) {
-      this.store.finish(turnId,'unknown',(error as Error).message);
-      if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:`Execution outcome unknown: ${(error as Error).message}`}}} as StateAction);
+      if(special?.operation==='observation.submit'&&active.pendingTurn&&(error as Json).code===-32008&&(error as Json).data?.executed===false){
+        this.store.finish(turnId,'failed','waiting_worker');this.store.annotateReceipt(turnId,{retryEligibility:'waiting_worker'});
+        if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'WAITING_WORKER',message:'Observation was not executed; its original native worker is unavailable.'}}} as StateAction);
+        return;
+      }
+      this.store.finish(turnId,'unknown',(error as Error).message);this.projectPendingTurn(uri,active);
+      if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'EXECUTION_OUTCOME_UNKNOWN',message:`Execution outcome unknown: ${(error as Error).message}`}}} as StateAction);
     } finally {
       await Promise.allSettled([...(active.steeringRuns??[])]);
       for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").all(channel,turnId)){
@@ -985,7 +999,7 @@ export class AmplifierHost {
         else{const timer=setTimeout(()=>this.settleSteering(uri,id,'unknown','Native steering disposition deadline expired'),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));timer.unref();this.steeringTimers.set(id,timer);}
       }
       for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
-      active.generationId=undefined;
+      active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;
       for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.lastUsed=Date.now();
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
@@ -1049,6 +1063,7 @@ export class AmplifierHost {
     }
     if(active.agent.loading)return; // load replay never executes or duplicates the persisted host projection.
     if(!active.busy||!active.turnId)return;
+    if(!projection&&['agent_message_chunk','agent_thought_chunk','tool_call','tool_call_update','plan'].includes(update.sessionUpdate))this.projectPendingTurn(uri,active);
     if(!projection){active.projectionBytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(update));if(active.projectionBytes>(this.config.maxActiveProjectionBytes??8*1024*1024)){void active.agent.client.cancel({sessionId:active.agent.nativeId!}).catch(()=>{});throw new Error('Active view exceeded its byte budget; native history is preserved and execution outcome requires reconciliation');}}
     const channel=chatURI(uri),turnId=active.turnId;
     const emit=(action:StateAction)=>projection?projection.emit(action):this.emit(channel,action);
@@ -1078,6 +1093,7 @@ export class AmplifierHost {
   }
   private async permission(uri:string,params:RequestPermissionRequest):Promise<RequestPermissionResponse> {
     const active=this.active.get(uri);if(!active?.busy||!active.turnId)return {outcome:{outcome:'cancelled'}};
+    this.projectPendingTurn(uri,active);
     const channel=chatURI(uri),turnId=active.turnId,id=params.toolCall.toolCallId;
     if(active.permissions.has(id))throw new Error('Duplicate pending permission identity');
     if(!active.tools.has(id)){active.tools.add(id);this.emit(channel,{type:'chat/toolCallStart',turnId,toolCallId:id,toolName:params.toolCall.kind??'tool',displayName:params.toolCall.title??'Tool'} as StateAction);}
@@ -1124,7 +1140,9 @@ export class AmplifierHost {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);
     const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
-    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),title:record.summary.title,activeTurnId:record.chat.activeTurn?.id,status:record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+    const active=this.active.get(record.uri),admission=active?.busy&&active.turnId?this.store.receipt(active.turnId):undefined;
+    const observationAdmission=admission?.status==='dispatching'&&active?.observationAdmission?{...active.observationAdmission,status:admission.status}:undefined;
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),title:record.summary.title,activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
   }
   /** Hold the selected session mapping through bounded trusted I/O. No filesystem snapshot is implied. */
   async withSessionWorkspace<T>(session:string,expected:SessionWorkspaceExpectation,capture:(workspace:Readonly<SessionWorkspace>)=>Promise<T>):Promise<T> {

@@ -500,3 +500,24 @@ proof reaches an explicit unknown outcome after a bounded deadline (10 seconds
 default, `steeringOutcomeTimeoutMs` up to 60 seconds); native runtime/process loss
 also produces unknown. Neither outcome replays input. `steeringDispositionPending`
 in diagnostics counts outstanding post-turn proof deadlines.
+
+Observation delivery requires the exact resident native worker. Admission never
+starts or revives a worker to explain an observation. A known absent worker
+returns `accepted:false, executed:false, reason:"waiting_worker"`. If native
+retirement wins after host reservation, `waitForTurn` returns `status:"failed"`,
+`executed:false`, `retryEligibility:"waiting_worker"`, and `observationAdmission`.
+Only this explicit no-effect outcome permits the identical input ID and typed
+payload to be admitted again. Previous attempts remain in the durable indexed
+receipt archive; unknown outcomes never permit retry. Callers must refresh and
+validate host revisions before an exact retry.
+
+During typed delivery, `inspectSession.observationAdmission` identifies the exact
+input/watch/task/revision/outcome digest, expected configuration/interruption/
+execution revisions, admitted execution revision, and `status:"dispatching"`.
+The admitted revision is exactly the pre-admission execution revision plus one.
+This proof lets a policy owner distinguish its own admission bump from unrelated
+user work; it does not prove native execution. The same proof is retained on the
+receipt and returned with explicit retry eligibility. Observation chat projection
+begins only after native input acceptance or execution evidence, so a refused
+attempt never becomes a fictitious turn or duplicates a turn ID on connected
+clients.

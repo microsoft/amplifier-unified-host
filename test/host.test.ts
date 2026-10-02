@@ -689,3 +689,34 @@ test('a peer that never acknowledges steering cannot hang settlement or retire a
   await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'new work',clientId:'owner'}),/unknown/);
  }finally{await f.cleanup();}
 });
+
+test('observation admission refuses a runtime retired after a resident precheck instead of mounting it',async()=>{
+ const stopped:any[]=[],f=await setup({maxActiveAgents:1,agentStopped:async(event:any)=>{stopped.push(event);}});try{
+  const client=await f.connect(),first=await f.create(client),before=await f.host.inspectSession(first.session);
+  await f.host.nativeControlExisting(first.session,'configuration.snapshot',{});
+  const other=await f.create(client);assert.equal(stopped[0].session,first.session);assert.equal(f.host.diagnostics().activeAgents,1);
+  const input={commandId:randomUUID(),watchId:'watch',taskId:'task',taskRevision:1,outcome:{status:'ready'},expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash};
+  assert.deepEqual(await f.host.submitObservation(first.session,input),{accepted:false,executed:false,reason:'waiting_worker'});assert.equal(f.host.store.receipt(input.commandId),undefined);assert.equal(f.host.diagnostics().activeAgents,1);
+  assert.ok(await f.host.nativeControlExisting(other.session,'configuration.snapshot',{}));await assert.rejects(f.host.nativeControlExisting(first.session,'configuration.snapshot',{}),/No existing owned native runtime/);
+ }finally{await f.cleanup();}
+});
+
+test('only explicit no-effect observation refusal may re-admit the same exact input ID',async()=>{
+ const f=await setup();try{
+  const flag=join(f.dir,'worker-unavailable');f.config.engines[0].env={...f.config.engines[0].env,FIXTURE_WORKER_UNAVAILABLE_FILE:flag};
+  const client=await f.connect(),other=await f.connect(),{session,chat}=await f.create(client),before=await f.host.inspectSession(session);
+  const subA=await client.subscribe(chat,{view:{turns:20}}),subB=await other.subscribe(chat,{view:{turns:20}});let stateA=subA.result.snapshot!.state as ChatState,stateB=subB.result.snapshot!.state as ChatState;
+  const consume=async(sub:any,apply:(action:any)=>void)=>{for await(const event of sub.subscription)if(event.type==='action'&&!event.params.rejectionReason)apply(event.params.action);};void consume(subA,a=>stateA=chatReducer(stateA,a));void consume(subB,a=>stateB=chatReducer(stateB,a));
+  const input={commandId:randomUUID(),watchId:'watch',taskId:'task',taskRevision:1,outcome:{status:'ready'},expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash};
+  await writeFile(flag,'retired after host reservation');assert.equal((await f.host.submitObservation(session,input)).accepted,true);
+  const refused=await f.host.waitForTurn(session,input.commandId);assert.equal(refused.status,'failed');assert.equal(refused.executed,false);assert.equal(refused.retryEligibility,'waiting_worker');assert.equal(refused.observationAdmission!.expectedExecutionRevision,before.executionRevision);assert.equal(refused.observationAdmission!.admittedExecutionRevision,before.executionRevision+1);assert.equal(stateA.turns.length,0);assert.equal(stateB.turns.length,0);assert.equal(stateA.activeTurn,undefined);await assert.rejects(readFile(f.log,'utf8'),/ENOENT/);
+  await rm(flag);const current=await f.host.inspectSession(session),retry={...input,expectedExecutionRevision:current.executionRevision,expectedInterruptionRevision:current.interruptionRevision,expectedConfigurationHash:current.configurationHash};
+  await assert.rejects(f.host.submitObservation(session,{...retry,outcome:{status:'changed'}}),/exact explicitly retryable/);
+  assert.equal((await f.host.submitObservation(session,retry)).accepted,true);assert.equal((await f.host.waitForTurn(session,input.commandId)).completed,true);
+  const old=f.host.store.db.prepare('SELECT receipt,turn_payload FROM receipt_attempts WHERE command_id=?').get(input.commandId)!;
+  assert.equal(JSON.parse(String(old.receipt)).retryEligibility,'waiting_worker');assert.equal(old.turn_payload,null);
+  await waitFor(()=>stateA.turns.length===1&&stateB.turns.length===1);assert.equal(stateA.turns[0].id,input.commandId);assert.deepEqual(stateA.turns,stateB.turns);assert.equal((await f.host.inspectSession(session)).observationAdmission,undefined);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);assert.equal(f.host.store.receipt(input.commandId)?.retryEligibility,undefined);
+  await assert.rejects(f.host.submitObservation(session,retry),/already admitted/);
+ }finally{await f.cleanup();}
+});

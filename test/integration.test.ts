@@ -107,7 +107,7 @@ test('actual Core/Foundation question admission preserves canonical answer prove
 
 test('actual Core/Foundation typed observation uses finite native admission and settles its authoritative outcome',{skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
  const directory=await mkdtemp(join(tmpdir(),'ahp-native-observation-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!),{randomUUID}=await import('node:crypto');let allow=false,calls=0;
- const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}],nativeHostCapabilities:{version:1,features:{observation:true}},nativeHostRequest:async(_context,request)=>{assert.equal(request.operation,'observation.admit');calls++;return {admitted:allow,reason:allow?undefined:'Saved watch changed'};}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}],nativeHostCapabilities:{version:1,features:{observation:true}},nativeHostRequest:async(_context,request)=>{assert.equal(request.operation,'observation.admit');const selected=await host.inspectSession(_context.session),proof=selected.observationAdmission!;assert.equal(selected.activeTurnId,request.args.inputId);assert.equal(proof.inputId,request.args.inputId);assert.equal(proof.watchId,request.args.watchId);assert.equal(proof.taskId,request.args.taskId);assert.equal(proof.taskRevision,request.args.taskRevision);assert.equal(proof.status,'dispatching');assert.equal(proof.admittedExecutionRevision,selected.executionRevision);assert.equal(proof.expectedExecutionRevision+1,selected.executionRevision);assert.equal(proof.expectedInterruptionRevision,selected.interruptionRevision);assert.equal(proof.expectedConfigurationHash,selected.configurationHash);assert.equal(host.store.get(_context.session)!.chat.activeTurn,undefined);calls++;return {admitted:allow,reason:allow?undefined:'Saved watch changed'};}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
  try{
   await client.initialize({clientId:'observation-integration',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID();await client.request('createSession',{channel:session,provider:'amplifier',workingDirectories:[pathToFileURL(workspace).href]});
   const created=await host.nativeControl(session,'task.create',{objective:'Finite typed observation qualification',maxTurns:3,commandId:randomUUID(),expectedRevision:0}),task=created.task;
@@ -155,4 +155,21 @@ test('actual Core/Foundation anchored steering applies or stays held within one 
   }
   assert.equal(host.store.turns(chat).turns.length,2);assert.equal(host.diagnostics().steeringDispositionPending,0);
  }finally{await client.shutdown();await host.close();await rm(state,{recursive:true,force:true});}
+});
+
+test('actual native idle retirement cannot be reversed by observation delivery', {skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const {randomUUID}=await import('node:crypto'),dir=await mkdtemp(join(tmpdir(),'ahp-observation-resident-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!);
+ const configPath=join(dir,'agent.json'),native=JSON.parse(await readFile(process.env.ACP_NATIVE_TEST_CONFIG!,'utf8'));await writeFile(configPath,JSON.stringify({...native,idleSeconds:1}));
+ const stopped:any[]=[],events:any[]=[];
+ const host=await createHost({stateDirectory:join(dir,'state'),allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',configPath]}],agentStopped:async event=>{stopped.push(event);},nativeEvent:async(_context,params)=>{events.push(params.event);}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'resident-observation',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID();await client.request('createSession',{channel:session,workingDirectories:[pathToFileURL(workspace).href]});
+  const made=await host.nativeControlExisting(session,'task.create',{objective:'Wait for a resident observer',maxTurns:3,commandId:randomUUID(),expectedRevision:0});
+  const before=await host.inspectSession(session);assert.equal((await host.readTaskState(session)).available,true);
+  const until=Date.now()+15000;while(!stopped.length&&Date.now()<until)await new Promise(resolve=>setTimeout(resolve,20));assert.equal(stopped[0]?.reason,'runtime-closed');
+  const ready=events.filter(event=>event.type==='runtime.ready').length,commandId=randomUUID();
+  const result=await host.submitObservation(session,{commandId,watchId:'watch',taskId:made.task.id,taskRevision:made.task.revision,outcome:{status:'ready'},expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash});
+  assert.deepEqual(result,{accepted:false,executed:false,reason:'waiting_worker'});assert.equal(host.store.receipt(commandId),undefined);assert.equal(events.filter(event=>event.type==='runtime.ready').length,ready);
+  assert.equal((await host.readTaskState(session)).available,true);
+ }finally{await client.shutdown();await host.close();await rm(dir,{recursive:true,force:true});}
 });

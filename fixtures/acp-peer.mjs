@@ -70,6 +70,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='session/set_config_option')reply(message.id,{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:p.value,options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});
   else if(message.method==='session/close')reply(message.id,{});
   else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&['schedule.submit','question.submit','observation.submit'].includes(p.operation)){
+    if(p.operation==='observation.submit'&&process.env.FIXTURE_WORKER_UNAVAILABLE_FILE&&existsSync(process.env.FIXTURE_WORKER_UNAVAILABLE_FILE)){if(p._meta?.['amplifier.dev/native']?.requireExisting!==true)throw new Error('Resident observation guard missing');send({id:message.id,error:{code:-32008,message:'waiting_worker',data:{executed:false,replayed:false}}});continue;}
     if(retired){send({id:message.id,error:{code:-32000,message:'Session handle retired'}});continue;}
     const scheduled=message.method==='_amplifier/native';
     if(scheduled&&(p.args.taskRevision===99||p.args.questionRevision===99)){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}

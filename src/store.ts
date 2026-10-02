@@ -11,7 +11,7 @@ export interface SessionRecord {
 export interface Receipt {
   commandId: string; channel: string; clientId: string; clientSeq: number;
   status: 'admitted' | 'dispatching' | 'completed' | 'failed' | 'cancelled' | 'unknown';
-  fingerprint: string; createdAt: string; updatedAt: string; detail?: string;
+  fingerprint: string; createdAt: string; updatedAt: string; detail?: string;requestSignature?:string;retryEligibility?:'waiting_worker';observationAdmission?:Record<string,unknown>;
 }
 
 /** Host projections and admission only. Native agent history is never rewritten here. */
@@ -43,6 +43,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS actions(seq INTEGER PRIMARY KEY,channel TEXT NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts(command_id TEXT PRIMARY KEY,channel TEXT NOT NULL,client_id TEXT NOT NULL,client_seq INTEGER NOT NULL,payload TEXT NOT NULL);
       DROP INDEX IF EXISTS receipt_origin;
+      CREATE TABLE IF NOT EXISTS receipt_attempts(command_id TEXT NOT NULL,attempt INTEGER NOT NULL,receipt TEXT NOT NULL,turn_payload TEXT,PRIMARY KEY(command_id,attempt));
       CREATE INDEX IF NOT EXISTS receipt_origin_lookup ON receipts(client_id,client_seq);
       CREATE INDEX IF NOT EXISTS receipt_status_channel ON receipts(json_extract(payload,'$.status'),channel);
       CREATE TABLE IF NOT EXISTS terminals(uri TEXT PRIMARY KEY,session TEXT NOT NULL,modified TEXT NOT NULL,payload TEXT NOT NULL);
@@ -165,6 +166,20 @@ export class Store {
     const receipt = this.receipt(commandId);
     if (!receipt) throw new Error('Unknown command identity');
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,status,detail,updatedAt:new Date().toISOString()}),commandId);
+  }
+  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'>) {
+    const receipt=this.receipt(commandId);if(!receipt)throw new Error('Unknown command identity');
+    this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,...values}),commandId);
+  }
+  reopenKnownRefusal(commandId:string,channel:string,signature:string) {
+    if(!this.transactionOpen)throw new Error('Known-refusal retry must share an atomic admission transaction');
+    const receipt=this.receipt(commandId);if(!receipt)return;
+    if(receipt.channel!==channel||receipt.status!=='failed'||receipt.retryEligibility!=='waiting_worker'||receipt.requestSignature!==signature)throw new Error('Command is not an exact retryable no-effect observation');
+    const turn=this.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(channel,commandId);
+    const attempt=Number(this.db.prepare('SELECT coalesce(max(attempt),0)+1 n FROM receipt_attempts WHERE command_id=?').get(commandId)!.n);
+    this.db.prepare('INSERT INTO receipt_attempts VALUES(?,?,?,?)').run(commandId,attempt,JSON.stringify(receipt),turn?.payload??null);
+    this.db.prepare('DELETE FROM turns WHERE chat=? AND turn_id=?').run(channel,commandId);
+    this.db.prepare('DELETE FROM receipts WHERE command_id=?').run(commandId);
   }
   unknown(channel: string): boolean {
     return !!this.db.prepare("SELECT 1 FROM receipts WHERE channel=? AND json_extract(payload,'$.status')='unknown' LIMIT 1").get(channel);
