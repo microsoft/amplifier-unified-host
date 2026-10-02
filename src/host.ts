@@ -590,6 +590,7 @@ export class AmplifierHost {
       if(action.kind!=='queued'||typeof action.id!=='string'||!action.id||action.id.length>128)throw new RpcFault(-32602,'Queued message identity required');
       const row=this.store.db.prepare('SELECT chat,status FROM queue_intents WHERE id=?').get(action.id);
       if(row?.chat&&row.chat!==channel)throw new RpcFault(-32009,'Queued message belongs to another conversation');
+      if(!row||row.status==='removed')throw new RpcFault(-32008,'No pending queued message with this identity');
       if(row?.status==='consumed'||this.store.receipt(action.id))throw new RpcFault(-32011,'Queued input is already admitted; cancel its active turn instead');
       this.store.transaction(()=>{this.store.db.prepare("INSERT INTO queue_intents(id,chat,message,origin,position,status,held,reason) VALUES(?,?,NULL,?,0,'removed',1,'removed') ON CONFLICT(id) DO UPDATE SET message=NULL,status='removed',held=1,reason='removed'").run(action.id,channel,JSON.stringify(origin));this.emit(channel,action,origin.clientSeq>=0?origin:undefined);});return {accepted:true,id:action.id,pending:false};
     }
@@ -701,6 +702,7 @@ export class AmplifierHost {
     }
     this.store.transaction(()=>{this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     active.busy=true;active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
+    if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
     this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,special);
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */

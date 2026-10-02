@@ -507,7 +507,7 @@ test('standard queued messages share two-viewer state, upsert/reorder/cancel and
   b.dispatch(chat,set(first,'edited'));b.dispatch(chat,{type:'chat/queuedMessagesReordered',order:[second,first]} as any);b.dispatch(chat,{type:'chat/pendingMessageRemoved',kind:'queued',id:removed} as any);await waitFor(()=>state.queuedMessages?.length===2&&state.queuedMessages[0].id===second&&state.queuedMessages[1].message.text==='edited');
   await waitFor(()=>f.host.store.receipt(first)?.status==='completed');assert.equal(state.queuedMessages,undefined);assert.equal(f.host.store.receipt(second)?.status,'completed');assert.equal(f.host.store.receipt(removed),undefined);
   const prompts=(await readFile(f.log,'utf8')).trim().split('\n').map(line=>JSON.parse(line).prompt[0].text);assert.deepEqual(prompts,['queue-hold','second','edited']);
-  assert.ok(events.some(e=>e.action.type==='chat/turnStarted'&&e.action.queuedMessageId===second));a.dispatch(chat,set(first,'do not repeat'));a.dispatch(chat,set(removed,'do not resurrect'));await waitFor(()=>events.filter(e=>e.rejectionReason).length>=2);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,3);
+  const removalIndex=events.findIndex(e=>e.action.type==='chat/pendingMessageRemoved'&&e.action.id===second),startIndex=events.findIndex(e=>e.action.type==='chat/turnStarted'&&e.action.queuedMessageId===second);assert.ok(removalIndex>=0&&startIndex>removalIndex);a.dispatch(chat,set(first,'do not repeat'));a.dispatch(chat,set(removed,'do not resurrect'));await waitFor(()=>events.filter(e=>e.rejectionReason).length>=2);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,3);
  }finally{await f.cleanup();}
 });
 
