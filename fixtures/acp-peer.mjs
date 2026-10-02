@@ -53,7 +53,9 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     const result={accepted:true,inputId:p.args.inputId,activeInputId:p.args.activeInputId,generationId:active.generationId,disposition:'queued'};
     if(p.args.text==='crash steering'){process.exit(17);continue;}
     if(p.args.text==='refuse steering'){reply(message.id,{accepted:false,executed:false,reason:'Loop mode unavailable'});continue;}
+    if(p.args.text==='no acknowledgement')continue;
     if(p.args.text==='silent steering'){reply(message.id,result);continue;}
+    if(p.args.text==='after-turn steering'){active.afterTurn={method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'steering.held',input_id:p.args.inputId,activeInputId:p.args.activeInputId,target_generation_id:active.generationId,reason:'after turn checkpoint'}}};reply(message.id,result);continue;}
     const disposition=p.args.text==='held steering'?'held':'applied';
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'steering.'+disposition,input_id:p.args.inputId,activeInputId:p.args.activeInputId,target_generation_id:active.generationId,reason:'independent fixture'}}});
     reply(message.id,result);
@@ -122,6 +124,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       if(text==='many')for(let i=0;i<100;i++)update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'x'}});
       else update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Echo: '+text}});
       reply(id,{...(text==='mapping'?{usage:{totalTokens:31,inputTokens:20,outputTokens:11,cachedReadTokens:4,cachedWriteTokens:2,thoughtTokens:3}}:{}),...(scheduled?{accepted:true,inputId:p.args.inputId}:{}),stopReason:turn.cancelled?'cancelled':'end_turn'});
+      if(turn.afterTurn)setTimeout(()=>send(turn.afterTurn),100);
     })();
   } else if(message.method==='session/cancel'){if(active)active.cancelled=true;}
   else if(message.id!==undefined)send({id:message.id,error:{code:-32601,message:'Unsupported'}});

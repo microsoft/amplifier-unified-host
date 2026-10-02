@@ -647,10 +647,10 @@ test('pending steering cancelled before generation readiness stays held across l
 });
 
 test('unconfirmed steering remains unknown when its original turn finishes successfully',async()=>{
- const f=await setup();try{
+ const f=await setup({steeringOutcomeTimeoutMs:100});try{
   const client=await f.connect(),{session}=await f.create(client),id=randomUUID();await f.host.submitTurn(session,{commandId:id,text:'slow',clientId:'owner'});
   await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'unconfirmed',message:{text:'silent steering',origin:{kind:'user'}}} as any,{clientId:'owner'});
-  assert.equal((await f.host.waitForTurn(session,id)).completed,true);assert.equal(f.host.store.receipt('unconfirmed')?.status,'unknown');
+  assert.equal((await f.host.waitForTurn(session,id)).completed,true);await waitFor(()=>f.host.store.receipt('unconfirmed')?.status==='unknown');
   await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'blocked new work',clientId:'owner'}),/unknown/);
  }finally{await f.cleanup();}
 });
@@ -667,5 +667,25 @@ test('cold receipt and steering archives stay out of current admission scans',as
   assert.match(plan("SELECT count(*) FROM steering_intents WHERE status IN ('pending','dispatching')"),/SEARCH steering_intents USING COVERING INDEX steering_status/);
   assert.equal(f.host.store.unknown('ahp-chat:/selected'),false);
   f.host.store.admission('ahp-chat:/selected',{text:'admitted'},'selected','owner',1);f.host.store.finish('selected','unknown');assert.equal(f.host.store.unknown('ahp-chat:/selected'),true);f.host.store.finish('selected','completed');assert.equal(f.host.store.unknown('ahp-chat:/selected'),false);
+ }finally{await f.cleanup();}
+});
+
+test('late held steering may settle after the parent prompt response without a false unknown',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'slow',clientId:'owner'});
+  await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'late-held',message:{text:'after-turn steering',origin:{kind:'user'}}} as any,{clientId:'owner'});
+  assert.equal((await f.host.waitForTurn(session,commandId)).completed,true);assert.equal(f.host.store.receipt('late-held')?.status,'dispatching');
+  await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'too soon',clientId:'owner'}),/steering disposition is pending/);
+  await waitFor(()=>f.host.store.receipt('late-held')?.status==='failed');assert.equal(f.host.diagnostics().steeringDispositionPending,0);
+  const next=randomUUID();await f.host.submitTurn(session,{commandId:next,text:'confirmed new work',clientId:'owner'});assert.equal((await f.host.waitForTurn(session,next)).completed,true);
+ }finally{await f.cleanup();}
+});
+
+test('a peer that never acknowledges steering cannot hang settlement or retire an uncertain effect',async()=>{
+ const f=await setup({steeringOutcomeTimeoutMs:100});try{
+  const client=await f.connect(),{session}=await f.create(client),commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'slow',clientId:'owner'});
+  await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'no-ack',message:{text:'no acknowledgement',origin:{kind:'user'}}} as any,{clientId:'owner'});
+  assert.equal((await f.host.waitForTurn(session,commandId,2000)).completed,true);assert.equal(f.host.store.receipt('no-ack')?.status,'unknown');assert.match(f.host.store.receipt('no-ack')!.detail!,/acceptance deadline/);
+  await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'new work',clientId:'owner'}),/unknown/);
  }finally{await f.cleanup();}
 });

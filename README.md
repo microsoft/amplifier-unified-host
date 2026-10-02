@@ -491,3 +491,12 @@ inputs can belong to an active turn. Identities/receipts remain on disk; restart
 never replays them. Provider-native steering, attachments in steering, and
 retraction of consumed context are explicitly unsupported until their effect
 and attribution contracts are available.
+
+A normally completed parent response may precede the loop's final held-steering
+event. The host keeps that steering receipt pending, blocks subsequent admission
+and idle retirement, and accepts the matching later disposition. It does not
+infer application or loss from the parent response. Missing acceptance or terminal
+proof reaches an explicit unknown outcome after a bounded deadline (10 seconds
+default, `steeringOutcomeTimeoutMs` up to 60 seconds); native runtime/process loss
+also produces unknown. Neither outcome replays input. `steeringDispositionPending`
+in diagnostics counts outstanding post-turn proof deadlines.

@@ -38,7 +38,7 @@ export interface HostConfig {
   host?:string;port?:number;allowedOrigins?:string[];allowedHosts?:string[];bearerToken?:string;
   maxActiveAgents?:number;maxClients?:number;maxSubscriptions?:number;replayLimit?:number;
   maxPeerBufferedBytes?:number;maxInFlightRequests?:number;idleAgentMs?:number;
-  maxActiveProjectionBytes?:number;
+  maxActiveProjectionBytes?:number;steeringOutcomeTimeoutMs?:number;
   resourceProviders?:Array<{scheme:string;read?:(params:Json,context:{clientId:string})=>Promise<Json>;resolve?:(params:Json,context:{clientId:string})=>Promise<Json>;list?:(params:Json,context:{clientId:string})=>Promise<Json>;write?:(params:Json,context:{clientId:string})=>Promise<Json>}>;
   catalog?:Catalog;
   /** Optional bounded handshake metadata, resolved by the authenticated distribution. */
@@ -84,6 +84,7 @@ export class AmplifierHost {
   private clientTools=new Map<string,{session:string;chat:string;turnId:string;clientId:string;resolve:(result:Json)=>void;timer:ReturnType<typeof setTimeout>}>();
   private observers=new Set<{session:string;chat:string;queue:ActionEnvelope[];bytes:number;running:boolean;closed:boolean;listener:(event:ActionEnvelope)=>void|Promise<void>;onError?:(error:Error)=>void}>();
   private retireTimer:ReturnType<typeof setInterval>;
+  private steeringTimers=new Map<string,ReturnType<typeof setTimeout>>();
   private stoppedCallbacks=new Set<Promise<void>>();
   private stoppedCallbackFailures=0;
   private settledCallbacks=new Set<Promise<void>>();
@@ -660,7 +661,8 @@ export class AmplifierHost {
     this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);});
     this.emit(record.chat.resource,{type:'chat/pendingMessageRemoved',kind:'steering',id} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(id);this.store.finish(id,'dispatching');
     active.controlDepth=(active.controlDepth??0)+1;
-    const pending=active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text}}).then(result=>{
+    let acceptanceTimer:ReturnType<typeof setTimeout>|undefined;
+    const pending=Promise.race([active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text}}),new Promise<never>((_resolve,reject)=>{acceptanceTimer=setTimeout(()=>reject(new Error('Native steering acceptance deadline expired')),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));acceptanceTimer.unref();})]).then(result=>{
       if(result.accepted===false&&result.executed===false){this.settleSteering(session,id,'held',String(result.reason??'Native steering refused before execution'));return;}
       if(result.accepted!==true||result.inputId!==id||result.activeInputId!==activeInputId||result.generationId!==generationId||!['queued','applied','held','unknown'].includes(String(result.disposition)))throw new Error('Invalid native steering disposition');
       if(result.disposition!=='queued')this.settleSteering(session,id,result.disposition as 'applied'|'held'|'unknown',String(result.reason??result.disposition));
@@ -680,7 +682,10 @@ export class AmplifierHost {
   private settleSteering(session:string,id:string,disposition:'applied'|'held'|'unknown',reason:string) {
     const chat=chatURI(session),row=this.store.db.prepare('SELECT * FROM steering_intents WHERE id=? AND chat=?').get(id,chat);
     if(!row||row.status!=='dispatching')return;
+    clearTimeout(this.steeringTimers.get(id));this.steeringTimers.delete(id);
+    const active=this.active.get(session);if(active?.turnId===row.active_turn_id)active.controlDepth=Math.max(0,(active.controlDepth??0)-1);
     this.store.transaction(()=>{this.store.db.prepare('UPDATE steering_intents SET status=?,held=1,reason=? WHERE id=?').run(disposition,reason.slice(0,1024),id);this.store.finish(id,disposition==='applied'?'completed':disposition==='held'?'failed':'unknown','steering:'+disposition+': '+reason.slice(0,512));});
+    if(active&&!active.busy&&!active.cancel&&!active.controlDepth&&!this.closing&&this.store.receipt(active.turnId!)?.detail==='end_turn')void this.withLock(session,()=>this.drainQueue(session)).catch(()=>{});
   }
   /** Caller holds the session mutex. Never drains held/unknown inputs or replays a receipt. */
   private async drainQueue(session:string) {
@@ -774,6 +779,7 @@ export class AmplifierHost {
     if(reservedQueue&&(action.queuedMessageId!==action.turnId||reservedQueue.chat!==channel||reservedQueue.status!=='pending'))throw new Error('Command identity is reserved by a queued intent; use queue controls');
     if(channel!==record.chat.resource||!action.turnId||typeof action.message?.text!=='string'||(action.message.origin?.kind!=='user'&&!(special?.operation==='observation.submit'&&action.message.origin?.kind==='systemNotification'))||!Number.isFinite(Date.parse(action.startedAt)))throw new Error('Malformed user turn');
     if(record.state.lifecycle!==SessionLifecycle.Ready)throw new Error('Session creation has not completed; reconcile its outcome before execution');
+    if(this.store.db.prepare("SELECT 1 FROM steering_intents WHERE chat=? AND status='dispatching' LIMIT 1").get(channel))throw new Error('A prior steering disposition is pending; wait for its receipt');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
     const blocks=this.prompt(action.message),active=await this.ensureAgent(record.uri);
@@ -973,7 +979,11 @@ export class AmplifierHost {
       if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:`Execution outcome unknown: ${(error as Error).message}`}}} as StateAction);
     } finally {
       await Promise.allSettled([...(active.steeringRuns??[])]);
-      for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").all(channel,turnId))this.settleSteering(uri,String(row.id),'unknown','Turn settled without confirmed steering disposition');
+      for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").all(channel,turnId)){
+        const id=String(row.id);
+        if(!drain||this.closing)this.settleSteering(uri,id,'unknown','Turn interrupted without confirmed steering disposition');
+        else{const timer=setTimeout(()=>this.settleSteering(uri,id,'unknown','Native steering disposition deadline expired'),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));timer.unref();this.steeringTimers.set(id,timer);}
+      }
       for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
       active.generationId=undefined;
       for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.lastUsed=Date.now();
@@ -1089,6 +1099,7 @@ export class AmplifierHost {
   }
   private notifyAgentStopped(session:string,active:Active,reason:AgentStopped['reason'],details:{exitCode?:number;signal?:string}={}) {
     if(active.stopNotified)return;active.stopNotified=true;
+    for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND status='dispatching'").all(chatURI(session)))this.settleSteering(session,String(row.id),'unknown','Native runtime stopped without confirmed steering disposition');
     if(!this.config.agentStopped)return;
     const event=Object.freeze({session,nativeSessionId:active.agent.nativeId,engineId:active.agent.engine.id,workingDirectory:active.agent.cwd,reason,...details});
     const pending=Promise.resolve().then(()=>this.config.agentStopped!(event)).catch(()=>{this.stoppedCallbackFailures++;}).finally(()=>this.stoppedCallbacks.delete(pending));this.stoppedCallbacks.add(pending);active.stopCallback=pending;
@@ -1108,7 +1119,7 @@ export class AmplifierHost {
       if(force&&retired)return;
     }
   }
-  diagnostics(){return {turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
+  diagnostics(){return {steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
   async inspectSession(session:string) {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);

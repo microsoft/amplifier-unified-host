@@ -131,3 +131,28 @@ test('actual persisted native task inspection needs no runtime worker', {skip:!p
   await assert.rejects(host.readTaskState(session,{expectedRevision:'stale'}),/revision|changed/i);assert.equal(host.diagnostics().activeAgents,0);
  }finally{await client.shutdown();await host.close();await rm(dir,{recursive:true,force:true});}
 });
+
+test('actual Core/Foundation anchored steering applies or stays held within one standard AHP turn', {skip:!process.env.ACP_STEERING_EXECUTABLE||!process.env.ACP_STEERING_TEST_DIRECTORY},async()=>{
+ const {randomUUID}=await import('node:crypto'),{stat}=await import('node:fs/promises');
+ const owned=await realpath(process.env.ACP_STEERING_TEST_DIRECTORY!),workspace=join(owned,'workspace'),gates=join(owned,'gates'),state=await mkdtemp(join(tmpdir(),'ahp-steering-native-'));
+ await rm(gates,{recursive:true,force:true});const events:any[]=[];
+ const host=await createHost({stateDirectory:state,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_STEERING_EXECUTABLE!,args:['--config',join(owned,'config.json')]}],nativeEvent:async(_context,params)=>{events.push(params.event);}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ const wait=async(predicate:()=>boolean|Promise<boolean>)=>{const until=Date.now()+20000;while(Date.now()<until){if(await predicate())return;await new Promise(resolve=>setTimeout(resolve,10));}throw new Error('Native steering fixture deadline; events='+JSON.stringify(events.slice(-12)));};
+ const exists=async(path:string)=>{try{await stat(path);return true;}catch{return false;}};
+ try{
+  await client.initialize({clientId:'real-steering',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID(),chat=session.replace('ahp-session:','ahp-chat:');await client.request('createSession',{channel:session,workingDirectories:[pathToFileURL(workspace).href]});await client.subscribe(chat,{view:{turns:5}});
+  for(const [prompt,gate,disposition] of [['steering-apply','tool','completed'],['steering-late','checkpoint','failed']]){
+   const commandId=randomUUID(),inputId=randomUUID(),text='Correction '+inputId;
+   await host.submitTurn(session,{commandId,text:prompt,clientId:'real-steering'});await wait(()=>exists(join(gates,gate+'.entered')));
+   client.dispatch(chat,{type:'chat/pendingMessageSet',kind:'steering',id:inputId,message:{text,origin:{kind:'user'}}} as any);
+   await wait(()=>events.some(event=>event.type==='input.accepted'&&event.input_id===inputId));await writeFile(join(gates,gate+'.release'),'');
+   const parent=await host.waitForTurn(session,commandId,30000);assert.equal(parent.completed,true,JSON.stringify(parent));await wait(()=>host.store.receipt(inputId)?.status===disposition);
+   assert.equal(events.filter(event=>event.type==='generation.started'&&event.activeInputId===commandId).length,1);
+   assert.match(host.store.receipt(inputId)!.detail!,disposition==='completed'?/steering:applied/:/steering:held/);
+   assert.equal((await host.readUserMessage(session,inputId)).text,text);
+   const snapshot=await host.inspectRecallSource(session),history=await host.readRecallSource(session,{expectedRevision:snapshot.revision,limit:50});
+   assert.equal(history.rows.some(row=>row.text===text),disposition==='completed');
+  }
+  assert.equal(host.store.turns(chat).turns.length,2);assert.equal(host.diagnostics().steeringDispositionPending,0);
+ }finally{await client.shutdown();await host.close();await rm(state,{recursive:true,force:true});}
+});
