@@ -165,6 +165,28 @@ Optional `clientMetadata` contributes bounded initialization metadata. The
 distribution may advertise a client-bound, read-only migration resource; the
 generic host does not import old client state, drafts or browser storage.
 
+## ACP projection fidelity
+
+Standard ACP text/reasoning, tool calls, offered permissions, plans, resources,
+filesystem/terminal callbacks and mode/config updates project through ordinary
+AHP actions. Tool update fields replace their prior values: `rawInput` objects
+are never concatenated into malformed JSON, and omitted completion fields retain
+previous tool content. A pending permission stays pending when input changes.
+
+Idle `session_info_update` values are preserved, and title changes update the
+session/catalog. Opaque `available_commands_update` lists and context-window /
+cumulative-cost `usage_update` reports have full replacement semantics under
+session `_meta['amplifier.dev/acp']`. They are not invented file-backed AHP skills
+or mislabeled turn token counts. Supplied experimental ACP `PromptResponse.usage`
+reports map matching AHP `chat/usage` fields; unmatched counters and the original
+report remain in usage `_meta['amplifier.dev/acp']`. Clients may render this
+explicit metadata when supported. This does not claim vendor-specific ACP
+extensions or provider authentication UI are implemented.
+
+Session-only metadata updates do not serialize or rewrite the active transcript
+checkpoint. Tool and text state changes append authoritative reducer actions;
+completion writes the retained turn once.
+
 ## Scheduled and source-configured admission
 
 `inspectSession(uri)` reads selected metadata without starting an agent, including

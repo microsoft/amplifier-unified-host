@@ -40,7 +40,7 @@ export interface HostConfig {
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
-interface Active {agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -410,7 +410,7 @@ export class AmplifierHost {
           return this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId,workingDirectory:record.workingDirectory},params);
         }}:{}),
       });active.agent=agent;this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId,creation);const fresh=this.getRecord(uri)!;fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[]}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??[]);return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation);const fresh=this.getRecord(uri)!;fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
       catch(error){this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
   }
@@ -432,8 +432,9 @@ export class AmplifierHost {
           record.chat={...reduced,turns:[]};
         } else record.state=sessionReducer(record.state,action as any);
         record.summary={...record.summary,title:record.state.title,status:record.chat.status,modifiedAt:record.chat.modifiedAt};
-        const streaming=['chat/delta','chat/reasoning','chat/responsePart','chat/toolCallDelta','chat/toolCallContentChanged','chat/usage'].includes(action.type);
-        if(streaming&&record.chat.activeTurn)this.store.appendActive(channel,action);else this.store.save(record);
+        if(channel===record.uri)this.store.saveSessionMetadata(record);
+        else if(record.chat.activeTurn&&action.type!=='chat/turnStarted'&&action.type!=='chat/turnsLoaded')this.store.appendActive(channel,action);
+        else this.store.save(record);
       }
       return this.store.append(channel,action,origin,rejectionReason);
     });
@@ -509,8 +510,14 @@ export class AmplifierHost {
           if(Object.keys(action.config).length!==1)throw new Error('One standard ACP config selector per action is required');
           const active=await this.ensureAgent(record.uri),[configId,value]=Object.entries(action.config)[0];
           if(typeof value!=='string')throw new Error('ACP selector value must be a string');
-          const response=await active.agent.client.setSessionConfigOption({sessionId:active.agent.nativeId!,configId,value});
-          this.configState(record.uri,response.configOptions);this.emit(p.channel,action,origin);return;
+          const current=this.getRecord(record.uri)!;
+          if(configId==='mode'&&(current.state._meta?.['amplifier.dev/acp'] as Json)?.configOptionsProtocol==='legacy-mode'){
+            const modes=(current.state._meta!['amplifier.dev/acp'] as Json).legacyModes;
+            if(!modes.availableModes.some((mode:Json)=>mode.id===value))throw new Error('Unknown ACP legacy mode');
+            await active.agent.client.setSessionMode({sessionId:active.agent.nativeId!,modeId:value});
+            this.configState(record.uri,this.legacyModeOptions({...modes,currentModeId:value}));
+          }else{const response=await active.agent.client.setSessionConfigOption({sessionId:active.agent.nativeId!,configId,value});this.configState(record.uri,response.configOptions);}
+          this.emit(p.channel,action,origin);return;
         }
         throw new Error(`Action is unsupported: ${action.type}`);
       });
@@ -531,7 +538,7 @@ export class AmplifierHost {
       if(current.interruptionRevision!==scheduled.expectedInterruptionRevision||current.executionRevision!==scheduled.expectedExecutionRevision||current.configurationHash!==scheduled.expectedConfigurationHash)throw new Error('Scheduled admission revisions changed');
     }
     this.store.transaction(()=>{this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);this.store.bump(record.uri,'execution');});
-    active.busy=true;active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();
+    active.busy=true;active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
     this.emit(channel,action,origin.clientSeq>=0?origin:undefined);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,scheduled);
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */
@@ -651,6 +658,7 @@ export class AmplifierHost {
       }
       if(typeof response.stopReason!=='string')throw new Error('Native execution did not provide a settled stop reason');
       await active.updates;
+      if(response.usage&&this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/usage',turnId,usage:{inputTokens:response.usage.inputTokens,outputTokens:response.usage.outputTokens,cacheReadTokens:response.usage.cachedReadTokens??undefined,_meta:{'amplifier.dev/acp':{usage:response.usage,experimental:true}}}} as StateAction);
       if(active.cancel&&response.stopReason!=='cancelled')this.emit(channel,active.cancel.action,active.cancel.origin,'Turn finished before cancellation took effect');
       if(this.getRecord(uri)!.chat.activeTurn) this.emit(channel,{type:response.stopReason==='cancelled'?'chat/turnCancelled':'chat/turnComplete',turnId,duration:Date.now()-active.started!,_meta:{'amplifier.dev/acp':{stopReason:response.stopReason}}} as StateAction,response.stopReason==='cancelled'?active.cancel?.origin:undefined);
       this.store.finish(turnId,response.stopReason==='cancelled'?'cancelled':'completed',response.stopReason);
@@ -662,12 +670,18 @@ export class AmplifierHost {
       await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
     }
   }
+  private legacyModeOptions(modes?:Json):any[] {return modes?.availableModes?[{id:'mode',name:'Mode',type:'select',currentValue:modes.currentModeId,options:modes.availableModes.map((mode:Json)=>({value:mode.id,name:mode.name,description:mode.description}))}]:[];}
+  private acpMetadata(uri:string,patch:Json) {
+    if(Buffer.byteLength(JSON.stringify(patch))>512*1024)throw new Error('ACP session metadata exceeds bounded projection capacity');
+    const record=this.getRecord(uri)!;
+    this.emit(uri,{type:'session/metaChanged',_meta:{...record.state._meta,'amplifier.dev/acp':{...(record.state._meta?.['amplifier.dev/acp'] as Json),...patch}}} as StateAction);
+  }
   private configState(uri:string,options:any[]) {
     const record=this.getRecord(uri)!;
     const properties:Record<string,any>={},values:Record<string,unknown>={};
     for(const option of options) {if(option.type!=='select')continue;const choices=(option.options??[]).flatMap((o:any)=>o.options??[o]);properties[option.id]={type:'string',title:option.name,description:option.description,enum:choices.map((o:any)=>o.value),enumLabels:choices.map((o:any)=>o.name),sessionMutable:true};values[option.id]=option.currentValue;}
     if(JSON.stringify(record.state.config?.values??{})!==JSON.stringify(values))this.store.bump(uri,'configuration');
-    record.state.config={schema:{type:'object',properties},values};record.state._meta={...record.state._meta,'amplifier.dev/acp':{...(record.state._meta?.['amplifier.dev/acp'] as Json),configOptions:options}};this.store.save(record);
+    record.state.config={schema:{type:'object',properties},values};record.state._meta={...record.state._meta,'amplifier.dev/acp':{...(record.state._meta?.['amplifier.dev/acp'] as Json),configOptions:options}};this.store.saveSessionMetadata(record);
     this.emit(uri,{type:'session/metaChanged',_meta:record.state._meta} as StateAction);
     this.emit(uri,{type:'session/configChanged',config:values,replace:true} as StateAction);
   }
@@ -693,7 +707,24 @@ export class AmplifierHost {
   private async update(uri:string,params:SessionNotification,projection?:{active:Active;emit:(action:StateAction)=>void}) {
     const active=projection?.active??this.active.get(uri);if(!active)return;
     const update=params.update as any;
-    if(update.sessionUpdate==='config_option_update'){if(!projection)this.configState(uri,update.configOptions);return;}
+    if(update.sessionUpdate==='config_option_update'){if(!projection){this.acpMetadata(uri,{configOptionsProtocol:'standard'});this.configState(uri,update.configOptions);}return;}
+    if(['available_commands_update','usage_update','current_mode_update','session_info_update'].includes(update.sessionUpdate)){
+      if(projection)return;
+      if(update.sessionUpdate==='available_commands_update')this.acpMetadata(uri,{availableCommands:update.availableCommands});
+      if(update.sessionUpdate==='usage_update')this.acpMetadata(uri,{usage:{used:update.used,size:update.size,cost:update.cost??null,_meta:update._meta}});
+      if(update.sessionUpdate==='current_mode_update'){
+        const record=this.getRecord(uri)!,meta=record.state._meta?.['amplifier.dev/acp'] as Json;
+        this.acpMetadata(uri,{currentModeId:update.currentModeId,...(meta?.legacyModes?{legacyModes:{...meta.legacyModes,currentModeId:update.currentModeId}}:{})});
+        if(meta?.legacyModes)this.configState(uri,this.legacyModeOptions({...meta.legacyModes,currentModeId:update.currentModeId}));
+        else if(record.state.config?.schema?.properties?.mode)this.emit(uri,{type:'session/configChanged',config:{mode:update.currentModeId}} as StateAction);
+      }
+      if(update.sessionUpdate==='session_info_update'){
+        this.acpMetadata(uri,{sessionInfo:{...((this.getRecord(uri)!.state._meta?.['amplifier.dev/acp'] as Json)?.sessionInfo??{}),...update}});
+        if(update.title!==undefined)this.emit(uri,{type:'session/titleChanged',title:update.title??''} as StateAction);
+        await this.syncCatalog(this.getRecord(uri)!);
+      }
+      return;
+    }
     if(active.agent.loading)return; // load replay never executes or duplicates the persisted host projection.
     if(!active.busy||!active.turnId)return;
     if(!projection){active.projectionBytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(update));if(active.projectionBytes>(this.config.maxActiveProjectionBytes??8*1024*1024)){void active.agent.client.cancel({sessionId:active.agent.nativeId!}).catch(()=>{});throw new Error('Active view exceeded its byte budget; native history is preserved and execution outcome requires reconciliation');}}
@@ -708,17 +739,19 @@ export class AmplifierHost {
       active.textPart=undefined;
       if(update.content.type==='text'){if(!active.reasoningPart){active.reasoningPart=randomUUID();emit({type:'chat/responsePart',turnId,part:{kind:'reasoning',id:active.reasoningPart,content:''}} as StateAction);}emit({type:'chat/reasoning',turnId,partId:active.reasoningPart,content:update.content.text} as StateAction);}
     } else if(update.sessionUpdate==='tool_call'||update.sessionUpdate==='tool_call_update') {
-      active.textPart=undefined;const id=update.toolCallId;
-      if(!active.tools.has(id)){active.tools.add(id);emit({type:'chat/toolCallStart',turnId,toolCallId:id,toolName:update.kind??'tool',displayName:update.title??'Tool',_meta:{'amplifier.dev/acp':{kind:update.kind,locations:update.locations}}} as StateAction);}
-      const raw=update.rawInput===undefined?undefined:JSON.stringify(update.rawInput);
-      if(raw)emit({type:'chat/toolCallDelta',turnId,toolCallId:id,content:raw} as StateAction);
-      if(['in_progress','completed','failed'].includes(update.status))emit({type:'chat/toolCallReady',turnId,toolCallId:id,invocationMessage:update.title??'Running tool',toolInput:raw,confirmed:'not-needed'} as StateAction);
-      if(update.status==='completed'||update.status==='failed')emit({type:'chat/toolCallComplete',turnId,toolCallId:id,result:{success:update.status==='completed',pastTenseMessage:update.title??'Tool finished',content:await this.toolContent(update.content??[]),structuredContent:update.rawOutput===undefined?undefined:{output:update.rawOutput}}} as StateAction);
-      else if(update.content?.length)emit({type:'chat/toolCallContentChanged',turnId,toolCallId:id,content:await this.toolContent(update.content)} as StateAction);
+      active.textPart=undefined;const id=update.toolCallId;active.toolStates??=new Map();
+      const previous=active.toolStates.get(id)??{},current={...previous,...Object.fromEntries(Object.entries(update).filter(([key,value])=>value!==undefined&&(value!==null||key==='rawInput'||key==='rawOutput')))};
+      active.toolStates.set(id,current);
+      const metadata={'amplifier.dev/acp':{kind:current.kind,locations:current.locations,title:current.title,rawInput:current.rawInput}};
+      if(!active.tools.has(id)){active.tools.add(id);emit({type:'chat/toolCallStart',turnId,toolCallId:id,toolName:current.name??current.kind??'tool',displayName:current.title??'Tool',_meta:metadata} as StateAction);}
+      const raw=current.rawInput===undefined?undefined:JSON.stringify(current.rawInput);
+      // ACP rawInput is a replacement object, never an appendable JSON fragment.
+      if(['in_progress','completed','failed'].includes(current.status)||active.permissions.has(id))emit({type:'chat/toolCallReady',turnId,toolCallId:id,invocationMessage:current.title??'Running tool',toolInput:raw,...(active.permissions.has(id)?{}:{confirmed:'not-needed'}),_meta:metadata} as StateAction);
+      else emit({type:'chat/toolCallDelta',turnId,toolCallId:id,_meta:metadata} as StateAction);
+      if(update.status==='completed'||update.status==='failed')emit({type:'chat/toolCallComplete',turnId,toolCallId:id,result:{success:update.status==='completed',pastTenseMessage:current.title??'Tool finished',content:await this.toolContent(current.content??[]),structuredContent:current.rawOutput===undefined?undefined:{output:current.rawOutput}}} as StateAction);
+      else if(update.content!==undefined)emit({type:'chat/toolCallContentChanged',turnId,toolCallId:id,content:await this.toolContent(current.content??[])} as StateAction);
     } else if(update.sessionUpdate==='plan') {
       emit({type:'chat/responsePart',turnId,part:{kind:'systemNotification',content:update.entries.map((e:any)=>`${e.status}: ${e.content}`).join('\n')}} as StateAction);
-    } else if(update.sessionUpdate==='session_info_update'&&update.title) {
-      if(!projection)this.emit(uri,{type:'session/titleChanged',title:update.title} as StateAction);
     }
   }
   private async permission(uri:string,params:RequestPermissionRequest):Promise<RequestPermissionResponse> {
@@ -727,7 +760,7 @@ export class AmplifierHost {
     if(active.permissions.has(id))throw new Error('Duplicate pending permission identity');
     if(!active.tools.has(id)){active.tools.add(id);this.emit(channel,{type:'chat/toolCallStart',turnId,toolCallId:id,toolName:params.toolCall.kind??'tool',displayName:params.toolCall.title??'Tool'} as StateAction);}
     const result=new Promise<RequestPermissionResponse>(resolve=>active.permissions.set(id,{params,resolve}));
-    this.emit(channel,{type:'chat/toolCallReady',turnId,toolCallId:id,invocationMessage:params.toolCall.title??'Agent requests permission',options:params.options.map(o=>({id:o.optionId,label:o.name,kind:o.kind.startsWith('allow_')?'approve':'deny'}))} as StateAction);
+    this.emit(channel,{type:'chat/toolCallReady',turnId,toolCallId:id,invocationMessage:params.toolCall.title??'Agent requests permission',toolInput:params.toolCall.rawInput===undefined?(active.toolStates?.get(id)?.rawInput===undefined?undefined:JSON.stringify(active.toolStates.get(id)!.rawInput)):JSON.stringify(params.toolCall.rawInput),options:params.options.map(o=>({id:o.optionId,label:o.name,kind:o.kind.startsWith('allow_')?'approve':'deny'}))} as StateAction);
     const tool=this.getRecord(uri)!.chat.activeTurn?.responseParts.find((p:any)=>p.kind==='toolCall'&&p.toolCall.toolCallId===id) as any;
     if(tool)this.emit(uri,{type:'session/inputNeededSet',request:{id,chat:channel,kind:'toolConfirmation',turnId,toolCall:tool.toolCall}} as StateAction);
     return result;

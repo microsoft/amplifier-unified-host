@@ -271,3 +271,46 @@ test('scheduled revisions and unknown creation receipts survive host restart wit
   assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
  }finally{if(replacement)await replacement.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
 });
+
+
+test('independent ACP metadata, legacy modes, usage and raw input replacements preserve official AHP state',async()=>{
+ const f=await setup();try{
+  f.config.engines[0].env.FIXTURE_LEGACY='1';
+  const client=await f.connect(),{session,chat}=await f.create(client);await client.subscribe(session);await client.subscribe(chat,{view:{turns:10}});
+  await waitFor(()=>f.host.store.get(session)?.state.title==='Idle peer title');
+  let state=f.host.store.get(session)!.state,meta=state._meta!['amplifier.dev/acp'] as any;
+  assert.equal(meta.availableCommands[0].name,'inspect');assert.deepEqual(meta.usage.cost,{amount:0.12,currency:'USD'});assert.equal(meta.usage.used,123);assert.equal(meta.sessionInfo.updatedAt,'2026-10-02T00:00:00Z');assert.equal(state.config?.values?.mode,'fast');
+  client.dispatch(session,{type:'session/configChanged',config:{mode:'safe'}});await waitFor(()=>f.host.store.get(session)?.state.config?.values?.mode==='safe');
+  assert.equal(JSON.parse((await readFile(f.log,'utf8')).trim()).modeChange.modeId,'safe');
+  const turn=action('mapping');client.dispatch(chat,turn);await waitFor(()=>f.host.store.receipt(turn.turnId)?.status==='completed');
+  const final=(await client.subscribe(chat,{view:{turns:10}})).result.snapshot!.state as ChatState,tool=(final.turns[0].responseParts.find((part:any)=>part.toolCall?.toolCallId==='replace-tool') as any).toolCall;
+  assert.equal(tool.toolName,'read_file');assert.equal(tool.toolInput,JSON.stringify({path:'final'}));assert.equal(tool.status,'completed');assert.equal(tool.content[0].text,'retained output');assert.equal(tool.partialInput,undefined);
+  assert.equal(final.turns[0].usage?.inputTokens,20);assert.equal(final.turns[0].usage?.outputTokens,11);assert.equal(final.turns[0].usage?.cacheReadTokens,4);assert.equal((final.turns[0].usage?._meta?.['amplifier.dev/acp'] as any).usage.cachedWriteTokens,2);
+  meta=f.host.store.get(session)!.state._meta!['amplifier.dev/acp'] as any;assert.deepEqual(meta.availableCommands,[]);assert.equal(meta.usage.used,321);
+ }finally{await f.cleanup();}
+});
+
+test('session usage metadata during a long response never rewrites the active transcript checkpoint',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session,chat}=await f.create(client);await client.subscribe(chat,{view:{turns:1}});
+  const turn=action('stream-metadata');client.dispatch(chat,turn);
+  await waitFor(()=>(f.host.store.get(session)?.state._meta?.['amplifier.dev/acp'] as any)?.usage?.used===19);
+  const checkpoint=f.host.store.db.prepare('SELECT chat FROM sessions WHERE uri=?').get(session)!.chat as string;
+  assert.ok(checkpoint.length<2000,checkpoint.length);assert.ok(!checkpoint.includes('x'.repeat(100)));
+  assert.equal(f.host.store.get(session)!.chat.activeTurn!.responseParts[0].kind,'markdown');
+  assert.equal((f.host.store.get(session)!.chat.activeTurn!.responseParts[0] as any).content.length,32000);
+  await waitFor(()=>f.host.store.receipt(turn.turnId)?.status==='completed');
+ }finally{await f.cleanup();}
+});
+
+
+test('raw input replacement while awaiting permission never implies approval',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{chat}=await f.create(client);await client.subscribe(chat,{view:{turns:1}});const turn=action('mapping-permission');client.dispatch(chat,turn);
+  const tool=()=>f.host.store.get(chat)?.chat.activeTurn?.responseParts.find((part:any)=>part.toolCall?.toolCallId==='approval-replace') as any;
+  await waitFor(()=>tool()?.toolCall.toolInput===JSON.stringify({path:'new'}));
+  assert.equal(tool().toolCall.status,'pending-confirmation');assert.equal(f.host.store.receipt(turn.turnId)?.status,'dispatching');
+  client.dispatch(chat,{type:'chat/toolCallConfirmed',turnId:turn.turnId,toolCallId:'approval-replace',approved:true,confirmed:'user-action',selectedOptionId:'allow'});
+  await waitFor(()=>f.host.store.receipt(turn.turnId)?.status==='completed');
+ }finally{await f.cleanup();}
+});

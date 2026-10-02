@@ -15,8 +15,11 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   }
   else if(message.method==='_amplifier/native'&&p.operation==='configuration.snapshot')reply(message.id,{version:1,sourceSessionId:p.sessionId,sourceCwd:process.cwd(),configurationHash:'fixture-native-config'});
   else if(message.method==='_amplifier/session/new'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({creation:p})+'\n');if(process.env.FIXTURE_CLONE_CRASH)process.exit(17);sessions.set(p.sessionId,{});reply(message.id,{sessionId:p.sessionId,configOptions:[],_meta:{'amplifier.dev/native':{creationConfirmed:true,configurationHash:p.source.configurationHash}}});}
-  else if(message.method==='session/new'){const sessionId='native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});reply(message.id,{sessionId,configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});}
+  else if(message.method==='session/new'){const sessionId='native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});reply(message.id,{sessionId,...(process.env.FIXTURE_LEGACY?{modes:{currentModeId:'safe',availableModes:[{id:'safe',name:'Safe'},{id:'fast',name:'Fast'}]}}:{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]})});
+    if(process.env.FIXTURE_LEGACY)setTimeout(()=>{update(sessionId,{sessionUpdate:'available_commands_update',availableCommands:[{name:'inspect',description:'Inspect local context',input:{hint:'path'}}]});update(sessionId,{sessionUpdate:'usage_update',used:123,size:4096,cost:{amount:0.12,currency:'USD'}});update(sessionId,{sessionUpdate:'session_info_update',title:'Idle peer title',updatedAt:'2026-10-02T00:00:00Z'});update(sessionId,{sessionUpdate:'current_mode_update',currentModeId:'fast'});},30);
+  }
   else if(message.method==='session/resume'||message.method==='session/load'){sessions.set(p.sessionId,{});reply(message.id,{configOptions:[]});}
+  else if(message.method==='session/set_mode'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({modeChange:p})+'\n');update(p.sessionId,{sessionUpdate:'current_mode_update',currentModeId:p.modeId});reply(message.id,{});}
   else if(message.method==='session/set_config_option')reply(message.id,{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:p.value,options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});
   else if(message.method==='session/close')reply(message.id,{});
   else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&p.operation==='schedule.submit'){
@@ -33,6 +36,29 @@ for await(const line of readline.createInterface({input:process.stdin})) {
         const choice=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'session/request_permission',params:{sessionId:p.sessionId,toolCall:{toolCallId:'tool-1',title:'Write file',kind:'edit',status:'pending'},options:[{optionId:'allow',name:'Allow once',kind:'allow_once'},{optionId:'deny',name:'Deny once',kind:'reject_once'}]}});});
         update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'tool-1',title:'Write file',status:choice.outcome.optionId==='allow'?'completed':'failed',content:[{type:'content',content:{type:'text',text:JSON.stringify(choice)}}]});
       }
+      if(text==='mapping-permission'){
+        update(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'approval-replace',title:'Changed permission input',status:'pending',rawInput:{path:'old'}});
+        const requestId=permissionId++;
+        const choice=new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'session/request_permission',params:{sessionId:p.sessionId,toolCall:{toolCallId:'approval-replace',title:'Changed permission input',status:'pending'},options:[{optionId:'allow',name:'Allow once',kind:'allow_once'},{optionId:'deny',name:'Deny once',kind:'reject_once'}]}});});
+        await new Promise(resolve=>setTimeout(resolve,30));
+        update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'approval-replace',rawInput:{path:'new'}});
+        const result=await choice;
+        update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'approval-replace',status:result.outcome.optionId==='allow'?'completed':'failed'});
+      }
+      if(text==='mapping'){
+        update(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'replace-tool',name:'read_file',title:'Read file',kind:'read',status:'pending',rawInput:{path:'initial'},content:[{type:'content',content:{type:'text',text:'retained output'}}]});
+        update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'replace-tool',rawInput:{path:'replacement'}});
+        update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'replace-tool',status:'in_progress'});
+        update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'replace-tool',rawInput:{path:'final'}});
+        update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'replace-tool',status:'completed'});
+        update(p.sessionId,{sessionUpdate:'available_commands_update',availableCommands:[]});
+        update(p.sessionId,{sessionUpdate:'usage_update',used:321,size:4096,cost:{amount:0.34,currency:'USD'}});
+      }
+      if(text==='stream-metadata'){
+        update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'x'.repeat(32000)}});
+        for(let i=0;i<20;i++)update(p.sessionId,{sessionUpdate:'usage_update',used:i,size:4096});
+        await new Promise(resolve=>setTimeout(resolve,150));
+      }
       if(text==='slow')await new Promise(resolve=>setTimeout(resolve,180));
       if(text==='client-tool'){
         const requestId=permissionId++;
@@ -47,7 +73,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       }
       if(text==='many')for(let i=0;i<100;i++)update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'x'}});
       else update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Echo: '+text}});
-      reply(id,{...(scheduled?{accepted:true,inputId:p.args.inputId}:{}),stopReason:turn.cancelled?'cancelled':'end_turn'});
+      reply(id,{...(text==='mapping'?{usage:{totalTokens:31,inputTokens:20,outputTokens:11,cachedReadTokens:4,cachedWriteTokens:2,thoughtTokens:3}}:{}),...(scheduled?{accepted:true,inputId:p.args.inputId}:{}),stopReason:turn.cancelled?'cancelled':'end_turn'});
     })();
   } else if(message.method==='session/cancel'){if(active)active.cancelled=true;}
   else if(message.id!==undefined)send({id:message.id,error:{code:-32601,message:'Unsupported'}});

@@ -120,7 +120,7 @@ export class AcpProcess {
         if((this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.configurationClone?.version!==1)throw new Error('Agent does not advertise exact configuration cloning');
         const created=await this.client.extMethod('_amplifier/session/new',{...creation,cwd:this.cwd,mcpServers:[]});
         if(created.sessionId!==creation.sessionId||(created._meta as any)?.['amplifier.dev/native']?.creationConfirmed!==true)throw new Error('Native creation was not conclusively confirmed');
-        this.nativeId=String(created.sessionId);return created as {sessionId:string;configOptions?:any[]};
+        this.nativeId=String(created.sessionId);return created as {sessionId:string;configOptions?:any[];modes?:any};
       }
       const created=await this.client.newSession({cwd:this.cwd,mcpServers:[]});this.nativeId=created.sessionId;return created;
     } finally {this.loading=false;}

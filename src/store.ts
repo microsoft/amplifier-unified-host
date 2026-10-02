@@ -83,6 +83,9 @@ export class Store {
       .run(record.uri, record.chat.resource, record.engineId, record.nativeSessionId ?? null, record.workingDirectory, record.summary.modifiedAt, JSON.stringify(record.summary), JSON.stringify(record.state), JSON.stringify({...record.chat, turns: []}));
     this.db.prepare('DELETE FROM active_events WHERE channel=?').run(record.chat.resource);
   }
+  saveSessionMetadata(record:SessionRecord) {
+    this.db.prepare('UPDATE sessions SET modified=?,summary=?,state=? WHERE uri=?').run(record.summary.modifiedAt,JSON.stringify(record.summary),JSON.stringify(record.state),record.uri);
+  }
   appendActive(channel:string,action:unknown){this.db.prepare('INSERT INTO active_events(channel,action) VALUES(?,?)').run(channel,JSON.stringify(action));}
   list(limit: number, after?: {modified: string; uri: string}): SessionSummary[] {
     const rows = after ? this.db.prepare('SELECT summary FROM sessions WHERE (modified,uri)<(?,?) ORDER BY modified DESC,uri DESC LIMIT ?').all(after.modified, after.uri, limit)
