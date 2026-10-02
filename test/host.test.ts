@@ -483,3 +483,16 @@ test('Recall inventories stay cold and pages retain exact messages, scoped curso
   records[0].kind='child';await assert.rejects(reader.inspectRecallSource(records[0].uri),/Child\/internal/);
  }finally{if(reader)await reader.close();await f.cleanup();}
 });
+
+test('question answers use settled common admission, preserve provenance and refuse busy or uncertain replay',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),question={commandId:randomUUID(),text:'Use the blue option',questionId:'q-1',questionRevision:4,answerProvenance:{actor:'user',sourceMessageId:'answer-1',revision:7}};
+  const accepted=await f.host.submitQuestionAnswer(session,question);assert.equal(accepted.accepted,true);assert.equal((await f.host.waitForTurn(session,question.commandId)).completed,true);
+  const input=await f.host.readUserMessage(session,question.commandId);assert.equal(input.inputOrigin,'question');assert.equal(input.questionId,'q-1');assert.deepEqual(input._meta['amplifier.dev/input'],{inputOrigin:'question',questionId:'q-1',questionRevision:4,answerProvenance:question.answerProvenance});
+  const line=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(line.operation,'question.submit');assert.equal(line.args.inputId,question.commandId);assert.equal(line.args.questionRevision,4);assert.deepEqual(line.args.answerProvenance,question.answerProvenance);assert.equal(line.prompt,undefined);
+  await assert.rejects(f.host.submitQuestionAnswer(session,question),/already admitted/);await assert.rejects(f.host.nativeControl(session,'question.submit',{}),/submitQuestionAnswer admission/);
+  const slow=randomUUID();await f.host.submitTurn(session,{commandId:slow,text:'slow',clientId:'owner'});const busy={...question,commandId:randomUUID()};assert.deepEqual(await f.host.submitQuestionAnswer(session,busy),{accepted:false,executed:false,reason:'A turn is already running; queued turns and steering are not advertised'});assert.equal(f.host.store.receipt(busy.commandId),undefined);await f.host.waitForTurn(session,slow);
+  const denied={...question,commandId:randomUUID(),questionRevision:99};assert.equal((await f.host.submitQuestionAnswer(session,denied)).accepted,true);assert.equal((await f.host.waitForTurn(session,denied.commandId)).status,'failed');
+  const uncertain={...question,commandId:randomUUID(),text:'crash'};assert.equal((await f.host.submitQuestionAnswer(session,uncertain)).accepted,true);assert.equal((await f.host.waitForTurn(session,uncertain.commandId)).status,'unknown');await assert.rejects(f.host.submitQuestionAnswer(session,uncertain),/already admitted/);assert.equal((await readFile(f.log,'utf8')).split('\n').filter(line=>line.includes(uncertain.commandId)).length,1);
+ }finally{await f.cleanup();}
+});

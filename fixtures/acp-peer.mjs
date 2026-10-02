@@ -9,7 +9,7 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
   else if(message.method==='_amplifier/retire'){
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
@@ -55,10 +55,10 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='session/set_mode'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({modeChange:p})+'\n');update(p.sessionId,{sessionUpdate:'current_mode_update',currentModeId:p.modeId});reply(message.id,{});}
   else if(message.method==='session/set_config_option')reply(message.id,{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:p.value,options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});
   else if(message.method==='session/close')reply(message.id,{});
-  else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&p.operation==='schedule.submit'){
+  else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&['schedule.submit','question.submit'].includes(p.operation)){
     if(retired){send({id:message.id,error:{code:-32000,message:'Session handle retired'}});continue;}
     const scheduled=message.method==='_amplifier/native';
-    if(scheduled&&p.args.taskRevision===99){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}
+    if(scheduled&&(p.args.taskRevision===99||p.args.questionRevision===99)){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}
     if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({...p,...(process.env.FIXTURE_LOCATIONS?{processCwd:process.cwd()}: {})})+'\n');
     const text=scheduled?p.args.text:p.prompt.filter(b=>b.type==='text').map(b=>b.text).join(' '),id=message.id;
     active={id,sessionId:p.sessionId,cancelled:false};

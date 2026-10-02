@@ -388,3 +388,19 @@ Native/catalog integration tests require explicit `ACP_EXECUTABLE` and
 `CATALOG_EXECUTABLE`; Core/Foundation execution tests additionally require the
 owned fixture configuration variables documented in the integration test. Skipped
 native tests are not native-runtime or real-account qualification.
+
+## Question answer admission
+
+`submitQuestionAnswer(session,{commandId,text,questionId,questionRevision,
+answerProvenance})` uses the same durable admission and ACP stream as normal turns.
+It requires negotiated native `questionTurns: {version:1,completion:'settled'}`;
+the native owner verifies the exact saved answer through `questions.delivery.admit`
+before execution. Both host input metadata and canonical native history retain
+`inputOrigin:'question'`, the question revision and bounded answer provenance.
+
+A known busy/unavailable preflight returns `{accepted:false,executed:false,reason}`.
+Host admission returns `{accepted:true,turnId,receipt}`; `waitForTurn` observes its
+terminal completed/failed/cancelled/unknown outcome. A lost response is unknown and
+a reused command never repeats delivery. Generic `nativeControl('question.submit')`
+is refused. In-flight answers to a waiting dependent turn require a separate native
+steering lifecycle and are not faked by a competing prompt collector or idle queue.

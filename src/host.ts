@@ -54,6 +54,7 @@ export interface HostConfig {
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
+interface SettledInput {operation:'schedule.submit'|'question.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
 interface Active {observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
@@ -613,7 +614,7 @@ export class AmplifierHost {
       });
     } catch(error) {this.emit(p.channel,action,origin,(error as Error).message);}
   }
-  private async admitTurn(record:SessionRecord,channel:string,action:Extract<StateAction,{type:'chat/turnStarted'}>,origin:NonNullable<ActionEnvelope['origin']>,scheduled?:Json) {
+  private async admitTurn(record:SessionRecord,channel:string,action:Extract<StateAction,{type:'chat/turnStarted'}>,origin:NonNullable<ActionEnvelope['origin']>,special?:SettledInput) {
     record=this.getRecord(record.uri)!;
     if(channel!==record.chat.resource||!action.turnId||typeof action.message?.text!=='string'||action.message.origin?.kind!=='user'||!Number.isFinite(Date.parse(action.startedAt)))throw new Error('Malformed user turn');
     if(record.state.lifecycle!==SessionLifecycle.Ready)throw new Error('Session creation has not completed; reconcile its outcome before execution');
@@ -622,14 +623,14 @@ export class AmplifierHost {
     const blocks=this.prompt(action.message),active=await this.ensureAgent(record.uri);
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
-    if(scheduled){
-      if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.scheduledTurns?.version!==1)throw new Error('Agent does not advertise settled scheduled turns');
-      const current=await this.inspectSession(record.uri);
-      if(current.interruptionRevision!==scheduled.expectedInterruptionRevision||current.executionRevision!==scheduled.expectedExecutionRevision||current.configurationHash!==scheduled.expectedConfigurationHash)throw new Error('Scheduled admission revisions changed');
+    if(special){
+      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':'questionTurns'];
+      if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
+      if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
     this.store.transaction(()=>{this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);this.store.bump(record.uri,'execution');});
     active.busy=true;active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
-    this.emit(channel,action,origin.clientSeq>=0?origin:undefined);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,scheduled);
+    this.emit(channel,action,origin.clientSeq>=0?origin:undefined);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,special);
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */
   async submitTurn(session:string,input:{commandId:string;text:string;clientId:string;attachments?:Message['attachments']}) {
@@ -673,9 +674,22 @@ export class AmplifierHost {
       if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Scheduled command already admitted; inspect its receipt without replay');
       try {
         const meta={inputOrigin:'scheduled',scheduledRunId:input.scheduledRunId??input.commandId,taskId:input.taskId,taskRevision:input.taskRevision,kind:input.kind};
-        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:'user'},_meta:{'amplifier.dev/scheduled':meta}}} as any,{clientId:'host:schedule',clientSeq:this.store.extensionSequence('host:schedule')},input);
+        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:'user'},_meta:{'amplifier.dev/scheduled':meta}}} as any,{clientId:'host:schedule',clientSeq:this.store.extensionSequence('host:schedule')},{operation:'schedule.submit',args:{taskId:input.taskId,taskRevision:input.taskRevision,text:input.text,kind:input.kind,interruptionRevision:input.expectedInterruptionRevision},expected:{executionRevision:input.expectedExecutionRevision,interruptionRevision:input.expectedInterruptionRevision,configurationHash:input.expectedConfigurationHash}});
         return {accepted:true,turnId:input.commandId,receipt:this.store.receipt(input.commandId)};
       }catch(error){if(this.store.receipt(input.commandId))throw error;return {accepted:false,reason:(error as Error).message};}
+    });
+  }
+  /** Saved answer authority is checked by the native questions owner before execution. Idle only. */
+  async submitQuestionAnswer(session:string,input:{commandId:string;text:string;questionId:string;questionRevision:number;answerProvenance:Json}) {
+    if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.text!=='string'||!input.text.trim()||Buffer.byteLength(input.text)>1024*1024||typeof input.questionId!=='string'||!input.questionId||input.questionId.length>200||!Number.isSafeInteger(input.questionRevision)||input.questionRevision<0||!input.answerProvenance||typeof input.answerProvenance!=='object'||Array.isArray(input.answerProvenance)||Buffer.byteLength(JSON.stringify(input.answerProvenance))>8192)throw new RpcFault(-32602,'Bounded question identity, revision, answer and provenance required');
+    const record=await this.record(session);
+    return this.withLock(record.uri,async()=>{
+      if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Question command already admitted; inspect its receipt without replay');
+      try{
+        const metadata={inputOrigin:'question',questionId:input.questionId,questionRevision:input.questionRevision,answerProvenance:input.answerProvenance};
+        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:'user'},_meta:{'amplifier.dev/input':metadata}}} as any,{clientId:'host:question',clientSeq:this.store.extensionSequence('host:question')},{operation:'question.submit',args:{text:input.text,questionId:input.questionId,questionRevision:input.questionRevision,answerProvenance:input.answerProvenance}});
+        return {accepted:true,turnId:input.commandId,receipt:this.store.receipt(input.commandId)};
+      }catch(error){if(this.store.receipt(input.commandId))throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});return {accepted:false,executed:false,reason:(error as Error).message};}
     });
   }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
@@ -758,14 +772,14 @@ export class AmplifierHost {
       if(block.type==='resource'&&!capabilities?.embeddedContext)throw new Error('Agent did not advertise embedded context');
     }
   }
-  private async run(uri:string,active:Active,blocks:ContentBlock[],scheduled?:Json) {
+  private async run(uri:string,active:Active,blocks:ContentBlock[],special?:SettledInput) {
     const channel=chatURI(uri),turnId=active.turnId!;
     try {
-      const response:Json=scheduled?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'schedule.submit',args:{taskId:scheduled.taskId,taskRevision:scheduled.taskRevision,inputId:turnId,text:scheduled.text,kind:scheduled.kind,interruptionRevision:scheduled.expectedInterruptionRevision}}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
-      if(scheduled&&response.accepted!==true){
-        if(response.accepted!==false)throw new Error('Native scheduled outcome was not conclusive');
-        await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native schedule rejected'));
-        this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:String(response.reason??'Native schedule rejected before execution')}}} as StateAction);return;
+      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId}}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId}}});
+      if(special&&response.accepted!==true){
+        if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
+        await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
+        this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{message:String(response.reason??'Native input rejected before execution')}}} as StateAction);return;
       }
       if(typeof response.stopReason!=='string')throw new Error('Native execution did not provide a settled stop reason');
       await active.updates;
@@ -1039,7 +1053,7 @@ export class AmplifierHost {
     session=(await this.record(session)).uri;
     if(this.relocationFence(session))throw new RpcFault(-32011,'Session relocation is fenced; no runtime control was dispatched');
     if(operation==='session.relocate')throw new RpcFault(-32602,'Relocation requires relocateSession admission');
-    if(operation==='schedule.submit')throw new RpcFault(-32602,'Scheduled execution requires submitScheduled admission');
+    if(operation==='schedule.submit'||operation==='question.submit')throw new RpcFault(-32602,'Execution requires submitScheduled or submitQuestionAnswer admission');
     const execute=async()=>{
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
       if(!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32008,'No existing owned native runtime; no process was started');

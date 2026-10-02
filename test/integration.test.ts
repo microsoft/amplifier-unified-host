@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp,mkdir,writeFile,readFile,rm,realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createHost } from '../src/host.js';
 import { StdioCatalog } from '../src/catalog.js';
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
@@ -88,5 +89,18 @@ test('real native graceful retirement releases a host slot only after confirmed 
   await client.request('createSession',{channel:first,workingDirectories:[new URL('file://'+workspace).href]});await client.request('createSession',{channel:second,workingDirectories:[new URL('file://'+workspace).href]});
   assert.equal(host.diagnostics().activeAgents,1);assert.equal(stopped.length,1);assert.equal(stopped[0].session,first);await assert.rejects(host.nativeControlExisting(first,'budget.get',{}),/No existing owned native runtime/);
   assert.equal((await host.inspectSession(first)).status,'idle');assert.equal((await host.readSessionContext(first)).messages.length,0);
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});
+
+test('actual Core/Foundation question admission preserves canonical answer provenance without plain prompt fallback',{skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-question-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!),{randomUUID,createHash}=await import('node:crypto'),proofs:any[]=[];
+ const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}],nativeHostCapabilities:{version:1,features:{questions:true}},nativeHostRequest:async(context,request)=>{assert.equal(request.operation,'questions.delivery.admit');proofs.push({context,args:request.args});return {admitted:true,inputId:request.args.inputId,questionId:request.args.questionId,questionRevision:request.args.questionRevision,answerHash:createHash('sha256').update(request.args.text).digest('hex')};}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'question-integration',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID();await client.request('createSession',{channel:session,provider:'amplifier',workingDirectories:[pathToFileURL(workspace).href]});
+  const answer={commandId:randomUUID(),questionId:'native-question-proof',questionRevision:2,text:'Use the exact saved answer',answerProvenance:{actor:'user',sourceMessageId:'owner-record-1'}};
+  const admitted=await host.submitQuestionAnswer(session,answer);assert.equal(admitted.accepted,true);const result=await host.waitForTurn(session,answer.commandId);assert.equal(result.status,'completed');assert.equal(proofs.length,1);assert.equal(proofs[0].context.session,session);assert.equal(proofs[0].args.inputId,answer.commandId);
+  const indexed=await host.readUserMessage(session,answer.commandId);assert.equal(indexed.inputOrigin,'question');assert.equal(indexed._meta['amplifier.dev/input'].questionRevision,2);
+  const source=await host.inspectRecallSource(session),page=await host.readRecallSource(session,{expectedRevision:source.revision,limit:1}),persisted=page.rows.find(row=>row.role==='user');assert.equal(persisted?.inputOrigin,'question');assert.equal(persisted?.questionId,answer.questionId);assert.equal(persisted?.authorization,'unverified-native-history');
+  await assert.rejects(host.submitQuestionAnswer(session,answer),/already admitted/);assert.equal(proofs.length,1);
  }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
 });
