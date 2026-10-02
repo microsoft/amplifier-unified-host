@@ -49,3 +49,29 @@ test('real Core/Foundation scheduled work and exact source configuration clone u
   assert.equal((await host.readSessionContext(created.uri)).messages.length,0);
  }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
 });
+
+
+test('actual native worktree handoff keeps transcript home, execution cwd, IDs and cloned configuration separate', {skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_RELOCATION_TEST_CONFIG},async()=>{
+ const {execFileSync}=await import('node:child_process'),{randomUUID}=await import('node:crypto'),{dirname}=await import('node:path'),{pathToFileURL}=await import('node:url'),{readdir}=await import('node:fs/promises');
+ const nativeConfig=process.env.ACP_RELOCATION_TEST_CONFIG!,owned=dirname(nativeConfig),workspace=await realpath(join(owned,'workspace')),target=join(owned,'worktree-'+randomUUID()),state=await mkdtemp(join(tmpdir(),'ahp-relocation-state-'));
+ execFileSync('git',['init',workspace]);execFileSync('git',['-C',workspace,'-c','user.name=Fixture','-c','user.email=fixture@invalid','commit','--allow-empty','-m','Owned qualification']);execFileSync('git',['-C',workspace,'worktree','add','-b','qualification-'+randomUUID(),target]);
+ const config={stateDirectory:state,allowedWorkspaceRoots:[owned],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',nativeConfig]}]};
+ let host=await createHost(config);const client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'real-relocator',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID();await client.request('createSession',{channel:session,workingDirectories:[pathToFileURL(workspace).href]});
+  await host.nativeControl(session,'budget.set',{contextTokens:7654});
+  const first=randomUUID();await host.submitTurn(session,{commandId:first,text:'Before host worktree handoff',clientId:'real-relocator'});assert.equal((await host.waitForTurn(session,first,30000)).completed,true);
+  const before=await host.inspectSession(session),projects=join(owned,'home/projects'),project=(await readdir(projects)).find(name=>name===workspace.replaceAll('/','-'))!;assert.ok(project);const transcript=join(projects,project,'sessions',before.nativeSessionId!,'transcript.jsonl'),original=await readFile(transcript,'utf8');
+  const commandId=randomUUID(),moved=await host.relocateSession(session,{commandId,target,expectedExecutionRevision:before.executionRevision});assert.equal(moved.applied,true,JSON.stringify(moved));
+  assert.equal((await host.nativeControl(session,'budget.get',{})).contextTokens,7654);
+  const second=randomUUID();await host.submitTurn(session,{commandId:second,text:'After host worktree handoff',clientId:'real-relocator'});assert.equal((await host.waitForTurn(session,second,30000)).completed,true);
+  const history=await readFile(transcript,'utf8');assert.ok(history.includes('Before host worktree handoff'));assert.ok(history.includes('After host worktree handoff'));assert.ok(history.length>original.length);
+  assert.equal((await host.inspectSession(session)).historyHome,workspace);assert.equal((await host.inspectSession(session)).executionDirectory,target);
+  const current=await host.inspectSession(session),clone=await host.createSession({commandId:randomUUID(),idempotencyKey:randomUUID(),sourceSession:session,expectedConfigurationHash:current.configurationHash});
+  const cloned=await host.inspectSession(clone.uri);assert.equal(cloned.executionDirectory,target);assert.equal(cloned.historyHome,workspace);assert.equal(cloned.nativeLocationRevision,0);assert.equal((await host.readSessionContext(clone.uri)).messages.length,0);assert.equal((await host.nativeControl(clone.uri,'budget.get',{})).contextTokens,7654);
+  await client.shutdown();await host.close();host=await createHost(config);
+  const third=randomUUID();await host.submitTurn(session,{commandId:third,text:'Fresh host retains relocated execution',clientId:'real-relocator'});assert.equal((await host.waitForTurn(session,third,30000)).completed,true);
+  assert.equal((await host.inspectSession(session)).nativeSessionId,before.nativeSessionId);assert.ok((await readFile(transcript,'utf8')).includes('Fresh host retains relocated execution'));
+  const snapshot=await host.nativeControl(session,'configuration.snapshot',{});assert.equal(snapshot.sourceCwd,workspace);assert.equal(snapshot.executionDirectory,target);assert.equal(snapshot.locationRevision,1);
+ }finally{await client.shutdown();await host.close();execFileSync('git',['-C',workspace,'worktree','remove','--force',target]);await rm(state,{recursive:true,force:true});}
+});

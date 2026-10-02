@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chatReducer, type ActionEnvelope, type ChatState, type SessionState, type SessionSummary, type Turn } from '@microsoft/agent-host-protocol';
 
 export interface SessionRecord {
-  uri: string; engineId: string; nativeSessionId?: string; workingDirectory: string;
+  uri: string; engineId: string; nativeSessionId?: string; workingDirectory: string; executionDirectory?:string; nativeLocationRevision?:number;
   summary: SessionSummary; state: SessionState; chat: ChatState;
 }
 export interface Receipt {
@@ -46,11 +46,17 @@ export class Store {
       CREATE INDEX IF NOT EXISTS receipt_origin_lookup ON receipts(client_id,client_seq);
       CREATE TABLE IF NOT EXISTS terminals(uri TEXT PRIMARY KEY,session TEXT NOT NULL,modified TEXT NOT NULL,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS session_admission(uri TEXT PRIMARY KEY,execution INTEGER NOT NULL DEFAULT 0,interruption INTEGER NOT NULL DEFAULT 0,configuration INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS relocations(command_id TEXT PRIMARY KEY,uri TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS relocations_session ON relocations(uri,status);
+      CREATE INDEX IF NOT EXISTS relocations_source ON relocations(source,status);
+      CREATE INDEX IF NOT EXISTS relocations_target ON relocations(target,status);
       CREATE TABLE IF NOT EXISTS creation_keys(identity TEXT PRIMARY KEY,command_id TEXT NOT NULL,uri TEXT NOT NULL,fingerprint TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);
     `);
     if(!this.db.prepare('PRAGMA table_info(terminals)').all().some(column=>column.name==='lifecycle'))this.db.exec("ALTER TABLE terminals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'exited'; UPDATE terminals SET lifecycle=json_extract(payload,'$.lifecycle.status');");
+    if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='execution_cwd'))this.db.exec('ALTER TABLE sessions ADD COLUMN execution_cwd TEXT; ALTER TABLE sessions ADD COLUMN native_location_revision INTEGER NOT NULL DEFAULT 0; UPDATE sessions SET execution_cwd=cwd');
+    this.db.exec("CREATE INDEX IF NOT EXISTS sessions_execution ON sessions(execution_cwd); CREATE INDEX IF NOT EXISTS sessions_history ON sessions(cwd); UPDATE relocations SET status='unknown' WHERE status='admitted';");
     this.db.exec('CREATE INDEX IF NOT EXISTS terminals_lifecycle ON terminals(lifecycle,modified DESC)');
     this.replayBytes=Number(this.db.prepare('SELECT coalesce(sum(bytes),0) AS n FROM actions').get()!.n);
     // An interrupted admitted/dispatching command is never sent again automatically.
@@ -75,12 +81,12 @@ export class Store {
     let chat=JSON.parse(row.chat as string) as ChatState;
     for(const event of this.db.prepare('SELECT action FROM active_events WHERE channel=? ORDER BY seq').iterate(chat.resource))chat=chatReducer(chat,JSON.parse(event.action as string));
     return {uri: row.uri as string, engineId: row.engine_id as string, nativeSessionId: row.native_id as string | undefined,
-      workingDirectory: row.cwd as string, summary: JSON.parse(row.summary as string), state: JSON.parse(row.state as string), chat};
+      workingDirectory: row.cwd as string,executionDirectory:(row.execution_cwd??row.cwd) as string,nativeLocationRevision:Number(row.native_location_revision??0), summary: JSON.parse(row.summary as string), state: JSON.parse(row.state as string), chat};
   }
   save(record: SessionRecord) {
     if(!this.transactionOpen){this.transaction(()=>this.save(record));return;}
-    this.db.prepare(`INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(uri) DO UPDATE SET native_id=excluded.native_id,modified=excluded.modified,summary=excluded.summary,state=excluded.state,chat=excluded.chat`)
-      .run(record.uri, record.chat.resource, record.engineId, record.nativeSessionId ?? null, record.workingDirectory, record.summary.modifiedAt, JSON.stringify(record.summary), JSON.stringify(record.state), JSON.stringify({...record.chat, turns: []}));
+    this.db.prepare(`INSERT INTO sessions(uri,chat_uri,engine_id,native_id,cwd,modified,summary,state,chat,execution_cwd,native_location_revision) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uri) DO UPDATE SET native_id=excluded.native_id,modified=excluded.modified,summary=excluded.summary,state=excluded.state,chat=excluded.chat,execution_cwd=excluded.execution_cwd,native_location_revision=excluded.native_location_revision`)
+      .run(record.uri, record.chat.resource, record.engineId, record.nativeSessionId ?? null, record.workingDirectory, record.summary.modifiedAt, JSON.stringify(record.summary), JSON.stringify(record.state), JSON.stringify({...record.chat, turns: []}),record.executionDirectory??record.workingDirectory,record.nativeLocationRevision??0);
     this.db.prepare('DELETE FROM active_events WHERE channel=?').run(record.chat.resource);
   }
   saveSessionMetadata(record:SessionRecord) {

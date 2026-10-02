@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp,readFile,rm,writeFile } from 'node:fs/promises';
+import { mkdtemp,mkdir,realpath,readFile,rm,writeFile } from 'node:fs/promises';
 import WebSocket from 'ws';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -312,5 +312,60 @@ test('raw input replacement while awaiting permission never implies approval',as
   assert.equal(tool().toolCall.status,'pending-confirmation');assert.equal(f.host.store.receipt(turn.turnId)?.status,'dispatching');
   client.dispatch(chat,{type:'chat/toolCallConfirmed',turnId:turn.turnId,toolCallId:'approval-replace',approved:true,confirmed:'user-action',selectedOptionId:'allow'});
   await waitFor(()=>f.host.store.receipt(turn.turnId)?.status==='completed');
+ }finally{await f.cleanup();}
+});
+
+
+test('relocation preserves history identity and configuration, resumes in target, and excludes deletion',async()=>{
+ const f=await setup();try{
+  f.config.engines[0].env.FIXTURE_LOCATIONS='1';
+  const client=await f.connect(),{session,chat}=await f.create(client),target=join(await realpath(f.dir),'worktree');await mkdir(target);
+  const first=randomUUID();await f.host.submitTurn(session,{commandId:first,text:'before move',clientId:'relocator'});await f.host.waitForTurn(session,first);
+  const before=await f.host.inspectSession(session),commandId=randomUUID();
+  const result=await f.host.relocateSession(session,{commandId,target,expectedExecutionRevision:before.executionRevision});assert.equal(result.applied,true,JSON.stringify(result));
+  const after=await f.host.inspectSession(session);assert.equal(after.nativeSessionId,before.nativeSessionId);assert.equal(after.historyHome,before.historyHome);assert.equal(after.executionDirectory,target);assert.equal(after.executionRevision,before.executionRevision+1);assert.equal(after.configurationHash,before.configurationHash);
+  assert.deepEqual(await f.host.relocateSession(session,{commandId,target,expectedExecutionRevision:before.executionRevision}),result);
+  const stale=await f.host.relocateSession(session,{commandId:randomUUID(),target,expectedExecutionRevision:before.executionRevision});assert.equal(stale.executed,false);
+  assert.equal((await f.host.directoryInUse(target)).inUse,true);let removed=false;await assert.rejects(f.host.withDirectoryGuard(target,async()=>{removed=true;}),/referenced/);assert.equal(removed,false);
+  const second=randomUUID();await f.host.submitTurn(session,{commandId:second,text:'after move',clientId:'relocator'});assert.equal((await f.host.waitForTurn(session,second)).completed,true);
+  const log=(await readFile(f.log,'utf8')).trim().split('\n').map(line=>JSON.parse(line)),resume=log.find(item=>item.resumed);assert.equal(resume.resumed.cwd,target);assert.equal(resume.resumed._meta['amplifier.dev/native'].historyCwd,before.historyHome);assert.equal(log.at(-1).processCwd,target);
+  assert.equal(f.host.store.turns(chat).turns.length,2);
+ }finally{await f.cleanup();}
+});
+
+test('lost relocation result survives restart, fences target, and reconciles durable native proof without replay',async()=>{
+ const f=await setup();let replacement:any;try{
+  const client=await f.connect(),{session}=await f.create(client),target=join(await realpath(f.dir),'lost');await mkdir(target);
+  const before=await f.host.inspectSession(session),commandId=randomUUID();
+  await assert.rejects(f.host.relocateSession(session,{commandId,target,expectedExecutionRevision:before.executionRevision}),(error:any)=>error.data?.receipt===commandId&&error.data.outcome==='unknown');
+  assert.equal(f.host.store.receipt(commandId)?.status,'unknown');assert.equal((await f.host.inspectSession(session)).executionDirectory,before.historyHome);assert.equal((await f.host.directoryInUse(target)).pending,true);
+  const noReplay=randomUUID();await assert.rejects(f.host.submitTurn(session,{commandId:noReplay,text:'must not execute',clientId:'relocator'}),/fenced/);assert.equal(f.host.store.receipt(noReplay),undefined);
+  await client.shutdown();await f.host.close();replacement=await createHost(f.config);
+  assert.equal((await replacement.inspectSession(session)).relocationFence.commandId,commandId);
+  const fix=randomUUID(),reconciled=await replacement.relocateSession(session,{commandId:fix,target,expectedExecutionRevision:before.executionRevision,reconciles:commandId,evidence:{reviewed:true}});
+  assert.equal(reconciled.applied,true,JSON.stringify(reconciled));assert.equal((await replacement.inspectSession(session)).relocationFence,undefined);assert.equal(replacement.store.receipt(commandId)?.status,'completed');assert.equal((await replacement.directoryInUse(target)).pending,false);
+  assert.equal((await replacement.relocateSession(session,{commandId,target,expectedExecutionRevision:before.executionRevision})).applied,true);
+  const native=JSON.parse(await readFile(f.log+'.locations','utf8'))[before.nativeSessionId!];assert.equal(native.executionRevision,1);assert.equal(native.receipt.commandId,commandId);
+ }finally{if(replacement)await replacement.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
+});
+
+test('directory removal reservation excludes racing new-session admission and unsupported preflight is known',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),target=join(await realpath(f.dir),'unused');await mkdir(target);
+  let entered!:()=>void,release!:()=>void;const started=new Promise<void>(resolve=>entered=resolve),hold=new Promise<void>(resolve=>release=resolve);
+  const removing=f.host.withDirectoryGuard(target,async()=>{entered();await hold;await rm(target,{recursive:true});});await started;
+  const session='ahp-session:/'+randomUUID(),creation=client.request('createSession',{channel:session,workingDirectories:[pathToFileURL(target).href]});const checked=assert.rejects(creation);await new Promise(resolve=>setTimeout(resolve,30));assert.equal(f.host.store.get(session),undefined);
+  release();await removing;await checked;assert.equal(f.host.store.get(session),undefined);
+  const created=await f.create(client),before=await f.host.inspectSession(created.session),bad=await f.host.relocateSession(created.session,{commandId:randomUUID(),target,expectedExecutionRevision:before.executionRevision});assert.equal(bad.executed,false);assert.equal(bad.applied,false);
+ }finally{await f.cleanup();}
+});
+
+
+test('indexed removal evidence refuses incomplete, stale and issue-bearing catalog coverage',async()=>{
+ const f=await setup();try{
+  const target=join(await realpath(f.dir),'removable');await mkdir(target);
+  let freshness:any={phase:'not-started',issues:0};f.host.config.catalog={list:async()=>({items:[]}),get:async()=>undefined,upsert:async()=>{},directoryInUse:async()=>({inUse:false,coverage:'indexed-native-history',freshness})};
+  for(const evidence of [{phase:'not-started',issues:0},{phase:'running',issues:0},{phase:'complete',completedAt:new Date().toISOString(),issues:1},{phase:'complete',completedAt:new Date(Date.now()-700000).toISOString(),issues:0}]){freshness=evidence;await assert.rejects(f.host.withDirectoryGuard(target,async()=>{}),/referenced/);}
+  freshness={phase:'complete',completedAt:new Date().toISOString(),issues:0};assert.equal(await f.host.withDirectoryGuard(target,async()=>true),true);
  }finally{await f.cleanup();}
 });

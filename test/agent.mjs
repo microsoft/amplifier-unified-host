@@ -1,31 +1,44 @@
 // Independent JSON-RPC ACP fixture: no host imports and no production models/accounts.
 import readline from 'node:readline';
-import { appendFileSync,readFileSync } from 'node:fs';
+import { appendFileSync,readFileSync,writeFileSync,existsSync } from 'node:fs';
 const sessions=new Map();let active;let permissionId=1000;const pending=new Map();
 const send=m=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...m})+'\n');
 const update=(sessionId,update)=>send({method:'session/update',params:{sessionId,update}});
 const reply=(id,result)=>send({id,result});
+const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+'.locations')?JSON.parse(readFileSync(process.env.FIXTURE_LOG+'.locations','utf8')):{};
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined){pending.get(message.id)?.(message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
   else if(message.method==='_amplifier/history'){
     const groups=JSON.parse(readFileSync(process.env.FIXTURE_HISTORY,'utf8'));const end=p.cursor?Number(p.cursor):groups.length,start=Math.max(0,end-p.limit);
     reply(message.id,{turnGroups:groups.slice(start,end),revision:'fixture-revision',diagnostics:[],nextCursor:start?String(start):null});
+  }
+  else if(message.method==='_amplifier/relocation'||message.method==='_amplifier/relocation/reconcile'){
+    const location=locations()[p.sessionId]??{sessionId:p.sessionId,historyCwd:p.historyCwd,executionDirectory:p.historyCwd,executionRevision:0,blocked:false};
+    reply(message.id,{...location,...(message.method.endsWith('/reconcile')?{reconciled:location.receipt?.commandId===p.commandId&&location.receipt?.status==='applied'}:{})});
+  }
+  else if(message.method==='_amplifier/native'&&p.operation==='session.relocate'){
+    const entries=locations(),prior=entries[p.sessionId]??{historyCwd:process.cwd(),executionDirectory:process.cwd(),executionRevision:0};
+    if(p.args.expectedExecutionRevision!==prior.executionRevision){reply(message.id,{applied:false,reason:'Location revision changed'});continue;}
+    const result={sessionId:p.sessionId,historyCwd:prior.historyCwd,executionDirectory:p.args.target,executionRevision:prior.executionRevision+1,blocked:false,receipt:{commandId:p.args.commandId,status:'applied',target:p.args.target}};
+    entries[p.sessionId]=result;writeFileSync(process.env.FIXTURE_LOG+'.locations',JSON.stringify(entries));
+    if(p.args.target.endsWith('/lost')){process.exit(17);continue;}
+    reply(message.id,{...result,applied:true});
   }
   else if(message.method==='_amplifier/native'&&p.operation==='configuration.snapshot')reply(message.id,{version:1,sourceSessionId:p.sessionId,sourceCwd:process.cwd(),configurationHash:'fixture-native-config'});
   else if(message.method==='_amplifier/session/new'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({creation:p})+'\n');if(process.env.FIXTURE_CLONE_CRASH)process.exit(17);sessions.set(p.sessionId,{});reply(message.id,{sessionId:p.sessionId,configOptions:[],_meta:{'amplifier.dev/native':{creationConfirmed:true,configurationHash:p.source.configurationHash}}});}
   else if(message.method==='session/new'){const sessionId='native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});reply(message.id,{sessionId,...(process.env.FIXTURE_LEGACY?{modes:{currentModeId:'safe',availableModes:[{id:'safe',name:'Safe'},{id:'fast',name:'Fast'}]}}:{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]})});
     if(process.env.FIXTURE_LEGACY)setTimeout(()=>{update(sessionId,{sessionUpdate:'available_commands_update',availableCommands:[{name:'inspect',description:'Inspect local context',input:{hint:'path'}}]});update(sessionId,{sessionUpdate:'usage_update',used:123,size:4096,cost:{amount:0.12,currency:'USD'}});update(sessionId,{sessionUpdate:'session_info_update',title:'Idle peer title',updatedAt:'2026-10-02T00:00:00Z'});update(sessionId,{sessionUpdate:'current_mode_update',currentModeId:'fast'});},30);
   }
-  else if(message.method==='session/resume'||message.method==='session/load'){sessions.set(p.sessionId,{});reply(message.id,{configOptions:[]});}
+  else if(message.method==='session/resume'||message.method==='session/load'){sessions.set(p.sessionId,{});if(process.env.FIXTURE_LOCATIONS)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({resumed:p,processCwd:process.cwd()})+'\n');reply(message.id,{configOptions:[]});}
   else if(message.method==='session/set_mode'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({modeChange:p})+'\n');update(p.sessionId,{sessionUpdate:'current_mode_update',currentModeId:p.modeId});reply(message.id,{});}
   else if(message.method==='session/set_config_option')reply(message.id,{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:p.value,options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});
   else if(message.method==='session/close')reply(message.id,{});
   else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&p.operation==='schedule.submit'){
     const scheduled=message.method==='_amplifier/native';
     if(scheduled&&p.args.taskRevision===99){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}
-    if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify(p)+'\n');
+    if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({...p,...(process.env.FIXTURE_LOCATIONS?{processCwd:process.cwd()}: {})})+'\n');
     const text=scheduled?p.args.text:p.prompt.filter(b=>b.type==='text').map(b=>b.text).join(' '),id=message.id;
     active={id,sessionId:p.sessionId,cancelled:false};
     void(async()=>{

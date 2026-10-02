@@ -40,6 +40,7 @@ export class StdioCatalog implements Catalog {
   list(params:Parameters<Catalog['list']>[0]) {return this.request('list',params);}
   async get(uri:string):Promise<CatalogRecord|undefined>{return await this.request('get',{uri})??undefined;}
   upsert(record:CatalogRecord){return this.request('upsert',{record});}
+  directoryInUse(path:string){return this.request('directoryInUse',{path});}
   hint(sessionDirectory:string){return this.request('hint',{sessionDirectory});}
   diagnostics(){return {closed:this.closed,pending:this.pending.size,stderrTail:this.stderr};}
   async close(){clearInterval(this.maintenance);this.fail(new Error('Catalog closed by owner'));this.process.stdin.end();await Promise.race([new Promise<void>(resolve=>this.process.once('close',()=>resolve())),new Promise<void>(resolve=>setTimeout(resolve,1000))]);if(this.process.exitCode===null)this.process.kill();}

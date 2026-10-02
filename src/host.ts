@@ -17,6 +17,7 @@ export interface Catalog {
   get(uri:string):Promise<CatalogRecord|undefined>;
   upsert(record:CatalogRecord):Promise<unknown>;
   hint?(sessionDirectory:string):Promise<unknown>;
+  directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   close?():Promise<void>;
 }
 export interface HostConfig {
@@ -362,11 +363,10 @@ export class AmplifierHost {
       if(p.activeClient)throw new RpcFault(-32602,'Register active client tools after subscribing to the new session');
       if(Object.keys(p.config??{}).length)throw new RpcFault(-32602,'Creation configuration is not advertised; use negotiated session selectors');
       const creationCommand=creation?.commandId??'create:'+p.channel;
-      this.store.transaction(()=>this.store.admission(p.channel,{kind:'session.create',params:p},creationCommand,'host:creation',this.store.extensionSequence('host:creation')));
       const timestamp=now(),chat:ChatState={resource:chatURI(p.channel),title:p.title??'New conversation',status:1,modifiedAt:timestamp,turns:[]};
       const summary:SessionSummary={resource:p.channel,provider:engine.id,title:chat.title,status:1,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(cwd).href]};
       const state:SessionState={provider:engine.id,title:chat.title,status:1,lifecycle:SessionLifecycle.Creating,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories};
-      this.store.save({uri:p.channel,engineId:engine.id,workingDirectory:cwd,summary,state,chat});
+      await this.withLock('@directory-reservations',async()=>{await this.workspace(pathToFileURL(cwd).href);if(creation?.source.executionDirectory)await this.workspace(pathToFileURL(creation.source.executionDirectory).href);this.store.transaction(()=>{this.store.admission(p.channel,{kind:'session.create',params:p},creationCommand,'host:creation',this.store.extensionSequence('host:creation'));this.store.save({uri:p.channel,engineId:engine.id,workingDirectory:cwd,executionDirectory:creation?.source.executionDirectory??cwd,summary,state,chat});});});
       this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);
       this.notify('root/sessionAdded',{channel:ROOT,summary});
       this.store.finish(creationCommand,'dispatching');
@@ -376,6 +376,7 @@ export class AmplifierHost {
     });
   }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
+    if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     const existing=this.active.get(uri);if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
@@ -386,9 +387,9 @@ export class AmplifierHost {
       if(count()>(this.config.maxActiveAgents??8))throw new RpcFault(-32000,'Active agent capacity reached; no historical workers are prewarmed');
       const record=await this.record(uri),engine=this.config.engines.find(e=>e.id===record.engineId);
       if(!engine)throw new RpcFault(-32002,'Session engine is not configured');
-      await this.workspace(pathToFileURL(record.workingDirectory).href);
+      await this.workspace(pathToFileURL(record.executionDirectory??record.workingDirectory).href);
       const active:Active={agent:null as any,busy:false,lastUsed:Date.now(),tools:new Set(),permissions:new Map()};
-      const agent=new AcpProcess(engine,record.workingDirectory,{
+      const agent=new AcpProcess(engine,record.executionDirectory??record.workingDirectory,{
         hostCapabilities:this.config.nativeHostCapabilities,
         update:params=>{
           const bytes=Buffer.byteLength(JSON.stringify(params));active.updateCount=(active.updateCount??0)+1;active.updateBytes=(active.updateBytes??0)+bytes;
@@ -403,14 +404,14 @@ export class AmplifierHost {
             if(!this.getRecord(uri)?.nativeSessionId){active.pendingHints??=[];if(active.pendingHints.length<64)active.pendingHints.push(dirname(event.metadataPath));}
             else await this.config.catalog?.hint?.(dirname(event.metadataPath));
           }
-          if(agent.nativeId)await this.config.nativeEvent?.({session:uri,nativeSessionId:agent.nativeId,workingDirectory:record.workingDirectory},params);
+          if(agent.nativeId)await this.config.nativeEvent?.({session:uri,nativeSessionId:agent.nativeId,workingDirectory:record.executionDirectory??record.workingDirectory},params);
         },
         ...(this.config.nativeHostRequest?{hostRequest:async(_method:string,params:Json)=>{
           if((!active.busy&&!active.controlDepth)||!agent.nativeId)throw new Error('Host capability requires an admitted native turn or scoped native control');
-          return this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId,workingDirectory:record.workingDirectory},params);
+          return this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId,workingDirectory:record.executionDirectory??record.workingDirectory},params);
         }}:{}),
       });active.agent=agent;this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId,creation);const fresh=this.getRecord(uri)!;fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
       catch(error){this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
   }
@@ -777,7 +778,84 @@ export class AmplifierHost {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);
     const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
-    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,activeTurnId:record.chat.activeTurn?.id,status:record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),title:record.summary.title,activeTurnId:record.chat.activeTurn?.id,status:record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+  }
+  private relocationFence(session:string):Json|undefined {
+    const row=this.store.db.prepare("SELECT command_id,source,target,status FROM relocations WHERE uri=? AND status IN ('admitted','unknown') ORDER BY rowid DESC LIMIT 1").get(session);
+    return row?{commandId:row.command_id,source:row.source,target:row.target,status:row.status}:undefined;
+  }
+  private async inspectNativeLocation(record:SessionRecord,reconcileCommand?:string):Promise<Json> {
+    if(!record.nativeSessionId)throw new RpcFault(-32008,'Native identity is unavailable');
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
+    const engine=this.config.engines.find(e=>e.id===record.engineId);if(!engine)throw new RpcFault(-32008,'Native engine is unavailable');
+    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}})});
+    try {
+      const initialized=await agent.initialize();
+      if((initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.relocation?.version!==1)throw new RpcFault(-32601,'Native relocation was not negotiated');
+      return await agent.client.extMethod(reconcileCommand?'_amplifier/relocation/reconcile':'_amplifier/relocation',{sessionId:record.nativeSessionId,historyCwd:record.workingDirectory,...(reconcileCommand?{commandId:reconcileCommand}:{})});
+    }finally{this.passiveReads--;await agent.retire();}
+  }
+  /** Indexed references only; a catalog without a directory guard cannot prove absence. */
+  async directoryInUse(path:string):Promise<{inUse:boolean;sessions:Array<{session:string;reason:string}>;pending:boolean;truncated?:boolean}> {
+    if(!isAbsolute(path))throw new RpcFault(-32602,'An absolute directory is required');
+    let target:string;try{target=await realpath(path);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;target=join(await realpath(dirname(path)),basename(path));}
+    const lower=target.endsWith('/')?target:target+'/',upper=lower+'\uffff',sessions:Array<{session:string;reason:string}>=[];
+    for(const row of this.store.db.prepare('SELECT uri FROM sessions WHERE execution_cwd=? OR execution_cwd>=? AND execution_cwd<? OR cwd=? OR cwd>=? AND cwd<? LIMIT 101').all(target,lower,upper,target,lower,upper))sessions.push({session:String(row.uri),reason:'execution-or-history-directory'});
+    const pending=this.store.db.prepare("SELECT uri FROM relocations WHERE status IN ('admitted','unknown') AND (source=? OR source>=? AND source<? OR target=? OR target>=? AND target<?) LIMIT 101").all(target,lower,upper,target,lower,upper);
+    for(const row of pending)sessions.push({session:String(row.uri),reason:'unresolved-relocation'});
+    // Ancestor equality lookups remain indexed and bounded by path depth.
+    for(let ancestor=dirname(target);ancestor!==target;){for(const row of this.store.db.prepare('SELECT uri FROM sessions WHERE execution_cwd=? OR cwd=? LIMIT 101').all(ancestor,ancestor))sessions.push({session:String(row.uri),reason:'ancestor-execution-or-history-directory'});for(const row of this.store.db.prepare("SELECT uri FROM relocations WHERE status IN ('admitted','unknown') AND (source=? OR target=?) LIMIT 101").all(ancestor,ancestor)){pending.push(row);sessions.push({session:String(row.uri),reason:'ancestor-unresolved-relocation'});}const next=dirname(ancestor);if(next===ancestor)break;ancestor=next;}
+    if(this.config.catalog){if(!this.config.catalog.directoryInUse)sessions.push({session:'',reason:'catalog-directory-authority-unavailable'});else{const result=await this.config.catalog.directoryInUse(target);if(result.inUse)sessions.push(...(result.sessions?.length?result.sessions:[{session:'',reason:'catalog-reference'}]));const freshness=result.freshness,age=Date.now()-Date.parse(freshness?.completedAt??'');if(result.coverage!=='indexed-native-history'||freshness?.phase!=='complete'||freshness.issues!==0||!Number.isFinite(age)||age<0||age>600000)sessions.push({session:'',reason:'catalog-coverage-incomplete-or-stale'});}}
+    return {inUse:sessions.length>0,sessions:sessions.slice(0,100),pending:pending.length>0,...(sessions.length>100?{truncated:true}:{})};
+  }
+  /** The callback may remove Git/filesystem state only; it must not reenter host mutations. */
+  async withDirectoryGuard<T>(path:string,remove:()=>Promise<T>):Promise<T> {
+    const target=await this.workspace(pathToFileURL(path).href);
+    return this.withLock('@directory-reservations',async()=>{const result=await this.directoryInUse(target);if(result.inUse)throw new RpcFault(-32011,'Directory is referenced by a session, history or unresolved transition',result);return remove();});
+  }
+  async relocateSession(session:string,input:{commandId:string;target:string;expectedExecutionRevision:number;reconciles?:string;evidence?:unknown}) {
+    if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.target!=='string'||!isAbsolute(input.target)||!Number.isSafeInteger(input.expectedExecutionRevision)||input.expectedExecutionRevision<0||Buffer.byteLength(JSON.stringify(input.evidence??null))>65536)throw new RpcFault(-32602,'Bounded relocation command, target and expected revision required');
+    let record:SessionRecord,target:string;
+    try{record=await this.record(session);target=await this.workspace(pathToFileURL(input.target).href);}catch(error){return {applied:false,executed:false,reason:(error as Error).message};}
+    return this.withLock(record.uri,async()=>{
+      let admitted=false;
+      try {
+      const prior=this.store.db.prepare('SELECT uri,payload,status FROM relocations WHERE command_id=?').get(input.commandId);
+      if(prior){const value=JSON.parse(String(prior.payload));if(prior.uri!==record.uri||value.target!==target||value.expectedExecutionRevision!==input.expectedExecutionRevision||value.reconciles!==input.reconciles)throw new RpcFault(-32011,'Relocation command reused with different content');if(prior.status==='applied')return value.result;if(prior.status==='rejected')return {applied:false,executed:false,reason:'Native relocation previously refused'};throw new RpcFault(-32011,'Relocation outcome is unresolved; the original operation must not be repeated',{receipt:input.commandId,outcome:'unknown',executed:true});}
+      const latest=this.getRecord(record.uri)!,fence=this.relocationFence(record.uri),revision=this.store.revisions(record.uri).executionRevision;
+      if(revision!==input.expectedExecutionRevision)return {applied:false,executed:false,reason:'Execution revision changed'};
+      if(fence&&!input.reconciles)return {applied:false,executed:false,reason:'A relocation is unresolved; inspect and explicitly reconcile'};
+      if(input.reconciles&&fence?.commandId!==input.reconciles)return {applied:false,executed:false,reason:'Reconciliation does not identify the current fence'};
+      if(latest.chat.activeTurn||this.active.get(record.uri)?.busy||this.active.get(record.uri)?.controlDepth||this.store.unknown(latest.chat.resource))return {applied:false,executed:false,reason:'Execution must be conclusively idle before relocation'};
+      // A reconcile admission can itself lose its reply. Follow only stored receipt links, never replay any effect.
+      const reconciledIds:string[]=[];let nativeCommand=input.reconciles;
+      while(nativeCommand){if(reconciledIds.includes(nativeCommand)||reconciledIds.length>=64)throw new RpcFault(-32011,'Invalid reconciliation chain');reconciledIds.push(nativeCommand);const ancestor=this.store.db.prepare('SELECT uri,payload FROM relocations WHERE command_id=?').get(nativeCommand);if(!ancestor||ancestor.uri!==record.uri)throw new RpcFault(-32011,'Reconciliation identity does not belong to this session');const parent=JSON.parse(String(ancestor.payload)).reconciles;if(!parent)break;nativeCommand=parent;}
+      const native=await this.inspectNativeLocation(latest,nativeCommand);
+      if(native.sessionId!==latest.nativeSessionId||native.historyCwd!==latest.workingDirectory||!Number.isSafeInteger(native.executionRevision))throw new RpcFault(-32000,'Native location identity or revision is invalid');
+      if(input.reconciles){
+        if(native.blocked||native.reconciled!==true||native.receipt?.commandId!==nativeCommand||native.receipt?.status!=='applied'||native.executionDirectory!==target)return {applied:false,executed:false,reason:'Native location evidence does not prove the requested outcome'};
+      }else if(native.blocked||native.executionDirectory!==(latest.executionDirectory??latest.workingDirectory))return {applied:false,executed:false,reason:'Native execution location changed or is blocked; no relocation was repeated'};
+      const active=input.reconciles?undefined:await this.ensureAgent(record.uri);
+      const request={...input,target,source:latest.executionDirectory??latest.workingDirectory};
+      await this.withLock('@directory-reservations',async()=>{
+        await this.workspace(pathToFileURL(target).href);
+        this.store.transaction(()=>{this.store.admission(record.uri,{kind:'session.relocate',...request},input.commandId,'host:relocation',this.store.extensionSequence('host:relocation'));this.store.db.prepare('INSERT INTO relocations VALUES(?,?,?,?,?,?)').run(input.commandId,record.uri,request.source,target,'admitted',JSON.stringify(request));});
+      });
+      admitted=true;this.store.finish(input.commandId,'dispatching');
+      try {
+        let result=native;
+        if(active){active.controlDepth=(active.controlDepth??0)+1;try{result=await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'session.relocate',args:{commandId:input.commandId,target,expectedExecutionRevision:native.executionRevision}});}finally{active.controlDepth--;}}
+        if(result.applied===false){this.store.transaction(()=>{this.store.finish(input.commandId,'failed',String(result.reason??'Native relocation refused'));this.store.db.prepare("UPDATE relocations SET status='rejected' WHERE command_id=?").run(input.commandId);});return {applied:false,executed:false,reason:String(result.reason??'Native relocation refused')};}
+        if((!input.reconciles&&result.applied!==true)||result.blocked||result.historyCwd!==latest.workingDirectory||result.executionDirectory!==target||!Number.isSafeInteger(result.executionRevision))throw new Error('Native relocation did not prove the requested committed location');
+        if(active){await active.agent.retire();this.active.delete(record.uri);}
+        const current=this.getRecord(record.uri)!;current.executionDirectory=target;current.nativeLocationRevision=result.executionRevision;
+        const outcome={applied:true,historyHome:current.workingDirectory,executionDirectory:target,executionRevision:revision+1,receipt:input.commandId};
+        this.store.transaction(()=>{this.store.save(current);this.store.bump(record.uri,'execution');this.store.finish(input.commandId,'completed');this.store.db.prepare("UPDATE relocations SET status='applied',payload=? WHERE command_id=?").run(JSON.stringify({...request,result:outcome}),input.commandId);for(const ancestor of reconciledIds){this.store.db.prepare("UPDATE relocations SET status='applied',payload=json_set(payload,'$.result',json(?)) WHERE command_id=?").run(JSON.stringify({...outcome,receipt:ancestor}),ancestor);this.store.finish(ancestor,'completed','Native durable location proof was explicitly reconciled');}});
+        this.acpMetadata(record.uri,{executionLocation:{historyHome:current.workingDirectory,executionDirectory:target,executionRevision:revision+1}});
+        return outcome;
+      }catch(error){this.store.transaction(()=>{this.store.finish(input.commandId,'unknown',(error as Error).message);this.store.db.prepare("UPDATE relocations SET status='unknown' WHERE command_id=?").run(input.commandId);});if(active){await active.agent.retire();this.active.delete(record.uri);}throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});}
+      }catch(error){if(admitted||(error instanceof RpcFault&&(error.data as Json)?.outcome==='unknown'))throw error;return {applied:false,executed:false,reason:(error as Error).message};}
+    });
   }
   /** Advertised tools only: no client drafts, DOM, editing buffers or rendered state. */
   async listClientTools(session:string) {const record=await this.record(session);return structuredClone(record.state.activeClients);}
@@ -820,6 +898,8 @@ export class AmplifierHost {
   async nativeControlExisting(session:string,operation:string,args:Json):Promise<Json> {return this.nativeControl(session,operation,args,{requireExisting:true});}
   async nativeControl(session:string,operation:string,args:Json,options:{requireExisting?:boolean}={}):Promise<Json> {
     session=(await this.record(session)).uri;
+    if(this.relocationFence(session))throw new RpcFault(-32011,'Session relocation is fenced; no runtime control was dispatched');
+    if(operation==='session.relocate')throw new RpcFault(-32602,'Relocation requires relocateSession admission');
     if(operation==='schedule.submit')throw new RpcFault(-32602,'Scheduled execution requires submitScheduled admission');
     const execute=async()=>{
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
@@ -828,7 +908,7 @@ export class AmplifierHost {
       if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
       if(['worker.stop','operations.cancel'].includes(operation))this.store.bump(session,'interruption');
       active.controlDepth=(active.controlDepth??0)+1;
-      try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args});}finally{active.controlDepth--;}
+      try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args,...(options.requireExisting?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})});}finally{active.controlDepth--;}
     };
     return ['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota','worker.stop','operations.cancel'].includes(operation)?this.withLock(session,execute):execute();
   }

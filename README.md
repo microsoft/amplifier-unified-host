@@ -243,3 +243,40 @@ core methods/actions fail explicitly; copying UI components is not feature parit
 The official package lock records AHP SDK 0.9.0 and ACP SDK 1.5.0. ACP wire version
 is 1, independently of SDK package numbering. Upstream schemas/reducers are used
 without a private fork.
+
+## Worktree relocation ownership
+
+`inspectSession(uri)` separates immutable `historyHome` (the canonical original
+workspace used for native history lookup) from `executionDirectory`. Its
+`executionRevision` is the host admission counter; `nativeLocationRevision` is
+the adapter's independent location revision. Catalog project membership and AHP
+canonical working-directory metadata remain at the original history home.
+
+Trusted composition providers can call
+`relocateSession(uri, {commandId, target, expectedExecutionRevision})`. The target
+must be an existing authorized directory, and the negotiated native adapter must
+prove the same Git repository and quiesce its writer before remounting. A durable
+host reservation precedes the native relocation. Success returns
+`{applied:true, historyHome, executionDirectory, executionRevision, receipt}`;
+known pre-admission refusal returns `{applied:false, executed:false, reason}`.
+Post-admission uncertainty throws with `error.data = {receipt, outcome:'unknown',
+executed:true}` and fences all subsequent session execution. No relocation or
+prompt is automatically replayed after restart.
+
+An explicit new command may add `reconciles: priorReceiptId` and bounded
+`evidence`. Reconciliation reads the native durable location proof without
+mounting a worker and commits only an already proven outcome. It cannot repeat
+a move or clear an unresolved native remount marker. Source configuration cloning
+preserves both directory identities through an opaque native snapshot; ordinary
+ACP agents without this negotiated capability receive a known refusal.
+
+`directoryInUse(path)` checks indexed host history/execution references and
+unresolved source/target reservations, plus the independent catalog. Explanations
+are bounded to 100 rows. `withDirectoryGuard(path, callback)` performs the same
+check while excluding concurrent host create/relocate admissions. The callback
+may perform Git/filesystem removal only and must not reenter host mutations.
+Catalog-backed deletion requires complete, issue-free discovery evidence no
+older than ten minutes. This is a cooperative-host guard, not proof against an
+undiscovered or noncooperating external process; no filesystem scan or transcript
+read is substituted during a query. The capability owner retains its own durable
+Git removal receipt and explicit handling for an unknown filesystem outcome.
