@@ -317,3 +317,26 @@ preserves scheduled/question/voice provenance and the original admission client 
 status when present. Unadmitted projections default to `inputOrigin: 'unknown'`
 unless recorded provenance explicitly identifies another origin. Consumers must
 apply their own authenticated actor, timing and content policies to this evidence.
+
+## Background work and runtime loss
+
+A settled prompt is not proof that its agent has no owned background work. Idle
+capacity eviction requires negotiated native
+`lifecycle: {version:1, gracefulRetire:true}` and a successful atomic
+`_amplifier/retire` response. The native owner must refuse while jobs, processes,
+approvals, bridge requests or auxiliary work remain; success permanently retires
+the native session handle before the host closes its ACP connection. The host holds
+the session admission lock through this decision and retains its own running ACP
+terminals. Refusal, unsupported capability or a missing response retains the agent;
+new capacity is refused rather than killing that work. Generic ACP peers without
+this explicit retirement proof are not automatically evicted from the configured
+active-agent bound. Explicit host shutdown remains a separate stopping operation.
+
+`HostConfig.agentStopped(event)` notifies capability owners of actual native runtime
+closure or ACP process loss. The exported `AgentStopped` includes session/native
+identity, engine, execution directory and observed stopping reason. A prompt's
+completion never emits this callback. Native runtime/process observations are
+deduplicated for that lifetime, and a subsequent `runtime.ready` starts a new one.
+Owners must make handling idempotent and mark affected live operations interrupted
+rather than assuming completed. Callback failures are visible in
+`diagnostics().agentStoppedFailures`; pending callbacks are drained on host close.

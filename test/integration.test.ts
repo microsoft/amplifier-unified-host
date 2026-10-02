@@ -75,3 +75,15 @@ test('actual native worktree handoff keeps transcript home, execution cwd, IDs a
   const snapshot=await host.nativeControl(session,'configuration.snapshot',{});assert.equal(snapshot.sourceCwd,workspace);assert.equal(snapshot.executionDirectory,target);assert.equal(snapshot.locationRevision,1);
  }finally{await client.shutdown();await host.close();execFileSync('git',['-C',workspace,'worktree','remove','--force',target]);await rm(state,{recursive:true,force:true});}
 });
+
+
+test('real native graceful retirement releases a host slot only after confirmed worker exit', {skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-retire-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!),stopped:any[]=[],{randomUUID}=await import('node:crypto');
+ const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],maxActiveAgents:1,engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}],agentStopped:async event=>{stopped.push(event);}}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'retire-interop',protocolVersions:['0.9.0']});const first='ahp-session:/'+randomUUID(),second='ahp-session:/'+randomUUID();
+  await client.request('createSession',{channel:first,workingDirectories:[new URL('file://'+workspace).href]});await client.request('createSession',{channel:second,workingDirectories:[new URL('file://'+workspace).href]});
+  assert.equal(host.diagnostics().activeAgents,1);assert.equal(stopped.length,1);assert.equal(stopped[0].session,first);await assert.rejects(host.nativeControlExisting(first,'budget.get',{}),/No existing owned native runtime/);
+  assert.equal((await host.inspectSession(first)).status,'idle');assert.equal((await host.readSessionContext(first)).messages.length,0);
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});

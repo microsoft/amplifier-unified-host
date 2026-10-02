@@ -1,7 +1,7 @@
 // Independent JSON-RPC ACP fixture: no host imports and no production models/accounts.
 import readline from 'node:readline';
 import { appendFileSync,readFileSync,writeFileSync,existsSync } from 'node:fs';
-const sessions=new Map();let active;let permissionId=1000;const pending=new Map();
+const sessions=new Map();let active,background,retired=false;let permissionId=1000;const pending=new Map();
 const send=m=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...m})+'\n');
 const update=(sessionId,update)=>send({method:'session/update',params:{sessionId,update}});
 const reply=(id,result)=>send({id,result});
@@ -9,7 +9,18 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined){pending.get(message.id)?.(message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},history:{version:1,paging:'complete-turns',passive:true}}}},authMethods:[]});
+  else if(message.method==='_amplifier/retire'){
+    if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
+    retired=true;reply(message.id,{retired:true});
+  }
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.start'){
+    background=setInterval(()=>appendFileSync(process.env.FIXTURE_LOG+'.background','tick\n'),10);reply(message.id,{id:'background-1'});
+  }
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.stop'){clearInterval(background);background=undefined;reply(message.id,{});}
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.runtime.loss'){
+    send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});setTimeout(()=>process.exit(17),20);
+  }
   else if(message.method==='_amplifier/history'){
     const groups=JSON.parse(readFileSync(process.env.FIXTURE_HISTORY,'utf8'));const end=p.cursor?Number(p.cursor):groups.length,start=Math.max(0,end-p.limit);
     reply(message.id,{turnGroups:groups.slice(start,end),revision:'fixture-revision',diagnostics:[],nextCursor:start?String(start):null});
@@ -36,6 +47,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='session/set_config_option')reply(message.id,{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:p.value,options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]});
   else if(message.method==='session/close')reply(message.id,{});
   else if(message.method==='session/prompt'||message.method==='_amplifier/native'&&p.operation==='schedule.submit'){
+    if(retired){send({id:message.id,error:{code:-32000,message:'Session handle retired'}});continue;}
     const scheduled=message.method==='_amplifier/native';
     if(scheduled&&p.args.taskRevision===99){reply(message.id,{accepted:false,reason:'Saved task changed'});continue;}
     if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({...p,...(process.env.FIXTURE_LOCATIONS?{processCwd:process.cwd()}: {})})+'\n');

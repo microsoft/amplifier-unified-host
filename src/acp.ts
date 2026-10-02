@@ -12,6 +12,7 @@ export interface AgentHandlers {
   hostRequest?(method: string, params: Record<string,unknown>): Promise<Record<string,unknown>>;
   nativeEvent?(params:Record<string,unknown>):Promise<void>;
   hostCapabilities?:Record<string,unknown>;
+  stopped?(event:{exitCode?:number;signal?:string}):void;
   terminal?(event:{terminalId:string;kind:'created'|'data'|'exited';title?:string;cwd?:string;data?:string;exitCode?:number}):void;
 }
 interface Terminal {
@@ -82,8 +83,9 @@ export class AcpProcess {
       extNotification:async(method,params)=>{if(method==='_amplifier/event'){this.validateSession(String(params.sessionId));await handlers.nativeEvent?.(params);}},
     };
     this.client = new ClientSideConnection(()=>callbacks,stream);
-    this.process.once('close',()=>{this.closed=true;for(const terminal of this.terminals.values())terminal.process.kill();});
-    this.process.once('error',()=>{this.closed=true;});
+    let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;for(const terminal of this.terminals.values())terminal.process.kill();handlers.stopped?.(event);};
+    this.process.once('close',(code,signal)=>reportStopped({...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})}));
+    this.process.once('error',()=>reportStopped({}));
   }
   private validateSession(sessionId:string) {
     // session/new can emit updates before returning the newly allocated identity.
@@ -125,6 +127,18 @@ export class AcpProcess {
       }
       const created=await this.client.newSession({cwd:this.cwd,mcpServers:[]});this.nativeId=created.sessionId;return created;
     } finally {this.loading=false;}
+  }
+  /** Native atomic graceful retirement; refusal/uncertainty never force-closes owned work. */
+  async retireIfIdle():Promise<boolean> {
+    if(this.closed)return true;
+    if([...this.terminals.values()].some(terminal=>!terminal.exit))return false;
+    const lifecycle=(this.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.lifecycle;
+    if(!this.nativeId||lifecycle?.version!==1||lifecycle.gracefulRetire!==true)return false;
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    try {
+      const result=await Promise.race([this.client.extMethod('_amplifier/retire',{sessionId:this.nativeId}),new Promise<undefined>(resolve=>{timer=setTimeout(()=>resolve(undefined),10000);timer.unref();})]);
+      return result?.retired===true;
+    }catch{return false;}finally{clearTimeout(timer);}
   }
   async retire() {
     if(this.nativeId&&this.initialized?.agentCapabilities?.sessionCapabilities?.close&&!this.closed) {

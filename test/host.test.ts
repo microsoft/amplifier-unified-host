@@ -415,3 +415,35 @@ test('unindexed legacy input refuses without starting native history and non-use
   await assert.rejects(f.host.readUserMessage(uri,'assistant-voice'),(error:any)=>error instanceof MessageUnavailableError&&error.reason==='not-user');
  }finally{await f.cleanup();}
 });
+
+test('background work prevents idle capacity retirement; actual runtime loss not prompt completion notifies owners',async()=>{
+ const stopped:any[]=[],f=await setup({maxActiveAgents:1,agentStopped:async(event:any)=>{stopped.push(event);}});try{
+  const client=await f.connect(),one=await f.create(client);await f.host.nativeControl(one.session,'fixture.background.start',{});
+  const id=randomUUID();await f.host.submitTurn(one.session,{commandId:id,text:'foreground can finish',clientId:'owner'});await f.host.waitForTurn(one.session,id);assert.equal(stopped.length,0);
+  await new Promise(r=>setTimeout(r,30));const before=(await readFile(f.log+'.background','utf8')).length;
+  await assert.rejects(f.create(client),/capacity/);assert.equal(f.host.diagnostics().activeAgents,1);await new Promise(r=>setTimeout(r,30));assert.ok((await readFile(f.log+'.background','utf8')).length>before);assert.equal(stopped.length,0);
+  await f.host.nativeControlExisting(one.session,'fixture.runtime.loss',{});await waitFor(()=>stopped.length===1);await new Promise(r=>setTimeout(r,50));assert.equal(stopped.length,1);assert.equal(stopped[0].session,one.session);assert.equal(stopped[0].reason,'runtime-closed');assert.ok(stopped[0].nativeSessionId);
+  await assert.rejects(f.host.nativeControlExisting(one.session,'fixture.background.stop',{}),/No existing owned native runtime/);assert.equal(stopped.length,1);
+  const next=await f.create(client);assert.ok(next.session);assert.equal(f.host.diagnostics().activeAgents,1);
+ }finally{await f.cleanup();}
+});
+
+test('only confirmed graceful retirement releases capacity; unnegotiated external agents remain retained',async()=>{
+ const stopped:any[]=[],f=await setup({maxActiveAgents:1,agentStopped:async(event:any)=>{stopped.push(event);}});try{
+  const client=await f.connect(),first=await f.create(client);await f.host.nativeControl(first.session,'fixture.background.start',{});await f.host.nativeControl(first.session,'fixture.background.stop',{});
+  const next=await f.create(client);assert.notEqual(first.session,next.session);await waitFor(()=>stopped.length===1);assert.equal(stopped[0].reason,'idle-retired');assert.equal(stopped[0].session,first.session);
+  assert.equal(f.host.diagnostics().activeAgents,1);await assert.rejects(f.host.nativeControlExisting(first.session,'fixture.background.stop',{}),/No existing owned native runtime/);
+ }finally{await f.cleanup();}
+ const generic=await setup({maxActiveAgents:1});try{
+  generic.config.engines[0].env.FIXTURE_NO_RETIRE='1';const client=await generic.connect();await generic.create(client);await assert.rejects(generic.create(client),/capacity/);assert.equal(generic.host.diagnostics().activeAgents,1);
+ }finally{await generic.cleanup();}
+});
+
+test('runtime-loss owner notification settles before the next native lifetime is admitted',async()=>{
+ let release!:()=>void,entered!:()=>void;const hold=new Promise<void>(resolve=>release=resolve),started=new Promise<void>(resolve=>entered=resolve);let notifications=0;
+ const f=await setup({agentStopped:async()=>{notifications++;entered();await hold;}});try{
+  const client=await f.connect(),{session}=await f.create(client);await f.host.nativeControlExisting(session,'fixture.runtime.loss',{});await started;
+  const commandId=randomUUID(),submission=f.host.submitTurn(session,{commandId,text:'next lifetime',clientId:'owner'});await new Promise(r=>setTimeout(r,50));assert.equal(f.host.store.receipt(commandId),undefined);assert.equal(notifications,1);
+  release();await submission;assert.equal((await f.host.waitForTurn(session,commandId)).completed,true);assert.equal(notifications,1);
+ }finally{release();await f.cleanup();}
+});

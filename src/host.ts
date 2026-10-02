@@ -29,6 +29,7 @@ export interface SessionWorkspace {
   session:string;engineId:string;nativeSessionId?:string;historyHome:string;executionDirectory:string;executionRevision:number;
 }
 export interface SessionWorkspaceExpectation {expectedExecutionRevision?:number;expectedDirectory?:string;}
+export interface AgentStopped {session:string;nativeSessionId?:string;engineId:string;workingDirectory:string;reason:'runtime-closed'|'process-closed'|'idle-retired'|'host-shutdown'|'relocated'|'relocation-unknown'|'startup-failed';exitCode?:number;signal?:string;}
 export interface HostConfig {
   stateDirectory:string; engines:EngineConfig[]; allowedWorkspaceRoots:string[];
   host?:string;port?:number;allowedOrigins?:string[];allowedHosts?:string[];bearerToken?:string;
@@ -47,10 +48,12 @@ export interface HostConfig {
   /** Scoped host capabilities receive trusted native identity and execution workspace. */
   nativeHostRequest?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<Json>;
   nativeHostCapabilities?:Json;
+  /** Actual runtime/process loss, never inferred from a completed prompt. Idempotent owner callback. */
+  agentStopped?:(event:Readonly<AgentStopped>)=>Promise<void>;
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
-interface Active {agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -74,6 +77,8 @@ export class AmplifierHost {
   private clientTools=new Map<string,{session:string;chat:string;turnId:string;clientId:string;resolve:(result:Json)=>void;timer:ReturnType<typeof setTimeout>}>();
   private observers=new Set<{session:string;chat:string;queue:ActionEnvelope[];bytes:number;running:boolean;closed:boolean;listener:(event:ActionEnvelope)=>void|Promise<void>;onError?:(error:Error)=>void}>();
   private retireTimer:ReturnType<typeof setInterval>;
+  private stoppedCallbacks=new Set<Promise<void>>();
+  private stoppedCallbackFailures=0;
   private roots:string[]=[];
   url='';
   constructor(readonly config:HostConfig) {
@@ -386,7 +391,7 @@ export class AmplifierHost {
   }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
-    const existing=this.active.get(uri);if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
+    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
     const pending=(async()=>{
@@ -406,8 +411,11 @@ export class AmplifierHost {
           const update=(active.updates??Promise.resolve()).then(()=>this.update(uri,params)).finally(()=>{active.updateCount!--;active.updateBytes!-=bytes;});active.updates=update;return update;
         },permission:async params=>{await active.updates;return this.permission(uri,params);},
         terminal:event=>this.terminalEvent(uri,event),
+        stopped:event=>this.notifyAgentStopped(uri,active,active.retireReason??'process-closed',event),
         nativeEvent:async params=>{
           const event=params.event as Json|undefined;
+          if(event?.type==='runtime.ready')active.stopNotified=false;
+          if(event?.type==='runtime.closed')this.notifyAgentStopped(uri,active,active.retireReason??'runtime-closed');
           if(event?.type==='history.persisted'&&typeof event.metadataPath==='string'&&isAbsolute(event.metadataPath)&&basename(event.metadataPath)==='metadata.json') {
             // The independent catalog validates its configured native roots and reloads metadata.
             if(!this.getRecord(uri)?.nativeSessionId){active.pendingHints??=[];if(active.pendingHints.length<64)active.pendingHints.push(dirname(event.metadataPath));}
@@ -421,7 +429,7 @@ export class AmplifierHost {
         }}:{}),
       });active.agent=agent;this.active.set(uri,active);
       try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
-      catch(error){this.active.delete(uri);await agent.retire();throw error;}
+      catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
   }
   private async syncCatalog(record:SessionRecord) {
@@ -795,14 +803,28 @@ export class AmplifierHost {
     if(tool)this.emit(uri,{type:'session/inputNeededSet',request:{id,chat:channel,kind:'toolConfirmation',turnId,toolCall:tool.toolCall}} as StateAction);
     return result;
   }
+  private notifyAgentStopped(session:string,active:Active,reason:AgentStopped['reason'],details:{exitCode?:number;signal?:string}={}) {
+    if(active.stopNotified)return;active.stopNotified=true;
+    if(!this.config.agentStopped)return;
+    const event=Object.freeze({session,nativeSessionId:active.agent.nativeId,engineId:active.agent.engine.id,workingDirectory:active.agent.cwd,reason,...details});
+    const pending=Promise.resolve().then(()=>this.config.agentStopped!(event)).catch(()=>{this.stoppedCallbackFailures++;}).finally(()=>this.stoppedCallbacks.delete(pending));this.stoppedCallbacks.add(pending);active.stopCallback=pending;
+  }
   private async retireIdle(force=false) {
     for(const [uri,active] of this.active) {
-      if(active.busy||active.controlDepth||this.starting.has(uri)||(!force&&Date.now()-active.lastUsed<(this.config.idleAgentMs??60000)))continue;
+      if(active.busy||active.controlDepth||this.starting.has(uri)||this.resourceLocks.has(uri)||(!force&&Date.now()-active.lastUsed<(this.config.idleAgentMs??60000)))continue;
       if(!active.agent.initialized?.agentCapabilities?.sessionCapabilities?.resume&&!active.agent.initialized?.agentCapabilities?.loadSession)continue;
-      this.active.delete(uri);await active.agent.retire();if(force)return;
+      const retired=await this.withLock(uri,async()=>{
+        if(this.active.get(uri)!==active||active.busy||active.controlDepth||this.starting.has(uri))return false;
+        active.controlDepth=(active.controlDepth??0)+1;
+        try {
+          if(!await active.agent.retireIfIdle())return false;
+          active.retireReason='idle-retired';await active.agent.retire();await active.stopCallback;this.active.delete(uri);return true;
+        }finally{active.controlDepth--;}
+      });
+      if(force&&retired)return;
     }
   }
-  diagnostics(){return {clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
+  diagnostics(){return {agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
   async inspectSession(session:string) {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);
@@ -891,13 +913,13 @@ export class AmplifierHost {
         if(active){active.controlDepth=(active.controlDepth??0)+1;try{result=await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'session.relocate',args:{commandId:input.commandId,target,expectedExecutionRevision:native.executionRevision}});}finally{active.controlDepth--;}}
         if(result.applied===false){this.store.transaction(()=>{this.store.finish(input.commandId,'failed',String(result.reason??'Native relocation refused'));this.store.db.prepare("UPDATE relocations SET status='rejected' WHERE command_id=?").run(input.commandId);});return {applied:false,executed:false,reason:String(result.reason??'Native relocation refused')};}
         if((!input.reconciles&&result.applied!==true)||result.blocked||result.historyCwd!==latest.workingDirectory||result.executionDirectory!==target||!Number.isSafeInteger(result.executionRevision))throw new Error('Native relocation did not prove the requested committed location');
-        if(active){await active.agent.retire();this.active.delete(record.uri);}
+        if(active){active.retireReason='relocated';await active.agent.retire();this.active.delete(record.uri);}
         const current=this.getRecord(record.uri)!;current.executionDirectory=target;current.nativeLocationRevision=result.executionRevision;
         const outcome={applied:true,historyHome:current.workingDirectory,executionDirectory:target,executionRevision:revision+1,receipt:input.commandId};
         this.store.transaction(()=>{this.store.save(current);this.store.bump(record.uri,'execution');this.store.finish(input.commandId,'completed');this.store.db.prepare("UPDATE relocations SET status='applied',payload=? WHERE command_id=?").run(JSON.stringify({...request,result:outcome}),input.commandId);for(const ancestor of reconciledIds){this.store.db.prepare("UPDATE relocations SET status='applied',payload=json_set(payload,'$.result',json(?)) WHERE command_id=?").run(JSON.stringify({...outcome,receipt:ancestor}),ancestor);this.store.finish(ancestor,'completed','Native durable location proof was explicitly reconciled');}});
         this.acpMetadata(record.uri,{executionLocation:{historyHome:current.workingDirectory,executionDirectory:target,executionRevision:revision+1}});
         return outcome;
-      }catch(error){this.store.transaction(()=>{this.store.finish(input.commandId,'unknown',(error as Error).message);this.store.db.prepare("UPDATE relocations SET status='unknown' WHERE command_id=?").run(input.commandId);});if(active){await active.agent.retire();this.active.delete(record.uri);}throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});}
+      }catch(error){this.store.transaction(()=>{this.store.finish(input.commandId,'unknown',(error as Error).message);this.store.db.prepare("UPDATE relocations SET status='unknown' WHERE command_id=?").run(input.commandId);});if(active){active.retireReason='relocation-unknown';await active.agent.retire();this.active.delete(record.uri);}throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});}
       }catch(error){if(admitted||(error instanceof RpcFault&&(error.data as Json)?.outcome==='unknown'))throw error;return {applied:false,executed:false,reason:(error as Error).message};}
     });
   }
@@ -960,7 +982,7 @@ export class AmplifierHost {
     clearInterval(this.retireTimer);
     for(const observer of this.observers){observer.closed=true;observer.queue=[];}this.observers.clear();
     for(const peer of this.peers)peer.socket.terminate();
-    const agents=[...this.active.values()];await Promise.all(agents.map(active=>active.agent.retire()));await Promise.allSettled(agents.map(active=>active.run));this.active.clear();
+    const agents=[...this.active.values()];await Promise.all(agents.map(active=>{active.retireReason='host-shutdown';return active.agent.retire();}));await Promise.all([...this.stoppedCallbacks]);await Promise.allSettled(agents.map(active=>active.run));this.active.clear();
     await new Promise<void>(resolve=>this.ws.close(()=>resolve()));await new Promise<void>(resolve=>this.http.close(()=>resolve()));
     await this.config.catalog?.close?.();this.store.close();
   }
