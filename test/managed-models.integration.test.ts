@@ -1,0 +1,22 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {mkdtemp,mkdir,readFile,writeFile,realpath,rm,readdir} from 'node:fs/promises';import {join} from 'node:path';import {tmpdir} from 'node:os';import {randomUUID} from 'node:crypto';import {createHost} from '../src/host.js';import {AhpClient} from '@microsoft/agent-host-protocol/client';import {WebSocketTransport} from '@microsoft/agent-host-protocol/ws';
+
+test('selected bundle-only models stay cold and explicit nondefault selection reaches first actual prompt',{skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG,timeout:90000},async()=>{
+ const dir=await realpath(await mkdtemp(join(tmpdir(),'native-managed-models-'))),workspace=join(dir,'workspace'),home=join(dir,'home'),root=join(dir,'managed');await mkdir(workspace);await mkdir(home);await writeFile(join(home,'settings.yaml'),'bundle:\n  app: []\n');
+ const config=join(dir,'native.json'),template=JSON.parse(await readFile(process.env.ACP_NATIVE_TEST_CONFIG!,'utf8')),bundle=join(dir,'chosen.yaml'),audit=join(dir,'model-audit.txt');
+ const original=await readFile(template.bundle,'utf8');await writeFile(bundle,original.replace('config: {}','config: '+JSON.stringify({fixtureModels:[{id:'first-model'},{id:'second-model'}],selectedModelAudit:audit})));
+ const normal={...template,bundle,home,appHome:join(dir,'app'),managedSessionRoots:[root],forkBundles:{approved:bundle}};await writeFile(config,JSON.stringify({...normal,workerCommand:['/impossible-worker']}));
+ const host=await createHost({stateDirectory:join(dir,'host'),managedSessionRoot:root,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',config],env:{AMPLIFIER_SESSION_STATE_HOME:join(dir,'writers')}}]});const client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  const init=await client.initialize({clientId:'managed-model-client',protocolVersions:['0.9.0']});assert.ok((init._meta?.['amplifier.dev/managedCreation'] as any).operations.includes('models'));
+  const options:any=await host.managedSessionOptions(),choice=options.bundles[0];assert.equal(choice.id,'approved');const selected={bundle:choice.id,bundleRevision:choice.revision};
+  const defaults=await host.managedSessionDefaults(selected);assert.equal(defaults.providers[0].id,'fixture');assert.equal(defaults.runtimeStarted,false);
+  const first:any=await client.request('x-amplifier/managedSession',{channel:'ahp-root://',operation:'models',args:{...selected,instance:'fixture',limit:1}});assert.equal(first.models[0].id,'first-model');assert.equal(first.total,2);
+  const second=await host.managedSessionModels({...selected,instance:'fixture',limit:1,cursor:first.nextCursor});assert.equal(second.models[0].id,'second-model');assert.equal(second.nextCursor,undefined);assert.equal(second.runtimeStarted,false);assert.equal(second.globalOnly,true);assert.equal(host.diagnostics().activeAgents,0);
+  await assert.rejects(readdir(join(root,'chats')),(error:any)=>error.code==='ENOENT');await assert.rejects(readFile(audit));
+  await assert.rejects(host.managedSessionModels({...selected,instance:'absent'}));await assert.rejects(host.managedSessionModels({...selected,instance:'fixture',bundleRevision:'0'.repeat(64)}));await assert.rejects(host.managedSessionModels({...selected,instance:'fixture',limit:101}));
+  const session='ahp-session:/'+randomUUID(),selection={instance:'fixture',model:second.models[0].id};await host.createManagedSession({session,commandId:'chosen-bundle-and-model',...selected,selection});assert.equal(host.diagnostics().activeAgents,0);await assert.rejects(readFile(audit));
+  const record=await host.inspectSession(session),controls=JSON.parse(await readFile(join(dir,'app/sessions',record.nativeSessionId!,'control-state.json'),'utf8'));assert.deepEqual(controls.selection,selection);
+  await writeFile(config,JSON.stringify(normal));await host.submitTurn(session,{commandId:'only-explicit-turn',clientId:'managed-model-client',text:'One offline selected model check'});assert.equal((await host.waitForTurn(session,'only-explicit-turn')).completed,true);
+  assert.equal(await readFile(audit,'utf8'),'second-model\n');assert.equal((await readdir(join(root,'chats'))).length,1);
+ }finally{await client.shutdown().catch(()=>{});await host.close();await rm(dir,{recursive:true,force:true});}
+});
