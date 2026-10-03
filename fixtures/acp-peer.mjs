@@ -165,9 +165,12 @@ for await(const line of readline.createInterface({input:process.stdin})) {
         const outcome=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'ui.inspect',args:{}}});});
         update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:JSON.stringify(outcome)}});
       }
-      if(text==='terminal'||text==='terminal-background'){
+      if(text==='terminal'||text==='terminal-background'||text==='terminal-delayed'||text==='terminal-released'){
         const call=method=>async params=>{const requestId=permissionId++;return new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method,params:{sessionId:p.sessionId,...params}});});};
-        const terminal=await call('terminal/create')({command:process.execPath,args:['-e',text==='terminal-background'?'setInterval(()=>process.stdout.write("owned terminal work\\n"),10)':'process.stdout.write("terminal proof")']});
+        const delayed=text==='terminal-delayed'||text==='terminal-released';
+        const terminal=await call('terminal/create')({command:process.execPath,args:delayed?[new URL('./terminal-close.mjs',import.meta.url).pathname,process.env.FIXTURE_LOG]:['-e',text==='terminal-background'?'setInterval(()=>process.stdout.write("owned terminal work\\n"),10)':'process.stdout.write("terminal proof")']});
+        if(delayed){while(!existsSync(process.env.FIXTURE_LOG+'.terminal-ready'))await new Promise(resolve=>setTimeout(resolve,5));}
+        if(text==='terminal-released')await call('terminal/release')({terminalId:terminal.terminalId});
         if(text==='terminal')await call('terminal/wait_for_exit')({terminalId:terminal.terminalId});
         update(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'terminal-tool',title:'Run process',kind:'execute',status:'completed',content:[{type:'terminal',terminalId:terminal.terminalId}]});
       }

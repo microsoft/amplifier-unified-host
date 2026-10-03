@@ -31,6 +31,10 @@ export class AcpProcess {
   closed = false;
   loading = false;
   private terminals = new Map<string,Terminal>();
+  // Released terminal handles still own callbacks until their stdio closes.
+  private terminalLifetimes = new Set<Terminal>();
+  private retiring = false;
+  private retirement?:Promise<void>;
   private stderr = '';
   constructor(readonly engine: EngineConfig, readonly cwd: string, readonly handlers: AgentHandlers) {
     this.process = spawn(engine.command, engine.args ?? [], {cwd, env: {...process.env,...engine.env}, stdio:'pipe'});
@@ -62,16 +66,18 @@ export class AcpProcess {
       }),
       createTerminal: async params => this.effect(async()=>{
         this.validateSession(params.sessionId);
-        if (this.terminals.size>=16) throw new Error('Session terminal limit reached');
+        if (this.terminals.size>=16||this.terminalLifetimes.size>=16) throw new Error('Session terminal limit reached');
         const cwd = params.cwd ? await this.scoped(params.cwd) : this.cwd;
+        if(this.retiring||this.closed)throw new Error('Agent is retiring; no new terminal was started');
         const terminalId=randomUUID();
         const child = spawn(params.command,params.args ?? [],{cwd,env:{...process.env,...Object.fromEntries((params.env??[]).map(e=>[e.name,e.value]))},stdio:'pipe'});
         const terminal: Terminal = {process:child,output:Buffer.alloc(0),truncated:false,done:Promise.resolve()};
         const limit = Math.min(params.outputByteLimit??65536,1024*1024);
+        this.terminalLifetimes.add(terminal);
         this.handlers.terminal?.({terminalId,kind:'created',title:params.command,cwd});
         const append = (data: Buffer) => { const combined=Buffer.concat([terminal.output,data]); terminal.truncated ||= combined.length>limit; terminal.output=combined.subarray(Math.max(0,combined.length-limit));this.handlers.terminal?.({terminalId,kind:'data',data:data.toString('utf8')}); };
         child.stdout.on('data',append); child.stderr.on('data',append);
-        terminal.done = new Promise(resolveDone=>{child.once('close',(code,signal)=>{terminal.exit={...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})};this.handlers.terminal?.({terminalId,kind:'exited',exitCode:code??undefined});resolveDone();});child.once('error',()=>{terminal.exit={exitCode:127};resolveDone();});});
+        terminal.done = new Promise(resolveDone=>{child.once('close',(code,signal)=>{terminal.exit={...(code!==null?{exitCode:code}:{}),...terminal.exit,...(signal?{signal}:{})};try{this.handlers.terminal?.({terminalId,kind:'exited',exitCode:terminal.exit.exitCode});}finally{this.terminalLifetimes.delete(terminal);resolveDone();}});child.once('error',()=>{terminal.exit={exitCode:127};});});
         this.terminals.set(terminalId,terminal);return {terminalId};
       }),
       terminalOutput: async params => {this.validateSession(params.sessionId);const t=this.terminal(params.terminalId);return {output:t.output.toString('utf8'),truncated:t.truncated,...(t.exit?{exitStatus:t.exit}:{})};},
@@ -85,7 +91,7 @@ export class AcpProcess {
       extNotification:async(method,params)=>{if(method==='_amplifier/event'){this.validateSession(String(params.sessionId));await handlers.nativeEvent?.(params);}},
     };
     this.client = new ClientSideConnection(()=>callbacks,stream);
-    let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;for(const terminal of this.terminals.values())terminal.process.kill();handlers.stopped?.(event);};
+    let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;for(const terminal of this.terminalLifetimes)terminal.process.kill();handlers.stopped?.(event);};
     this.process.once('close',(code,signal)=>reportStopped({...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})}));
     this.process.once('error',()=>reportStopped({}));
   }
@@ -136,8 +142,8 @@ export class AcpProcess {
   }
   /** Native atomic graceful retirement; refusal/uncertainty never force-closes owned work. */
   async retireIfIdle():Promise<boolean> {
+    if(this.terminalLifetimes.size)return false;
     if(this.closed)return true;
-    if([...this.terminals.values()].some(terminal=>!terminal.exit))return false;
     const lifecycle=(this.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.lifecycle;
     if(!this.nativeId||lifecycle?.version!==1||lifecycle.gracefulRetire!==true)return false;
     let timer:ReturnType<typeof setTimeout>|undefined;
@@ -146,12 +152,23 @@ export class AcpProcess {
       return result?.retired===true;
     }catch{return false;}finally{clearTimeout(timer);}
   }
-  async retire() {
+  retire():Promise<void> {
+    this.retiring=true;
+    return this.retirement??=this.finishRetirement();
+  }
+  private async finishRetirement() {
     if(this.nativeId&&this.initialized?.agentCapabilities?.sessionCapabilities?.close&&!this.closed) {
       await Promise.race([this.client.closeSession({sessionId:this.nativeId}),new Promise(resolve=>setTimeout(resolve,2000))]).catch(()=>{});
     }
-    this.process.kill();for(const t of this.terminals.values())t.process.kill();
-    if(this.process.exitCode===null&&!this.closed)await Promise.race([new Promise<void>(resolve=>this.process.once('close',()=>resolve())),new Promise<void>(resolve=>{const timer=setTimeout(()=>{this.process.kill('SIGKILL');resolve();},1000);timer.unref();})]);
+    this.process.kill();for(const t of this.terminalLifetimes)t.process.kill();
+    // Do not close the host store while terminal output/exit callbacks remain.
+    // SIGKILL bounds a direct child that ignores the first shutdown signal;
+    // completion still requires its real close event, not the timer.
+    const terminalKill=setTimeout(()=>{for(const t of this.terminalLifetimes)t.process.kill('SIGKILL');},1000);terminalKill.unref();
+    try {
+      if(this.process.exitCode===null&&!this.closed)await Promise.race([new Promise<void>(resolve=>this.process.once('close',()=>resolve())),new Promise<void>(resolve=>{const timer=setTimeout(()=>{this.process.kill('SIGKILL');resolve();},1000);timer.unref();})]);
+      await Promise.all([...this.terminalLifetimes].map(t=>t.done));
+    }finally{clearTimeout(terminalKill);}
   }
   diagnostics() {return {closed:this.closed,stderrTail:this.stderr,terminals:this.terminals.size};}
 }
