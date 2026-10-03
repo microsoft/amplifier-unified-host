@@ -1564,7 +1564,11 @@ export class AmplifierHost {
       if(force&&retired)return;
     }
   }
-  diagnostics(){return {steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq};}
+  diagnostics(){return {steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq,
+    workingSet:{hotRecords:this.hotRecords.size,passiveReads:this.passiveReads,selectedNativeWindows:this.nativeWindows.size,selectedNativeTurnIds:[...this.nativeWindows.values()].reduce((sum,window)=>sum+window.ids.length,0),selectedHostWindows:this.loadedFloors.size,cursors:{turns:this.cursors.size,native:this.nativeCursors.size,mixed:this.mixedCursors.size,prefix:this.prefixCursors.size,recall:this.recallCursors.size,coordination:this.coordinationCursors.size},peerBufferedBytes:[...this.peers].reduce((sum,peer)=>sum+peer.socket.bufferedAmount,0),handshakeQueuedEvents:[...this.peers].reduce((sum,peer)=>sum+peer.buffer.length,0),handshakeQueuedBytes:[...this.peers].reduce((sum,peer)=>sum+peer.bufferBytes,0)},
+    retainedReplay:this.store.db.prepare('SELECT count(*) events,coalesce(sum(bytes),0) bytes FROM actions').get(),
+    pendingQueue:this.store.db.prepare("SELECT count(*) messages,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM queue_intents WHERE status='pending'").get()
+  };}
   async inspectSession(session:string) {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);

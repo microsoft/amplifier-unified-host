@@ -703,3 +703,10 @@ cannot block the same client's control or receipt request. Capability owners ret
 their durable command admission and compare-and-set responsibilities. Clients must
 await a result when a later request depends on its effect; wire response order is
 not an effect-ordering guarantee. The per-peer in-flight request limit still applies.
+
+`host.diagnostics()` exposes aggregate working-set, cursor, queued-intent and
+retained-replay counts/bytes for qualification. It contains no session IDs or
+history payloads. Selected native turn-ID windows disappear after their last
+subscriber leaves; cursor caches retain at most 4,096 entries per cursor kind.
+Calling diagnostics queries small indexed host projections and never asks a native
+agent for history or starts an execution worker.
