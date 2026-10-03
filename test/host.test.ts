@@ -216,16 +216,19 @@ test('scheduled admission compares durable revisions, shares stop lifecycle, and
   const client=await f.connect(),{session,chat}=await f.create(client);await client.subscribe(chat,{view:{turns:10}});
   const before=await f.host.inspectSession(session);
   const input={commandId:randomUUID(),text:'slow',taskId:'task',taskRevision:1,kind:'monitor' as const,expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash};
-  const [first,second]=await Promise.all([f.host.submitScheduled(session,input),f.host.submitScheduled(session,{...input,commandId:randomUUID()})]);
-  assert.equal(first.accepted,true);assert.equal(second.accepted,false);
-  client.dispatch(chat,{type:'chat/turnCancelled',turnId:input.commandId,duration:0});
-  await waitFor(()=>f.host.store.receipt(input.commandId)?.status==='cancelled');
+  const other={...input,commandId:randomUUID()};
+  const results=await Promise.all([f.host.submitScheduled(session,input),f.host.submitScheduled(session,other)]);
+  assert.equal(results.filter(result=>result.accepted).length,1);
+  // Canonical workspace validation is asynchronous; admission promises do not promise a winner order.
+  const admitted=results[0].accepted?input:other;
+  client.dispatch(chat,{type:'chat/turnCancelled',turnId:admitted.commandId,duration:0});
+  await waitFor(()=>f.host.store.receipt(admitted.commandId)?.status==='cancelled');
   const after=await f.host.inspectSession(session);assert.equal(after.executionRevision,before.executionRevision+1);assert.equal(after.interruptionRevision,before.interruptionRevision+1);
   const stale=await f.host.submitScheduled(session,{...input,commandId:randomUUID()});assert.equal(stale.accepted,false);
-  await assert.rejects(f.host.submitScheduled(session,input),/already admitted/);
+  await assert.rejects(f.host.submitScheduled(session,admitted),/already admitted/);
   await assert.rejects(f.host.nativeControl(session,'schedule.submit',{}),/submitScheduled/);
-  const recorded=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(recorded.operation,'schedule.submit');assert.equal(recorded.args.inputId,input.commandId);assert.equal(recorded.args.taskRevision,1);
-  const context=await f.host.readSessionContext(session);assert.equal(context.messages[0].inputOrigin,'scheduled');assert.equal(context.messages[0].scheduledRunId,input.commandId);
+  const recorded=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(recorded.operation,'schedule.submit');assert.equal(recorded.args.inputId,admitted.commandId);assert.equal(recorded.args.taskRevision,1);
+  const context=await f.host.readSessionContext(session);assert.equal(context.messages[0].inputOrigin,'scheduled');assert.equal(context.messages[0].scheduledRunId,admitted.commandId);
   const rejectedId=randomUUID();assert.equal((await f.host.submitScheduled(session,{...input,commandId:rejectedId,taskRevision:99,expectedExecutionRevision:after.executionRevision,expectedInterruptionRevision:after.interruptionRevision})).accepted,true);
   await waitFor(()=>f.host.store.receipt(rejectedId)?.status==='failed');
   assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);

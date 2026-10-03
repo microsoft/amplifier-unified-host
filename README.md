@@ -1210,3 +1210,15 @@ set this binding. The WebSocket handler never derives it from request fields,
 `args.sessionId`, or client metadata. Providers continue to authorize their typed
 selectors against `context.session`; routing an action on the root channel does
 not grant agents authority over other sessions.
+
+### Reversible conversation presentation
+
+An optional `conversationPresentation` embedding owns reviewed, reversible
+product visibility. It preserves native histories, files, input provenance,
+unknown/admission receipts, queue tombstones and other owners' records. It uses
+selected host admission locks for the local marker transaction; visibility never
+revokes authorized exact-ID reads, commands or deferred work. There is no global
+maintenance dependency or client-asserted authority. Exact DTOs, limits,
+catalog reconstruction obligations and remaining recovery boundaries are in
+[conversation-presentation.v1](docs/contracts/conversation-presentation.v1.md).
+The feature is unavailable without the configured indexed catalog projection. Removing that configuration cannot bypass retained authority.

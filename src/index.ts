@@ -13,3 +13,6 @@ export type {RetentionProtection,RetentionPreviewRequest,RetentionApplyRequest} 
 export type {ManagedSessionCreate,ManagedLocation} from './managed.js';
 
 export type {ManagedFilesProtection,ManagedFilesActor,ManagedFilesApply} from './managed-files.js';
+
+export type * from './presentation-types.js';
+export {PRESENTATION_LIMITS} from './presentation.js';
