@@ -20,6 +20,7 @@ export interface Catalog {
   projectSessionArchives?(params:{items:Array<{uri:string;isArchived:boolean}>}):Promise<unknown>;
   get(uri:string):Promise<CatalogRecord|undefined>;
   upsert(record:CatalogRecord):Promise<unknown>;
+  claimNative?(params:{record:CatalogRecord;commandId:string;evidence:'verified-native-import'}):Promise<CatalogRecord>;
   hint?(sessionDirectory:string):Promise<unknown>;
   directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   setVisibility?(params:{uri:string;nativeSessionId:string;workingDirectory:string;deleted:boolean;commandId:string;evidence:"native-completed-receipt"}):Promise<unknown>;
@@ -34,6 +35,7 @@ export interface SessionWorkspace {
   session:string;engineId:string;nativeSessionId?:string;historyHome:string;executionDirectory:string;executionRevision:number;
 }
 export interface SessionWorkspaceExpectation {expectedExecutionRevision?:number;expectedDirectory?:string;}
+export interface AdoptImport {commandId:string;session:string;engineId:string;workingDirectory:string;importCommandId:string;sourceSha256:string;previewHash:string;}
 export interface TransferCommand {commandId:string;transferId:string;}
 export interface BeginTransfer extends TransferCommand {destination:string;expectedExecutionRevision:number;}
 /** AHP identity/source originate in the authenticated signed portability envelope. */
@@ -233,6 +235,11 @@ export class AmplifierHost {
     let path:string;try {path=await realpath(fileURLToPath(uri));}catch {throw new RpcFault(-32602,'Working directory must be an existing local directory');}
     if(!(await stat(path)).isDirectory()||!this.roots.some(root=>{const rel=relative(root,path);return !rel||rel!=='..'&&!rel.startsWith('../')&&!isAbsolute(rel);}))throw new RpcFault(-32009,'Working directory is outside allowed workspace roots');
     return path;
+  }
+  /** Read-only canonical workspace authority for trusted product owners. */
+  async authorizeWorkspace(directory:string):Promise<string> {
+    if(typeof directory!=='string'||directory.length>8192||!isAbsolute(directory))throw new RpcFault(-32602,'An absolute existing workspace directory is required');
+    return this.workspace(pathToFileURL(directory).href);
   }
   private async resourcePath(uri:string):Promise<string> {
     let path:string;try {path=await realpath(fileURLToPath(uri));}catch{throw new RpcFault(-32008,'Resource not found');}
@@ -733,6 +740,92 @@ export class AmplifierHost {
       return {session:record.uri,transferId,hostFence:this.transferFence(record.uri)??null,native:result,replayed:false};
     }));
   }
+  private validateImport(input:AdoptImport) {
+    const keys=['commandId','session','engineId','workingDirectory','importCommandId','sourceSha256','previewHash'];
+    if(!input||Object.keys(input).some(key=>!keys.includes(key))||keys.some(key=>typeof (input as unknown as Json)[key]!=='string'||!(input as unknown as Json)[key])||input.commandId.length>200||input.importCommandId.length>200||input.engineId.length>128||!/^ahp-session:\/[A-Za-z0-9_-]{1,200}$/.test(input.session)||!isAbsolute(input.workingDirectory)||!/^[a-f0-9]{64}$/.test(input.sourceSha256)||!/^[a-f0-9]{64}$/.test(input.previewHash))throw new RpcFault(-32602,'Bounded exact import receipt identity required',{executed:false});
+  }
+  private async verifiedImport(input:AdoptImport):Promise<Json> {
+    const engine=this.config.engines.find(engine=>engine.id===input.engineId);
+    if(!engine)throw new RpcFault(-32601,'Import engine is not configured',{executed:false});
+    const cwd=await this.workspace(pathToFileURL(input.workingDirectory).href);
+    if(cwd!==input.workingDirectory)throw new RpcFault(-32602,'Import workspace must be canonical',{executed:false});
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached',{executed:false});
+    this.passiveReads++;
+    const agent=new AcpProcess(engine,cwd,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Import receipt inspection cannot perform filesystem or terminal effects');}});
+    try {
+      const initialized=await agent.initialize(),capability=(initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.admin?.historyImport;
+      if(capability?.version!==1||capability.staged!==true)throw new RpcFault(-32601,'Configured agent does not advertise staged native history import',{executed:false});
+      const receipt=await agent.client.extMethod('_amplifier/admin',{cwd,operation:'history.import.receipt',args:{commandId:input.importCommandId}}),proof=receipt?.result as Json|undefined;
+      if(!receipt||Buffer.byteLength(JSON.stringify(receipt))>32768||receipt.commandId!==input.importCommandId||receipt.operation!=='history.import.commit'||receipt.status!=='succeeded'||receipt.replayed!==false||!proof||proof.importCommandId!==input.importCommandId||proof.creationConfirmed!==true||proof.workReplayed!==false||proof.sourceSha256!==input.sourceSha256||proof.previewHash!==input.previewHash||proof.historyCwd!==cwd||proof.executionDirectory!==cwd||typeof proof.nativeSessionId!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(proof.nativeSessionId)||typeof proof.historyRevision!=='string'||!proof.historyRevision||proof.historyRevision.length>512||typeof proof.title!=='string'||proof.title.length>1000)throw new RpcFault(-32011,'Exact successful native import creation receipt is unavailable',{executed:false});
+      return proof;
+    }finally{this.passiveReads--;await agent.retire();}
+  }
+  private async finishImportAdoption(entry:Json,proof:Json) {
+    const input=JSON.parse(String(entry.payload)) as AdoptImport;
+    return this.withLock('@directory-reservations',async()=>{
+      await this.workspace(pathToFileURL(input.workingDirectory).href);
+      let uri=String(entry.session),existing=this.getRecord(uri),timestamp=now(),title=proof.title,createdAt=timestamp,modifiedAt=timestamp,status=SessionStatus.Idle;
+      const catalogRecord:CatalogRecord={uri,engineId:input.engineId,nativeSessionId:proof.nativeSessionId,workingDirectory:input.workingDirectory,title:proof.title,createdAt:timestamp,modifiedAt:timestamp,kind:'root',availability:'available',workspaceAvailability:'present'};
+      // Native import and background discovery can race. The catalog atomically
+      // claims an exact native identity, reusing an already discovered URI.
+      if(this.config.catalog){
+        if(!this.config.catalog.claimNative)throw new RpcFault(-32601,'Catalog lacks atomic native import registration');
+        const claimed=await this.config.catalog.claimNative({record:catalogRecord,commandId:String(entry.command_id),evidence:'verified-native-import'});
+        if(!claimed||claimed.engineId!==input.engineId||claimed.nativeSessionId!==proof.nativeSessionId||claimed.workingDirectory!==input.workingDirectory||!/^ahp-session:\/[A-Za-z0-9_-]{1,200}$/.test(claimed.uri))throw new Error('Catalog returned a different native import identity');
+        uri=claimed.uri;existing=this.getRecord(uri);title=claimed.title;createdAt=claimed.createdAt;modifiedAt=claimed.modifiedAt;status=SessionStatus.Idle|(claimed.isArchived?SessionStatus.IsArchived:0);
+      }
+      if(existing&&(existing.engineId!==input.engineId||existing.nativeSessionId!==proof.nativeSessionId||existing.workingDirectory!==input.workingDirectory))throw new Error('Import target already maps to a different native identity');
+      const duplicates=this.store.db.prepare('SELECT uri FROM sessions WHERE engine_id=? AND native_id=? AND cwd=? AND uri<>? LIMIT 1').get(input.engineId,proof.nativeSessionId,input.workingDirectory,uri);
+      if(duplicates)throw new Error('Native import already has another host mapping');
+      const summary:SessionSummary={resource:uri,provider:input.engineId,title,status,createdAt,modifiedAt,workingDirectories:[pathToFileURL(input.workingDirectory).href]};
+      const chat:ChatState={resource:chatURI(uri),title,status,modifiedAt,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:true},'amplifier.dev/import':{sourceSha256:input.sourceSha256,workReplayed:false}}};
+      const record:SessionRecord=existing??{uri,engineId:input.engineId,nativeSessionId:proof.nativeSessionId,workingDirectory:input.workingDirectory,executionDirectory:input.workingDirectory,summary,chat,state:{provider:input.engineId,title,status,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories}};
+      const result={uri,nativeSessionId:proof.nativeSessionId,importCommandId:input.importCommandId,sourceSha256:input.sourceSha256,historyRevision:proof.historyRevision,creationConfirmed:true,workReplayed:false,receipt:String(entry.command_id)};
+      this.store.transaction(()=>{this.store.save(record);this.store.db.prepare("UPDATE import_adoptions SET session=?,status='completed',result=? WHERE command_id=?").run(uri,JSON.stringify(result),entry.command_id);this.store.finish(String(entry.command_id),'completed');});
+      this.notify('root/sessionAdded',{channel:ROOT,summary:record.summary});return result;
+    });
+  }
+  /** Verify the configured native owner; caller identity fields never prove creation. */
+  async adoptImportedSession(input:AdoptImport) {
+    return this.intake.run(async()=>{
+      this.validateImport(input);const payload=JSON.stringify(input);
+      return this.withLock('@native-import:'+input.engineId+':'+input.importCommandId,async()=>{
+        if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
+        const prior=this.store.db.prepare('SELECT * FROM import_adoptions WHERE command_id=? OR (engine_id=? AND import_command_id=?)').all(input.commandId,input.engineId,input.importCommandId);
+        if(prior.length){
+          const row=prior[0]!,original=JSON.parse(String(row.payload));
+          if(prior.length!==1||row.command_id===input.commandId&&row.payload!==payload||original.engineId!==input.engineId||original.importCommandId!==input.importCommandId||original.workingDirectory!==input.workingDirectory||original.sourceSha256!==input.sourceSha256||original.previewHash!==input.previewHash)throw new RpcFault(-32011,'Import adoption command or receipt identity conflicts',{executed:false});
+          if(row.status==='completed')return JSON.parse(String(row.result));
+          throw new RpcFault(-32011,'Original import mapping is unresolved; inspect its receipt without repeating native import',{receipt:row.command_id,outcome:row.status});
+        }
+        if(this.config.catalog&&!this.config.catalog.claimNative)throw new RpcFault(-32601,'Catalog lacks atomic native import registration',{executed:false});
+        const proof=await this.verifiedImport(input);
+        return this.withLock(input.session,async()=>{
+          const existing=this.getRecord(input.session)??await this.config.catalog?.get(input.session);
+          if(existing&&(existing.engineId!==input.engineId||existing.nativeSessionId!==proof.nativeSessionId||existing.workingDirectory!==input.workingDirectory))throw new RpcFault(-32011,'Requested AHP identity belongs to another native session',{executed:false});
+          const duplicate=this.store.db.prepare('SELECT uri FROM sessions WHERE engine_id=? AND native_id=? AND cwd=? LIMIT 1').get(input.engineId,proof.nativeSessionId,input.workingDirectory);
+          if(duplicate&&duplicate.uri!==input.session)throw new RpcFault(-32011,'Imported native identity already has a host mapping',{executed:false});
+          const entry={command_id:input.commandId,session:input.session,payload};
+          this.store.transaction(()=>{this.store.admission(input.session,{kind:'import.adopt',input},input.commandId,'host:import',this.store.extensionSequence('host:import'));this.store.db.prepare('INSERT INTO import_adoptions VALUES(?,?,?,?,?,?,?,?)').run(input.commandId,input.engineId,input.importCommandId,input.session,'dispatching',payload,JSON.stringify(proof),null);this.store.finish(input.commandId,'dispatching');});
+          try{return await this.finishImportAdoption(entry,proof);}catch{this.store.transaction(()=>{this.store.db.prepare("UPDATE import_adoptions SET status='unknown' WHERE command_id=?").run(input.commandId);this.store.finish(input.commandId,'unknown','Derived import registration is unresolved; native creation is not replayed');});throw new RpcFault(-32011,'Import mapping outcome unknown; reconcile original receipt',{receipt:input.commandId,outcome:'unknown'});}
+        });
+      });
+    });
+  }
+  /** Explicit metadata-only repair, using the original native receipt, never commit again. */
+  async importAdoptionReceipt(commandId:string,{reconcile=false}:{reconcile?:boolean}={}) {
+    if(typeof commandId!=='string'||!commandId||commandId.length>200)throw new RpcFault(-32602,'Exact import adoption command required');
+    const row=this.store.db.prepare('SELECT * FROM import_adoptions WHERE command_id=?').get(commandId);
+    if(!row)return null;
+    if(row.status==='completed'||!reconcile)return {status:row.status,result:row.result?JSON.parse(String(row.result)):undefined,receipt:this.store.receipt(commandId),replayed:false};
+    return this.intake.run(()=>this.withLock('@native-import:'+row.engine_id+':'+row.import_command_id,async()=>{
+      const current=this.store.db.prepare('SELECT * FROM import_adoptions WHERE command_id=?').get(commandId)!;
+      if(current.status==='completed')return {status:'completed',result:JSON.parse(String(current.result)),receipt:this.store.receipt(commandId),replayed:false};
+      const input=JSON.parse(String(current.payload)),proof=await this.verifiedImport(input);
+      if(JSON.stringify(proof)!==current.proof)throw new RpcFault(-32011,'Native import proof changed; registration remains unresolved');
+      const result=await this.withLock(String(current.session),()=>this.finishImportAdoption(current,proof));return {status:'completed',result,receipt:this.store.receipt(commandId),replayed:false};
+    }));
+  }
   /** Trusted composition boundary: preserve the AHP identity from a verified signed envelope. */
   async adoptTransferredSession(input:AdoptTransfer) {
     return this.intake.run(async()=>{
@@ -767,6 +860,7 @@ export class AmplifierHost {
   }
   private guardSessionLifecycle(session:string) {
     this.guardTransfer(session);
+    if(this.store.db.prepare("SELECT 1 FROM import_adoptions WHERE session=? AND status<>'completed' LIMIT 1").get(session))throw new RpcFault(-32011,'Imported session registration is unresolved; inspect its exact receipt');
     if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(session,session))throw new RpcFault(-32011,'Session lifecycle outcome is unresolved; inspect the original receipt without replay');
     if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(session))throw new RpcFault(-32008,'Session was removed from discovery; restore it before execution');
   }

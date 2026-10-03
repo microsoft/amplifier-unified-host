@@ -837,3 +837,32 @@ repairs archive flags after catalog rebuild without loading transcripts, spawnin
 agents, or constructing a global session snapshot. Older custom catalogs can omit
 `projectSessionArchives`; upgraded stdio catalogs implement that public repair
 port. Native metadata scans must preserve explicit host archive flags.
+
+## Verified native history import adoption
+
+`authorizeWorkspace(directory)` returns only an existing canonical directory under
+configured roots. Trusted product owners use it before staging an explicit import;
+it grants no generic browser filesystem or native-administration capability.
+
+`adoptImportedSession({commandId,session,engineId,workingDirectory,importCommandId,
+sourceSha256,previewHash})` independently initializes the **configured** ACP engine
+and queries its exact `history.import.receipt` through negotiated native
+`admin.historyImport` v1. It never accepts a caller-provided native ID, transcript,
+or successful-creation boolean. The native receipt must be a succeeded exact
+`history.import.commit`, with a newly generated native UUID, matching canonical
+workspace, source/review hashes, `creationConfirmed:true`, and `workReplayed:false`.
+No ACP session, worker, model or history page is started by adoption.
+
+The durable mapping is unique by configured engine and native import command.
+Changed caller command IDs or requested URI hints cannot create duplicate chats.
+Conflicting existing native/AHP identities refuse. A catalog must implement atomic
+`claimNative`; it may reuse an already discovered URI, which becomes authoritative.
+Ordinary upsert is not a safe substitute. A failed/lost catalog acknowledgement
+retains unknown registration evidence. `importAdoptionReceipt(commandId)` is a
+passive exact read; `{reconcile:true}` explicitly rechecks the original native proof
+and repairs **derived metadata only** under host intake and directory guards.
+Neither method ever invokes native import commit or replays source work.
+
+Generic ACP engines lacking the extension report unsupported. The staged source,
+normalization, native writer leases and original bytes belong exclusively to the
+native import owner; the host stores only bounded proof and mapping receipts.
