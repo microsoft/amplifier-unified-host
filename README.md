@@ -815,3 +815,15 @@ An idle-triggered retry may retain the durable supervisor command with explicit
 reconciliation case. Acquisition/release callbacks have a
 bounded `timeoutMs` (25–30,000; default 10,000). The public gate API does not invent
 release version/digest, account readiness, or complete owner coverage.
+
+### Exclusive host state ownership
+
+Before opening `host.sqlite` or running any recovery migration, the host holds a
+separate `host-owner-lock.sqlite` lifetime SQLite `BEGIN EXCLUSIVE` lease with a
+DELETE journal and zero lock wait. Only one cooperating process can own the state
+directory. Process death releases the operating-system lock; durable admission and
+quiescence receipts remain and are classified conservatively on the next open.
+No PID file is unlinked to reclaim ownership. A surviving legacy `host.lock` is
+retained as evidence, and a live legacy PID prevents opening the new journals.
+Old releases do not participate in the new lease: retire an old instance before
+activating this release, as required by the supervisor replacement protocol.

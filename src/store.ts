@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, openSync, writeFileSync, readFileSync, closeSync, unlinkSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
+import { OwnerLease } from './owner-lease.js';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { chatReducer, type ActionEnvelope, type ChatState, type SessionState, type SessionSummary, type Turn } from '@microsoft/agent-host-protocol';
@@ -19,20 +20,14 @@ export class Store {
   readonly db: DatabaseSync;
   readonly incarnation = randomUUID();
   private replayBytes=0;
-  private lease:number|undefined;
-  private leasePath:string;
+  private lease:OwnerLease;
   private transactionOpen=false;
   constructor(directory: string, readonly replayLimit = 4096) {
     mkdirSync(directory, {recursive: true, mode: 0o700});
-    this.leasePath=join(directory,'host.lock');
-    try {this.lease=openSync(this.leasePath,'wx',0o600);}catch(error) {
-      if((error as NodeJS.ErrnoException).code!=='EEXIST')throw error;
-      const previous=JSON.parse(readFileSync(this.leasePath,'utf8'));
-      try{process.kill(previous.pid,0);}catch(probe){if((probe as NodeJS.ErrnoException).code==='ESRCH'){unlinkSync(this.leasePath);this.lease=openSync(this.leasePath,'wx',0o600);}else throw probe;}
-      if(this.lease===undefined)throw new Error('Host state directory already has a live owner');
-    }
-    writeFileSync(this.lease!,JSON.stringify({pid:process.pid,incarnation:this.incarnation}));
-    this.db = new DatabaseSync(join(directory, 'host.sqlite'));
+    this.lease=new OwnerLease(directory);
+    let opened:DatabaseSync|undefined;
+    try{
+    this.db = opened = new DatabaseSync(join(directory, 'host.sqlite'));
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES('seq',0);
@@ -95,6 +90,7 @@ export class Store {
       const receipt = JSON.parse(row.payload as string) as Receipt;
       this.finish(receipt.commandId, 'unknown', 'Host restarted before a conclusive ACP outcome; reconcile native history before new work.');
     }
+    }catch(error){opened?.close();this.lease.close();throw error;}
   }
   get seq(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='seq'").get()!.value); }
   get count(): number { return Number(this.db.prepare('SELECT count(*) AS n FROM sessions').get()!.n); }
@@ -215,5 +211,5 @@ export class Store {
     this.db.prepare('INSERT OR IGNORE INTO session_admission(uri) VALUES(?)').run(uri);
     this.db.prepare(`UPDATE session_admission SET ${kind}=${kind}+1 WHERE uri=?`).run(uri);
   }
-  close() { this.db.close();closeSync(this.lease!);if(JSON.parse(readFileSync(this.leasePath,'utf8')).incarnation===this.incarnation)unlinkSync(this.leasePath); }
+  close() { try{this.db.close();}finally{this.lease.close();} }
 }
