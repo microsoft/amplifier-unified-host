@@ -2,7 +2,7 @@ import {AsyncLocalStorage} from 'node:async_hooks';
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
 
-export type QuiescencePurpose='distribution-update'|'recovery'|'service-stop';
+export type QuiescencePurpose='distribution-update'|'recovery'|'service-stop'|'retention-hide';
 export type QuiescenceOutcome='ready'|'unchanged'|'unknown';
 export interface ServiceIdentity {installationId:string;dataScope:string;ownerId:string;instanceId:string;releaseDigest:string;}
 export interface ServiceStopRequest {commandId:string;expected:ServiceIdentity;retryRefused?:boolean;}
@@ -34,6 +34,8 @@ export interface QuiescenceParticipant {
  id:string;
  /** Declares full persisted service identity and service-specific release proof support. */
  serviceStop?:{version:1};
+ /** Supports persisted retention-purpose identity and exact selected-item release evidence. */
+ retentionHide?:{version:1};
  /** Atomically closes this owner's intake; null is a proven no-effect busy refusal. */
  acquire:(context:Readonly<QuiescenceContext>)=>Promise<QuiescenceLease|null>;
  /** Exact persisted owner fence reconciliation after process/supervisor replacement. */
@@ -123,7 +125,7 @@ export class QuiescenceGate {
   catch(error){return this.unknown(fence,String(error));}
  }
  private unknown(fence:QuiescenceFence,reason:string){fence.phase='unknown';fence.reason=reason.slice(0,500);this.save(fence);return this.receipt(fence.commandId);}
- async admit(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'>;retryRefused?:boolean}) {
+ async admit(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'retention-hide'>;retryRefused?:boolean}) {
   if((input.purpose as string)==='service-stop')throw new QuiescenceError('Service stop requires its identity-bound admission API',{executed:false});
   return this.admitBound(input);
  }

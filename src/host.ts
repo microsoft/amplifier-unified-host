@@ -1,3 +1,4 @@
+import {Retention,type RetentionProtection,type RetentionPreviewRequest,type RetentionApplyRequest} from './retention.js';
 import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest} from './quiescence.js';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
@@ -25,6 +26,7 @@ export interface Catalog {
   hint?(sessionDirectory:string):Promise<unknown>;
   directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   setVisibility?(params:{uri:string;nativeSessionId:string;workingDirectory:string;deleted:boolean;commandId:string;evidence:"native-completed-receipt"}):Promise<unknown>;
+  retentionCandidates?(params:RetentionPreviewRequest&{allowedWorkspaceRoots:string[]}):Promise<Json>;
   descendants?(params:{parentUri:string;limit:number}):Promise<CatalogFamily>;
   close?():Promise<void>;
 }
@@ -55,6 +57,7 @@ export interface HostConfig {
   resolvePromptAttachment?:(context:{session:string;engineId:string;nativeSessionId?:string;workingDirectory:string},attachment:NonNullable<Message['attachments']>[number])=>Promise<ContentBlock[]|undefined>;
   resourceProviders?:Array<{scheme:string;read?:(params:Json,context:{clientId:string})=>Promise<Json>;resolve?:(params:Json,context:{clientId:string})=>Promise<Json>;list?:(params:Json,context:{clientId:string})=>Promise<Json>;write?:(params:Json,context:{clientId:string})=>Promise<Json>}>;
   catalog?:Catalog;
+  retentionProtection?:RetentionProtection;
   /** Existing directory used for new-client workspace hints; must be within allowed roots. */
   defaultWorkingDirectory?:string;
   quiescence?:QuiescenceConfig;
@@ -97,6 +100,8 @@ export class AmplifierHost {
   readonly http:Server;
   readonly ws:WebSocketServer;
   private peers=new Set<Peer>();
+  private retention:Retention;
+  private retentionChanging=new Set<string>();
   private active=new Map<string,Active>();
   private starting=new Map<string,Promise<Active>>();
   private resourceLocks=new Map<string,Promise<unknown>>();
@@ -132,6 +137,11 @@ export class AmplifierHost {
     if(config.transferIdentity!==undefined&&!/^[a-f0-9]{64}$/.test(config.transferIdentity))throw new Error('transferIdentity must be an exact node public-key fingerprint');
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
     this.store=new Store(config.stateDirectory,config.replayLimit);
+    this.retention=new Retention(this.store.db,{list:async input=>{
+      if(!config.catalog?.retentionCandidates)throw new RpcFault(-32601,'Catalog retention metadata is unavailable',{executed:false});
+      if(input.workingDirectory)await this.workspace(pathToFileURL(input.workingDirectory).href);
+      return config.catalog.retentionCandidates({...input,allowedWorkspaceRoots:this.roots});
+    },protected:(row,protect)=>this.retentionProtected(row,protect),hide:(row,input)=>this.hideRetained(row,input)});
     for(const [name,access] of Object.entries(config.capabilities?.quiescenceAccess??{})){
       const action=config.capabilities?.manifest.actions[name];
       if(!action||!['read','reconcile'].includes(access)||Object.values(config.capabilities!.manifest.actions).filter(candidate=>candidate.topic===action.topic&&candidate.operation===action.operation).length!==1)throw Error('Quiescence action classification must identify one exact advertised action');
@@ -493,7 +503,8 @@ export class AmplifierHost {
   }
   private async subscribe(peer:Peer,uri:string,turns?:number) {
     if(peer.subscriptions.size>=(this.config.maxSubscriptions??64)&&!peer.subscriptions.has(uri))throw new RpcFault(-32000,'Subscription capacity reached');
-    const snapshot=await this.snapshot(uri,turns);peer.subscriptions.add(uri);return snapshot;
+    if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');
+    const snapshot=await this.snapshot(uri,turns);if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');peer.subscriptions.add(uri);return snapshot;
   }
   private async route(peer:Peer,method:string,p:Json):Promise<unknown> {
     if(method==='ping')return null;
@@ -516,7 +527,7 @@ export class AmplifierHost {
       peer.clientId=p.clientId;peer.initialized=true;
       const missing:string[]=[];
       if(p.subscriptions.length>(this.config.maxSubscriptions??64))throw new RpcFault(-32000,'Subscription capacity reached');
-      for(const uri of p.subscriptions)try {if(uri!==ROOT&&!this.watches.has(uri)&&!this.terminalState(uri))await this.record(uri);peer.subscriptions.add(uri);}catch{missing.push(uri);}
+      for(const uri of p.subscriptions)try {if(this.retentionChanging.has(uri))throw new Error('Retention operation in progress');if(uri!==ROOT&&!this.watches.has(uri)&&!this.terminalState(uri))await this.record(uri);peer.subscriptions.add(uri);}catch{missing.push(uri);}
       const replay=this.store.replay(p.lastSeenServerSeq,peer.subscriptions);
       if(replay){peer.replayCut=this.store.seq;return {type:'replay',actions:replay,missing};}
       // Snapshot recovery has no view hint in AHP 0.9; return all retained turns as specified.
@@ -862,6 +873,58 @@ export class AmplifierHost {
     });
       });
   }
+  /** Cold bounded candidate reviews; no ACP process or selected history startup. */
+  previewRetention(input:RetentionPreviewRequest){return this.retention.preview(input);}
+  applyRetention(input:RetentionApplyRequest){return this.intake.run(()=>this.retention.apply(input));}
+  retentionReceipt(commandId:string){return this.retention.receipt(commandId);}
+  retentionItemReceipt(commandId:string){return this.retention.itemReceipt(commandId);}
+  private retentionProtected(row:CatalogRecord,protect:string[]):string|undefined {
+    const uri=row.uri,chat=uri.replace('ahp-session:','ahp-chat:');
+    if(protect.includes(uri)||this.hasSubscribers(uri)||this.hasSubscribers(chat))return 'selected-or-subscribed';
+    if(this.retentionChanging.has(uri))return 'retention-in-progress';
+    if(this.active.get(uri)?.busy||this.active.get(uri)?.controlDepth||this.starting.has(uri))return 'active-work';
+    if(this.store.unknown(chat))return 'unknown-input';
+    if(this.store.db.prepare("SELECT 1 FROM queue_intents WHERE chat=? AND status='pending' UNION ALL SELECT 1 FROM steering_intents WHERE chat=? AND status IN ('pending','dispatching','unknown') LIMIT 1").get(chat,chat))return 'pending-input';
+    if(this.relocationFence(uri)||this.transferFence(uri))return 'ownership-transition';
+    if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(uri,uri))return 'unknown-lifecycle';
+    if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(uri))return 'already-hidden';
+    const current=this.store.db.prepare('SELECT modified,engine_id,native_id,cwd FROM sessions WHERE uri=?').get(uri) as Json|undefined;
+    if(current&&(current.engine_id!==row.engineId||current.native_id!==row.nativeSessionId||current.cwd!==row.workingDirectory))return 'changed-identity';
+    if(current&&row.modifiedAt&&Date.parse(current.modified)>Date.parse(row.modifiedAt))return 'new-host-activity';
+    return undefined;
+  }
+  private async hideRetained(reviewed:CatalogRecord,input:{commandId:string;modifiedBefore:number;protectSessionIds:string[]}) {
+    return this.withLock(reviewed.uri,async()=>{
+      const fail=(message:string)=>new RpcFault(-32011,message,{executed:false});
+      if(!this.config.retentionProtection)throw fail('Dependent-owner retention protection is unavailable');
+      const current=await this.config.catalog?.get(reviewed.uri);
+      if(!current||current.nativeSessionId!==reviewed.nativeSessionId||current.engineId!==reviewed.engineId||current.workingDirectory!==reviewed.workingDirectory||current.modifiedAt!==reviewed.modifiedAt||current.createdAt!==reviewed.createdAt||current.nativeDeleted||current.workspaceAvailability!=='present')throw fail('Reviewed catalog identity or activity changed');
+      const protectedReason=this.retentionProtected(current,input.protectSessionIds);if(protectedReason)throw fail(protectedReason);
+      const record=await this.record(current.uri);this.guardSessionLifecycle(record.uri);
+      const fenced=new Set<string>(),fence=(row:CatalogRecord)=>{const reason=this.retentionProtected(row,input.protectSessionIds);if(reason)throw fail(reason);for(const uri of [row.uri,row.uri.replace('ahp-session:','ahp-chat:')]){this.retentionChanging.add(uri);fenced.add(uri);}};
+      fence(current);
+      try{
+        await this.quiesceLifecycle(record);
+        return await this.withLifecycleFamily(record,true,async(descendants,sessions)=>{
+          const lease=await this.config.retentionProtection!.acquire({commandId:input.commandId,session:record.uri,descendants:sessions,operation:'hide'});
+          if(!lease||!Array.isArray(lease.ownerIds)||!lease.ownerIds.length||lease.ownerIds.length>64||lease.ownerIds.some(id=>typeof id!=='string'||!id)||typeof lease.release!=='function')throw new Error('Dependent-owner protection did not return held coverage');
+          try{const confirmed=await this.lifecycleAgent(record,async agent=>{
+            const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle;
+            if(capability?.retention?.version!==1||capability?.descendantGuard?.version!==1)throw fail('Native guarded retention hide is unavailable');
+            const inspected=await this.nativeLifecycle(agent,record,'inspect'),args={commandId:input.commandId,expectedHistoryRevision:inspected.historyRevision,modifiedBefore:input.modifiedBefore,descendants};
+            const entry={command_id:input.commandId,session:record.uri,operation:'retention.hide',target:null,status:'dispatching',payload:JSON.stringify(args)};
+            this.store.transaction(()=>{this.store.admission(record.uri,{operation:entry.operation,args},input.commandId,'host:retention',this.store.extensionSequence('host:retention'));this.store.db.prepare('INSERT INTO lifecycle_commands(command_id,session,operation,target,status,payload) VALUES(?,?,?,?,?,?)').run(entry.command_id,entry.session,entry.operation,null,entry.status,entry.payload);this.store.finish(input.commandId,'dispatching');});
+            try{return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,'retention.hide',args));}
+            catch(error){let proof:Json|undefined;try{proof=await this.nativeLifecycle(agent,record,'receipt',{commandId:input.commandId});}catch{}
+              if(proof?.receipt?.status==='completed'){try{return await this.applyLifecycleResult(record,entry,{...proof.receipt.result,receipt:proof.receipt});}catch{}}
+              const status=proof?.receipt===null?'failed':'unknown';this.store.transaction(()=>{this.store.db.prepare('UPDATE lifecycle_commands SET status=? WHERE command_id=?').run(status,input.commandId);this.store.finish(input.commandId,status,(error as Error).message);});throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:status,...(status==='failed'?{executed:false}:{})});
+            }
+          });this.retention.settleItem(input.commandId,{status:'hidden',executed:true,result:confirmed});return confirmed;
+          }catch(error){const known=(error as any)?.data?.executed===false;this.retention.settleItem(input.commandId,{status:known?'refused':'unknown',...(known?{executed:false}:{}),reason:(error as Error).message.slice(0,1000)});throw error;}finally{await lease.release();}
+        },fence);
+      }finally{for(const uri of fenced)this.retentionChanging.delete(uri);}
+    });
+  }
   private guardSessionLifecycle(session:string) {
     this.guardTransfer(session);
     if(this.store.db.prepare("SELECT 1 FROM import_adoptions WHERE session=? AND status<>'completed' LIMIT 1").get(session))throw new RpcFault(-32011,'Imported session registration is unresolved; inspect its exact receipt');
@@ -937,6 +1000,7 @@ export class AmplifierHost {
   }
   private async applyLifecycleResult(record:SessionRecord,entry:Json,native:Json) {
     if(native.receipt?.status!=='completed'||native.receipt.commandId!==entry.command_id)throw new Error('Native lifecycle outcome lacks completed receipt proof');
+    if(entry.operation==='retention.hide'&&(native.receipt.operation!=='retention.hide'||native.retention?.modifiedBefore!==JSON.parse(String(entry.payload)).modifiedBefore||native.retention?.canonicalFilesDeleted!==0||native.familyGuard?.ownersHeld!==true))throw new Error('Native retention outcome lacks exact preserve-history cutoff and family proof');
     const operation=String(entry.operation),args=JSON.parse(String(entry.payload)),timestamp=now();let result:Json;
     if(operation==='fork') {
       if(args.mode==='recovery'&&(native.mode!=='recovery'||native.preservedSource!==true)||args.bundle!==undefined&&native.bundleSelection!==args.bundle)throw new Error('Native copy mode does not match the reviewed request');
@@ -955,7 +1019,7 @@ export class AmplifierHost {
       result={resource:uri,filename:native.filename,mimeType:native.mimeType,summary:native.summary,capturedAt:native.capturedAt,historyRevision:native.historyRevision,contentHash:native.contentHash,receipt:native.receipt};
       this.store.db.prepare('INSERT OR IGNORE INTO export_resources VALUES(?,?,?,?)').run(uri,record.uri,native.snapshotId,JSON.stringify(result));
     }else{
-      if(native.sessionId!==record.nativeSessionId||native.historyCwd!==record.workingDirectory||native.deleted!==(operation==='delete'))throw new Error('Native visibility confirmation does not match selected identity');
+      if(native.sessionId!==record.nativeSessionId||native.historyCwd!==record.workingDirectory||native.deleted!==(['delete','retention.hide'].includes(operation)))throw new Error('Native visibility confirmation does not match selected identity');
       this.store.db.prepare('INSERT INTO session_visibility VALUES(?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id').run(record.uri,native.deleted?1:0,entry.command_id);
       if(this.config.catalog){if(!this.config.catalog.setVisibility)throw new Error('Catalog does not support confirmed native visibility');await this.config.catalog.setVisibility({uri:record.uri,nativeSessionId:record.nativeSessionId!,workingDirectory:record.workingDirectory,deleted:native.deleted,commandId:String(entry.command_id),evidence:'native-completed-receipt'});}
       this.store.db.prepare('UPDATE sessions SET hidden=? WHERE uri=?').run(native.deleted?1:0,record.uri);
@@ -966,9 +1030,9 @@ export class AmplifierHost {
     this.store.transaction(()=>{this.store.db.prepare("UPDATE lifecycle_commands SET status='completed',result=? WHERE command_id=?").run(JSON.stringify(result),entry.command_id);this.store.finish(String(entry.command_id),'completed');});return result;
   }
   /** Caller holds source admission; indexed facts never stand in for native ownership. */
-  private async withLifecycleFamily<T>(record:SessionRecord,required:boolean,work:(descendants:Json[])=>Promise<T>):Promise<T> {
+  private async withLifecycleFamily<T>(record:SessionRecord,required:boolean,work:(descendants:Json[],sessions:string[])=>Promise<T>,validate?:(row:CatalogRecord)=>void):Promise<T> {
     const catalog=this.config.catalog;
-    if(!catalog){if(required)throw new RpcFault(-32601,'Recovery and bundle copies require indexed family coverage',{executed:false});return work([]);}
+    if(!catalog){if(required)throw new RpcFault(-32601,'Recovery and bundle copies require indexed family coverage',{executed:false});return work([],[]);}
     if(!catalog.descendants)throw new RpcFault(-32601,'Catalog cannot provide bounded descendant coverage',{executed:false});
     const family=await catalog.descendants({parentUri:record.uri,limit:100}),fresh=family.freshness,age=Date.now()-Date.parse(fresh?.completedAt??'');
     if(!family.rootKnown||!family.completeIndexedCoverage||family.truncated||family.issues?.length||family.excludedKinds?.length||family.coverage!=='indexed-native-history'||family.root?.nativeSessionId!==record.nativeSessionId||family.root?.engineId!==record.engineId||family.root?.workingDirectory!==record.workingDirectory||!Array.isArray(family.items)||family.items.length>100||fresh?.phase!=='complete'||fresh.issues!==0||!Number.isFinite(age)||age<0||age>600000)throw new RpcFault(-32011,'Indexed family coverage is incomplete or stale; copy was not executed',{executed:false});
@@ -982,9 +1046,9 @@ export class AmplifierHost {
     }
     const lock=async(index:number):Promise<T>=>{
       if(index<family.items.length)return this.withLock(family.items[index].uri,()=>lock(index+1));
-      for(const row of family.items){const child=await this.record(row.uri);this.guardSessionLifecycle(child.uri);if(this.store.unknown(child.chat.resource)||child.chat.activeTurn||this.relocationFence(child.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle(child);}
+      for(const row of family.items){validate?.(row);const child=await this.record(row.uri);this.guardSessionLifecycle(child.uri);if(this.store.unknown(child.chat.resource)||child.chat.activeTurn||this.relocationFence(child.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle(child);}
       if((await catalog.descendants!({parentUri:record.uri,limit:100})).revision!==family.revision)throw new RpcFault(-32011,'Indexed family changed while acquiring ownership',{executed:false});
-      return work(descendants);
+      return work(descendants,family.items.map(row=>row.uri));
     };
     family.items.sort((a,b)=>a.uri.localeCompare(b.uri));return lock(0);
   }
@@ -1796,7 +1860,7 @@ export class AmplifierHost {
     return {ready:true};
   }
   /** Trusted supervisor seam, never an AHP action or a client-supplied readiness claim. */
-  admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'>;retryRefused?:boolean}) {return this.intake.admit(input);}
+  admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'retention-hide'>;retryRefused?:boolean}) {return this.intake.admit(input);}
   admitServiceStop(input:ServiceStopRequest) {return this.intake.admitServiceStop(input);}
   serviceStopReceipt(commandId:string) {return this.intake.serviceStopReceipt(commandId);}
   inspectServiceLifecycle() {return this.intake.inspectServiceLifecycle();}

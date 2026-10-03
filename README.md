@@ -977,3 +977,42 @@ read flag. These boundary events are durable; token streaming and historical
 page loads do not emit read-state writes. Reading a conversation never answers
 or dismisses its pending tool approvals. Normal AHP server ordering governs
 concurrent client actions; no private required revision field is added.
+
+
+### Reviewed age-based discovery cleanup
+
+`previewRetention({connectionId,modifiedBefore,limit?,cursor?,workingDirectory?,protectSessionIds?})`
+reads only the public cold catalog (maximum50 rows). Cutoff is past Unix seconds;
+review expiry is Unix milliseconds. Global `candidateCount` is unverified metadata;
+`eligibleCountOnPage` is only host preflight, explicitly not permission to remove.
+The ten-minute review binds the exact metadata and local protected IDs. Private
+client drafts are never synchronized. Current session/chat subscriptions protect
+selection, including new subscriptions arriving after review.
+
+`applyRetention({commandId,reviewId,reviewHash,sessionIds})` selects a nonempty
+reviewed subset of at most50. Every item has a durable deterministic command ID
+and conclusive/unknown/not-attempted state. `retentionReceipt(commandId)` is a
+passive exact batch read; `retentionItemReceipt(childCommandId)` is a lock-free
+passive item proof, persisted before dependent protection release. Never retry an
+unknown batch or silently skip it into a new command. An uncertain release can
+leave the batch unknown while preserving an already-confirmed hidden effect.
+
+Apply requires a configured `retentionProtection.acquire({commandId,session,
+descendants,operation:'hide'})` returning an actual held `{ownerIds,release}`
+lease. Missing coverage refuses. The aggregate must fence its dependent owners,
+check retained scheduling/question/reference restrictions, and authenticate its
+release using the exact durable item receipt. Its release must not reenter host
+mutation/session-lock APIs. Native authority is separate: negotiated
+`sessionLifecycle.retention` holds the native-home shared maintenance gate and
+source/family Foundation leases, verifies current activity against cutoff, then
+writes only a preserve-history discovery tombstone. Native admin/transfer global
+gates must not deadlock this independent native ownership check.
+
+`QuiescencePurpose` includes `retention-hide` for explicit participant contracts;
+optional `retentionHide:{version:1}` declares support. Host global restart
+admission does not accept that purpose. No existing recovery/update proof grants
+retention release. The product must provide real supported owner coverage.
+
+Canonical transcripts/events, workspace files and all owner records remain.
+Retired legacy-copy purge and permanent managed-chat deletion are separate
+authorities; this API performs neither.
