@@ -32,6 +32,13 @@ export class Store {
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES('seq',0);
       CREATE TABLE IF NOT EXISTS sessions(uri TEXT PRIMARY KEY,chat_uri TEXT UNIQUE NOT NULL,engine_id TEXT NOT NULL,native_id TEXT,cwd TEXT NOT NULL,modified TEXT NOT NULL,summary TEXT NOT NULL,state TEXT NOT NULL,chat TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS archive_projection_pending(uri TEXT PRIMARY KEY,is_archived INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS archived_session_projection ON sessions(uri) WHERE (json_extract(summary,'$.status') & 64)<>0;
+      INSERT OR IGNORE INTO archive_projection_pending SELECT uri,1 FROM sessions WHERE (json_extract(summary,'$.status') & 64)<>0;
+      CREATE TRIGGER IF NOT EXISTS archive_projection_changed AFTER UPDATE OF summary ON sessions
+        WHEN (json_extract(OLD.summary,'$.status') & 64)<>(json_extract(NEW.summary,'$.status') & 64) BEGIN
+          INSERT INTO archive_projection_pending VALUES(NEW.uri,(json_extract(NEW.summary,'$.status') & 64)<>0) ON CONFLICT(uri) DO UPDATE SET is_archived=excluded.is_archived;
+        END;
       CREATE INDEX IF NOT EXISTS sessions_order ON sessions(modified DESC,uri DESC);
       CREATE TABLE IF NOT EXISTS turns(chat TEXT NOT NULL,ordinal INTEGER PRIMARY KEY AUTOINCREMENT,turn_id TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(chat,turn_id));
       CREATE INDEX IF NOT EXISTS turns_page ON turns(chat,ordinal);

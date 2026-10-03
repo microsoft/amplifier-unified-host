@@ -827,3 +827,13 @@ No PID file is unlinked to reclaim ownership. A surviving legacy `host.lock` is
 retained as evidence, and a live legacy PID prevents opening the new journals.
 Old releases do not participate in the new lease: retire an old instance before
 activating this release, as required by the supervisor replacement protocol.
+
+Archive organization is projected separately from native history. Standard
+`session/isArchivedChanged` and public `archiveSession` persist the host flag and
+send explicit `isArchived` to the derived catalog. A tiny durable pending
+projection is updated in the same session transaction; restart repairs failed
+acknowledgements in batches of100. The host's archived-summary partial index
+repairs archive flags after catalog rebuild without loading transcripts, spawning
+agents, or constructing a global session snapshot. Older custom catalogs can omit
+`projectSessionArchives`; upgraded stdio catalogs implement that public repair
+port. Native metadata scans must preserve explicit host archive flags.

@@ -14,9 +14,10 @@ import { mergeHistoryTurns, turnIdentityHash } from './history.js';
 import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
-export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;}
+export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;isArchived?:boolean;}
 export interface Catalog {
-  list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];includeArchive?:boolean}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
+  list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
+  projectSessionArchives?(params:{items:Array<{uri:string;isArchived:boolean}>}):Promise<unknown>;
   get(uri:string):Promise<CatalogRecord|undefined>;
   upsert(record:CatalogRecord):Promise<unknown>;
   hint?(sessionDirectory:string):Promise<unknown>;
@@ -155,6 +156,7 @@ export class AmplifierHost {
   }
   async listen():Promise<this> {
     this.roots=await Promise.all(this.config.allowedWorkspaceRoots.map(root=>realpath(root)));
+    await this.repairArchiveProjection();
     this.defaultWorkingDirectory=await this.workspace(pathToFileURL(this.config.defaultWorkingDirectory??this.roots[0]).href);
     await new Promise<void>((resolve,reject)=>{this.http.once('error',reject);this.http.listen(this.config.port??0,this.config.host??'127.0.0.1',resolve);});
     const address=this.http.address();if(!address||typeof address==='string')throw new Error('Missing bound address');
@@ -266,7 +268,7 @@ export class AmplifierHost {
   private getRecord(uri:string):SessionRecord|undefined {return this.hotRecords.get(uri.startsWith('ahp-chat:/')?'ahp-session:/'+uri.slice('ahp-chat:/'.length):uri)??this.store.get(uri);}
   private catalogSummary(record:CatalogRecord):SessionSummary {
     const live=this.getRecord(record.uri);
-    return {resource:record.uri,provider:record.engineId,title:live?.summary.title??record.title,status:live?.summary.status??1,createdAt:record.createdAt,modifiedAt:live?.summary.modifiedAt??record.modifiedAt,workingDirectories:[pathToFileURL(record.workingDirectory).href],_meta:{'amplifier.dev/native':{availability:record.availability??'available'}}};
+    return {resource:record.uri,provider:record.engineId,title:live?.summary.title??record.title,status:live?.summary.status??(1|(record.isArchived?SessionStatus.IsArchived:0)),createdAt:record.createdAt,modifiedAt:live?.summary.modifiedAt??record.modifiedAt,workingDirectories:[pathToFileURL(record.workingDirectory).href],_meta:{'amplifier.dev/native':{availability:record.availability??'available'}}};
   }
   private chatSummary(chat:ChatState) {return {resource:chat.resource,title:chat.title,status:chat.status,modifiedAt:chat.modifiedAt};}
   private turnCursor(chat:string,before?:number):string|undefined {
@@ -975,9 +977,17 @@ export class AmplifierHost {
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
       });
   }
+  private async repairArchiveProjection() {
+    const catalog=this.config.catalog;if(!catalog?.projectSessionArchives)return;
+    while(true){const rows=this.store.db.prepare('SELECT uri,is_archived FROM archive_projection_pending ORDER BY uri LIMIT 100').all();if(!rows.length)return;
+      await catalog.projectSessionArchives({items:rows.map(row=>({uri:String(row.uri),isArchived:!!row.is_archived}))});
+      this.store.transaction(()=>{for(const row of rows)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(row.uri,row.is_archived);});
+    }
+  }
   private async syncCatalog(record:SessionRecord) {
     if(!this.config.catalog)return;
-    await this.config.catalog.upsert({uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,availability:'available',workspaceAvailability:'present'});
+    await this.config.catalog.upsert({uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,isArchived:!!(record.summary.status & SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present'});
+    if(this.config.catalog.projectSessionArchives)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(record.uri,Number(!!(record.summary.status & SessionStatus.IsArchived)));
   }
   private emit(channel:string,action:StateAction,origin?:ActionEnvelope['origin'],rejectionReason?:string):ActionEnvelope {
     const previous=this.getRecord(channel);let record=previous?{...previous}:undefined;

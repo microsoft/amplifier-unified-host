@@ -39,6 +39,7 @@ export class StdioCatalog implements Catalog {
   }
   list(params:Parameters<Catalog['list']>[0]) {return this.request('list',params);}
   async get(uri:string):Promise<CatalogRecord|undefined>{return await this.request('get',{uri})??undefined;}
+  projectSessionArchives(params:{items:Array<{uri:string;isArchived:boolean}>}){return this.request('projectSessionArchives',params);}
   upsert(record:CatalogRecord){return this.request('upsert',{record});}
   setVisibility(params:Parameters<NonNullable<Catalog['setVisibility']>>[0]){return this.request('setVisibility',params);}
   directoryInUse(path:string){return this.request('directoryInUse',{path});}
