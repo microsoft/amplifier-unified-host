@@ -39,6 +39,10 @@ export class StdioCatalog implements Catalog {
   }
   list(params:Parameters<Catalog['list']>[0]) {return this.request('list',params);}
   async get(uri:string):Promise<CatalogRecord|undefined>{return await this.request('get',{uri})??undefined;}
+  projectSessionVisibility(params:Parameters<NonNullable<Catalog['projectSessionVisibility']>>[0]){return this.request('projectSessionVisibility',{...params});}
+  sessionVisibilityProjectionStatus(params:{source:string}){return this.request('sessionVisibilityProjectionStatus',params);}
+  sessionVisibilityProjectionReceipt(params:{source:string;commandId:string}){return this.request('sessionVisibilityProjectionReceipt',params);}
+  status(){return this.request('status',{});}
   projectSessionArchives(params:{items:Array<{uri:string;isArchived:boolean}>}){return this.request('projectSessionArchives',params);}
   upsert(record:CatalogRecord){return this.request('upsert',{record});}
   claimNative(params:Parameters<NonNullable<Catalog['claimNative']>>[0]):Promise<CatalogRecord>{return this.request('claimNative',params);}

@@ -66,7 +66,7 @@ const canonical=(value:unknown):string=>JSON.stringify(value,(_key,item)=>item&&
 const digest=(value:unknown)=>createHash('sha256').update(canonical(value)).digest('hex');
 /** Durable intake fence. Read-only state may remain available while execution is closed. */
 export class QuiescenceGate {
- private scope=new AsyncLocalStorage<{active:boolean}>();
+ private scope=new AsyncLocalStorage<{active:boolean;maintenance?:{live:boolean;fenceId:string;commandId:string}}>();
  private calls=0;
  private continuations=0;
  private maintenance=0;
@@ -113,8 +113,14 @@ export class QuiescenceGate {
  async maintain<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T>{
   const fence=this.fence();
   if(!fence||fence.purpose==='service-stop'||fence.phase!=='held'||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.maintenance)throw new QuiescenceError('Exact idle held maintenance fence required',{executed:false});
-  this.maintenance++;
-  try{return await this.scope.run({active:false},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{this.maintenance--;}
+  this.maintenance++;const authority={live:true,fenceId:fence.fenceId,commandId:fence.commandId};
+  try{return await this.scope.run({active:false,maintenance:authority},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{authority.live=false;this.maintenance--;}
+ }
+ /** A claimed fence is insufficient: only the live trusted callback carries this authority. */
+ assertRecoveryMaintenance(input:{fenceId:string;commandId:string}):Readonly<QuiescenceFence>{
+  const scope=this.scope.getStore()?.maintenance,fence=this.fence();
+  if(!scope?.live||!fence||fence.purpose!=='recovery'||fence.phase!=='held'||scope.fenceId!==input.fenceId||scope.commandId!==input.commandId||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId)throw new QuiescenceError('Exact current recovery maintenance callback required',{executed:false});
+  return structuredClone(fence);
  }
  workChanged(){this.maybeIdle();}
  private maybeIdle(){if(this.calls||this.continuations||this.fence())return;queueMicrotask(()=>{try{this.config?.onMayBeIdle?.();}catch{/* Advisory wakeup never changes operation truth. */}});}
