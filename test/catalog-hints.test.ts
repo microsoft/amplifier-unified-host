@@ -16,6 +16,7 @@ test('failed hint retains exact attempt across reopen; mismatched settlement can
   hints.enqueue('/native/session');await until(()=>hints.inspect().unsettled&&!hints.inspect().inFlight);await hints.close();hints=new CatalogHints(db,ports);
   proof={attemptId:'foreign',evidence:'process-exited',ownerReceipt:'retained-exit'};await assert.rejects(hints.quiet(),/Exact catalog-owner/);assert.equal(hints.inspect().unsettled,true);
   proof={attemptId:attempt.attemptId,evidence:'new-process-started',ownerReceipt:'new-pid'};await assert.rejects(hints.quiet(),/Exact catalog-owner/);
+  proof={attemptId:attempt.attemptId,evidence:'process-exited',ownerReceipt:'retained-exit',unexpected:'private data'};await assert.rejects(hints.quiet(),/Exact catalog-owner/);assert.equal(hints.inspect().unsettled,true);
   proof={attemptId:attempt.attemptId,evidence:'process-exited',ownerReceipt:'retained-exit'};await hints.quiet();assert.equal(hints.inspect().unsettled,false);assert.equal(hints.inspect().pending,1);
  }finally{await hints.close();db.close();}
 });

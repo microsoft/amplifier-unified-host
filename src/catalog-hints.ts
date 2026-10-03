@@ -29,7 +29,7 @@ export class CatalogHints {
   if(!this.ports.settle)throw Error('Catalog discovery outcome is unknown; original writer settlement is required');
   let timer:ReturnType<typeof setTimeout>|undefined;let result:CatalogDiscoverySettlement;
   try{result=await Promise.race([this.ports.settle(structuredClone(attempt)),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('Catalog-owner settlement inspection timed out')),10000);})]);}finally{clearTimeout(timer);}
-  if(!result||result.attemptId!==attempt.attemptId||!['response-settled','process-exited'].includes(result.evidence)||typeof result.ownerReceipt!=='string'||!result.ownerReceipt||result.ownerReceipt.length>512)throw Error('Exact catalog-owner settlement evidence required');
+  if(!result||Object.keys(result).sort().join(',')!=='attemptId,evidence,ownerReceipt'||result.attemptId!==attempt.attemptId||!['response-settled','process-exited'].includes(result.evidence)||typeof result.ownerReceipt!=='string'||!result.ownerReceipt||result.ownerReceipt.length>512)throw Error('Exact catalog-owner settlement evidence required');
   // Owner evidence may establish writer quiet, but does not claim its metadata effect succeeded.
   this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO presentation_hint_settlements VALUES(?,?,?)').run(attempt.attemptId,String(saved),JSON.stringify(result));this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1 AND attempt=?').run(String(saved));this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
  }
