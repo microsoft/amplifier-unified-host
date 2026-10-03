@@ -1,10 +1,13 @@
+import {CatalogHints} from './catalog-hints.js';
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
-import type {PresentationActor,PresentationPrepare,PresentationApply,PresentationIdentity,PresentationReadiness,PresentationEffectReceipt,VisibilityProjectionRequest,VisibilityProjectionReceipt,PresentationRebuild,PresentationReceipt,PresentationReviewPage,PresentationMappingPage} from './presentation-types.js';
+import type {PresentationActor,PresentationPrepare,PresentationApply,PresentationIdentity,PresentationReadiness,PresentationEffectReceipt,VisibilityProjectionRequest,VisibilityProjectionReceipt,PresentationRebuild,PresentationReceipt,PresentationReviewPage,PresentationMappingPage,ConversationPresentationConfig} from './presentation-types.js';
 
 type Json=Record<string,any>;
 export interface PresentationMetadata {identity:PresentationIdentity;title:string;catalog:Json;hostBeforeImage?:Json;}
 export interface PresentationPorts {
+ hint?:(path:string,context:{attemptId:string})=>Promise<unknown>;
+ settleDiscovery?:ConversationPresentationConfig['settleDiscovery'];
  metadata(session:string):Promise<PresentationMetadata>;
  withSelection<T>(sessions:string[],work:()=>Promise<T>):Promise<T>;
  validateSelection(sessions:PresentationIdentity[]):Promise<void>;
@@ -33,6 +36,7 @@ const identity=(value:PresentationIdentity)=>{if(!value||Object.keys(value).sort
 /** Product presentation authority only. Canonical and execution tables are never rewritten. */
 export class ConversationPresentation {
  private working=false;
+ private hints:CatalogHints;
  constructor(private db:DatabaseSync,private ports:PresentationPorts){
   db.exec(`CREATE TABLE IF NOT EXISTS presentation_state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS presentation_reviews(id TEXT PRIMARY KEY,command_id TEXT UNIQUE NOT NULL,signature TEXT NOT NULL,payload TEXT NOT NULL);
@@ -47,6 +51,7 @@ export class ConversationPresentation {
   const old=this.state();
   if(!old)this.save({enabled:true,ready:false,revision:0,source:'host:'+randomUUID()+':conversation-presentation-v1',projectionRevision:0,phase:'checking'});
   else this.save({...old,ready:false,phase:old.phase==='ready'?'checking':old.phase,reason:old.phase==='ready'?'confirm-catalog-checkpoint':'host-restarted'});
+  this.hints=new CatalogHints(db,{hint:(path,context)=>this.ports.hint!(path,context),ready:async()=>{await this.checkReady(false);return this.inspect().ready;},blocked:reason=>this.save({...this.state()!,ready:false,phase:'unknown',reason}),settle:ports.settleDiscovery});
  }
  private state():PresentationReadiness|undefined{const row=this.db.prepare('SELECT payload FROM presentation_state WHERE id=1').get();return row?JSON.parse(String(row.payload)):undefined;}
  private save(value:PresentationReadiness){this.db.prepare('INSERT INTO presentation_state VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(JSON.stringify(value));}
@@ -54,18 +59,21 @@ export class ConversationPresentation {
  assertReadable(){const state=this.state()!;if(!state.ready)throw new PresentationError('Conversation catalog is unavailable until its exact projection is reconstructed',{available:false,phase:state.phase,reason:state.reason});}
  async read<T>(work:()=>Promise<T>):Promise<T>{await this.checkReady();this.assertReadable();const generation=canonical([this.state()!.revision,this.state()!.projectionRevision]);const value=await work();this.assertReadable();if(canonical([this.state()!.revision,this.state()!.projectionRevision])!==generation)throw new PresentationError('Conversation presentation changed during catalog read',{available:false});return value;}
  hidden(session:string){return !!this.db.prepare('SELECT 1 FROM presentation_markers WHERE session=? AND hidden=1').get(uri(session));}
- async checkReady(){
+ enqueueHint(path:string){if(this.ports.hint)this.hints.enqueue(path);}
+ hintDiagnostics(){return this.hints.inspect();}
+ async close(){await this.hints.close();}
+ async checkReady(wake=true){
   const state=this.state()!;if(!state.ready&&state.phase!=='checking')return this.inspect();
   try{const result=await this.ports.projectionStatus(state.source!),fresh=await this.ports.catalogFreshness();
    if(canonical(this.state())!==canonical(state))return this.inspect();
    if(result.source!==state.source||result.revision!==state.projectionRevision||!state.ready&&(fresh.phase!=='complete'||fresh.issues!==0)){this.save({...state,ready:false,phase:'checking',reason:'metadata-or-visibility-reconstruction-required'});return this.inspect();}
    if(!state.ready)this.save({...state,ready:true,phase:'ready',reason:undefined});
-  }catch{if(canonical(this.state())===canonical(state))this.save({...state,ready:false,phase:'checking',reason:'catalog-unavailable'});}return this.inspect();
+  }catch{if(canonical(this.state())===canonical(state))this.save({...state,ready:false,phase:'checking',reason:'catalog-unavailable'});}if(wake)this.hints.wake();return this.inspect();
  }
  private marker(session:string){const row=this.db.prepare('SELECT * FROM presentation_markers WHERE session=?').get(session) as Json|undefined;return {hidden:!!row?.hidden,revision:Number(row?.revision??0)};}
  private review(reviewId:string){const row=this.db.prepare('SELECT payload FROM presentation_reviews WHERE id=?').get(id(reviewId,'review'));if(!row)throw new PresentationError('Unknown presentation review');return JSON.parse(String(row.payload)) as Json;}
  private rows(reviewId:string,after=-1,limit=50){return this.db.prepare('SELECT * FROM presentation_review_rows WHERE review_id=? AND ordinal>? ORDER BY ordinal LIMIT ?').all(reviewId,after,limit) as Json[];}
- private async serial<T>(work:()=>Promise<T>){if(this.working)throw new PresentationError('Presentation transaction already in progress');this.working=true;try{return await work();}finally{this.working=false;}}
+ private async serial<T>(work:()=>Promise<T>,wait=true){if(this.working)throw new PresentationError('Presentation transaction already in progress');this.working=true;this.hints.pause();try{if(wait)await this.hints.quiet();return await work();}finally{this.working=false;this.hints.resume();}}
  async prepare(input:PresentationPrepare,actor:PresentationActor){
   if(!input||Object.keys(input).some(key=>!['commandId','operation','selection','resetCommandId'].includes(key))||!['reset','restore'].includes(input.operation))throw new PresentationError('Exact presentation review required');
   id(input.commandId);const by=actorKey(actor),signature=hash({input,actor:by});
@@ -210,6 +218,7 @@ export class ConversationPresentation {
   this.db.prepare('INSERT INTO presentation_rebuilds VALUES(?,?,?)').run(input.commandId,signature,JSON.stringify(payload));this.save({...state,ready:false,phase:'rebuilding',reason:'exact-metadata-reconstruction'});
   const save=()=>this.db.prepare('UPDATE presentation_rebuilds SET payload=? WHERE command_id=?').run(JSON.stringify(payload),input.commandId);
   try{
+   await this.hints.quiet();
    let cursor:string|undefined;const digest=createHash('sha256');const seenCursors=new Set<string>();
    const add=(record:Json)=>{const prior=this.db.prepare('SELECT metadata FROM presentation_rebuild_rows WHERE command_id=? AND session=?').get(input.commandId,record.uri);if(prior){const previous=JSON.parse(String(prior.metadata));for(const key of ['uri','engineId','nativeSessionId','workingDirectory'])if(previous[key]!==record[key])throw Error('Rebuild mapping collision');return;}
     identity({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory});const data=canonical(record),bytes=Buffer.byteLength(data);if(bytes>16384||payload.count>=100000||payload.bytes+bytes>64*1024*1024)throw Error('Metadata reconstruction capacity exceeded');
@@ -218,7 +227,9 @@ export class ConversationPresentation {
    do{const page=await this.ports.mappings(cursor);if(page.items.length>100)throw Error('Mapping page exceeded100');for(const item of page.items)add(item);if(page.nextCursor&&seenCursors.has(page.nextCursor))throw Error('Repeated mapping cursor');if(page.nextCursor)seenCursors.add(page.nextCursor);cursor=page.nextCursor;}while(cursor);
    let after='';for(;;){const rows=this.db.prepare('SELECT session,metadata FROM presentation_markers WHERE session>? ORDER BY session LIMIT 100').all(after);if(!rows.length)break;for(const row of rows)add(JSON.parse(String(row.metadata)).catalog);after=String(rows.at(-1)!.session);}
    payload.manifestHash=digest.digest('hex');payload.phase='metadata';save();
+   const hintBoundary=this.hints.scanBoundary();
    await this.ports.reconstructMetadata?.({commandId:input.commandId,source:state.source!,readMappings:cursor=>this.mappingPage(input.commandId,cursor)});
+   if(this.ports.reconstructMetadata)this.hints.scanned(hintBoundary);
    const fresh=await this.ports.catalogFreshness();if(fresh.phase!=='complete'||fresh.issues!==0)throw Error('Metadata discovery is incomplete');
    for(let after=-1;;){const rows=this.db.prepare('SELECT * FROM presentation_rebuild_rows WHERE command_id=? AND ordinal>? ORDER BY ordinal LIMIT 100').all(input.commandId,after);if(!rows.length)break;for(const row of rows){const expected=JSON.parse(String(row.metadata)),current=await this.ports.catalogGet(String(row.session));for(const key of ['uri','engineId','nativeSessionId','workingDirectory'])if(!current||current[key]!==expected[key])throw Error('Metadata reconstruction identity differs');if(expected.storagePath&&current!.storagePath!==expected.storagePath)throw Error('Native home mapping differs');}after=Number(rows.at(-1)!.ordinal);}
    const checkpoint=await this.ports.projectionStatus(state.source!);if(checkpoint.source!==state.source||!Number.isSafeInteger(checkpoint.revision)||checkpoint.revision<0)throw Error('Invalid projection checkpoint');
@@ -229,8 +240,8 @@ export class ConversationPresentation {
     this.db.prepare('INSERT INTO presentation_projection_batches VALUES(?,?,?,NULL,?)').run(input.commandId,ordinal,JSON.stringify(request),'prepared');ordinal++;if(!rows.length||rows.length<100)break;pageAfter=Number(page.at(-1)!.ordinal);
    }
    payload.phase='projection';payload.targetCheckpoint=checkpoint.revision+ordinal;save();await this.dispatchBatches(input.commandId);await this.finishRebuild(input.commandId);return this.publicRebuild(JSON.parse(String(this.db.prepare('SELECT payload FROM presentation_rebuilds WHERE command_id=?').get(input.commandId)!.payload)));
-  }catch{payload.phase='unknown';save();this.save({...this.state()!,ready:false,phase:'unknown',reason:'metadata-or-projection-reconstruction-unconfirmed'});return this.publicRebuild(payload);}
- });}
+  }catch{payload.phase='unknown';payload.reason=this.hints.inspect().unsettled?'catalog-discovery-unsettled':'metadata-or-projection-reconstruction-unconfirmed';save();this.save({...this.state()!,ready:false,phase:'unknown',reason:payload.reason});return this.publicRebuild(payload);}
+ },false);}
  private publicRebuild(payload:Json){const {actor,...result}=payload;return result;}
  private mappingPage(commandId:string,cursor?:string):PresentationMappingPage{
   const payload=JSON.parse(String(this.db.prepare('SELECT payload FROM presentation_rebuilds WHERE command_id=?').get(commandId)!.payload));let after=-1;
@@ -243,6 +254,7 @@ export class ConversationPresentation {
   let count=0,markers=0;for(let after=-1;;){const rows=this.db.prepare('SELECT * FROM presentation_rebuild_rows WHERE command_id=? AND ordinal>? ORDER BY ordinal LIMIT 100').all(commandId,after);if(!rows.length)break;
    const check=rows.map(row=>{const record=JSON.parse(String(row.metadata));count++;if(row.hidden!==null)markers++;return {session:row.session,metadata:JSON.stringify({identity:{session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory}}),...(row.hidden!==null?{target_hidden:row.hidden}:{})};});await this.verifyRows(check,payload.targetCheckpoint);after=Number(rows.at(-1)!.ordinal);
   }if(count!==payload.count||markers!==payload.markerCount)throw Error('Reconstruction count differs');if(!count)await this.verifyRows([],payload.targetCheckpoint);
+  this.hints.assertComplete();
   // This repair reprojects authoritative markers; it never replays original reset/restore effects.
   this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('UPDATE presentation_rebuilds SET payload=? WHERE command_id=?').run(JSON.stringify({...payload,status:'completed',phase:'ready'}),commandId);this.save({...this.state()!,ready:true,phase:'ready',projectionRevision:payload.targetCheckpoint,reason:undefined});this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
  }

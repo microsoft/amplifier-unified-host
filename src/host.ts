@@ -31,7 +31,7 @@ export interface Catalog {
   get(uri:string):Promise<CatalogRecord|undefined>;
   upsert(record:CatalogRecord):Promise<unknown>;
   claimNative?(params:{record:CatalogRecord;commandId:string;evidence:'verified-native-import'}):Promise<CatalogRecord>;
-  hint?(sessionDirectory:string):Promise<unknown>;
+  hint?(sessionDirectory:string,context?:{attemptId:string}):Promise<unknown>;
   directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   setVisibility?(params:{uri:string;nativeSessionId:string;workingDirectory:string;deleted:boolean;commandId:string;evidence:"native-completed-receipt"}):Promise<unknown>;
   retentionCandidates?(params:RetentionPreviewRequest&{allowedWorkspaceRoots:string[]}):Promise<Json>;
@@ -177,7 +177,8 @@ export class AmplifierHost {
         projectionStatus:source=>catalog.sessionVisibilityProjectionStatus!({source}),project:request=>catalog.projectSessionVisibility!(request),projectionReceipt:(source,commandId)=>catalog.sessionVisibilityProjectionReceipt!({source,commandId}),
         catalogGet:session=>catalog.get(session),catalogFreshness:()=>catalog.status!(),
         mappings:async after=>{const rows=this.store.db.prepare('SELECT uri FROM sessions WHERE uri>? ORDER BY uri LIMIT 100').all(after??'');const items=[];for(const row of rows){const retained=this.presentation!.mapping(String(row.uri));if(!retained)throw Error('Host mapping lacks retained canonical metadata; reconstruct its original authority first');items.push(retained);}return {items,...(rows.length===100?{nextCursor:String(rows.at(-1)!.uri)}:{})};},
-        reconstructMetadata:config.conversationPresentation.reconstructMetadata,
+        reconstructMetadata:config.conversationPresentation.reconstructMetadata,settleDiscovery:config.conversationPresentation.settleDiscovery,
+        ...(catalog.hint?{hint:(path:string,context:{attemptId:string})=>catalog.hint!(path,context)}:{}),
         changed:rows=>{for(const row of rows){if(row.hidden)this.notify('root/sessionRemoved',{channel:ROOT,session:row.session});else {const record=this.getRecord(row.session);if(record&&!this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(row.session))this.notify('root/sessionAdded',{channel:ROOT,summary:record.summary});}}},
       });
     }
@@ -1407,7 +1408,7 @@ export class AmplifierHost {
           if(event?.type==='history.persisted'&&typeof event.metadataPath==='string'&&isAbsolute(event.metadataPath)&&basename(event.metadataPath)==='metadata.json') {
             // The independent catalog validates its configured native roots and reloads metadata.
             if(!this.getRecord(uri)?.nativeSessionId){active.pendingHints??=[];if(active.pendingHints.length<64)active.pendingHints.push(dirname(event.metadataPath));}
-            else await this.config.catalog?.hint?.(dirname(event.metadataPath));
+            else await this.catalogHint(dirname(event.metadataPath));
           }
           if(agent.nativeId&&this.config.nativeEvent)await this.intake.continuation(()=>this.config.nativeEvent!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params));
         },
@@ -1419,11 +1420,12 @@ export class AmplifierHost {
           try{return await this.intake.continuation(()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params));}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}}
         }}:{}),
       });active.agent=agent;this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.config.catalog?.hint?.(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
       });
   }
+  private async catalogHint(path:string){if(this.presentation)this.presentation.enqueueHint(path);else await this.config.catalog?.hint?.(path);}
   private async repairArchiveProjection() {
     const catalog=this.config.catalog;if(!catalog?.projectSessionArchives)return;
     while(true){const rows=this.store.db.prepare('SELECT uri,is_archived FROM archive_projection_pending ORDER BY uri LIMIT 100').all();if(!rows.length)return;
@@ -2189,7 +2191,7 @@ export class AmplifierHost {
   withQuiescenceMaintenance<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T> {return this.intake.maintain(input,work);}
   /** Composition uses this for native-admin and other effects outside normal AHP methods. */
   withExternalMutation<T>(ownerId:string,work:()=>Promise<T>):Promise<T> {return this.intake.external(ownerId,work);}
-  diagnostics(){return {steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq,
+  diagnostics(){return {...(this.presentation?{catalogHints:this.presentation.hintDiagnostics()}:{}),steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq,
     workingSet:{hotRecords:this.hotRecords.size,passiveReads:this.passiveReads,selectedNativeWindows:this.nativeWindows.size,selectedNativeTurnIds:[...this.nativeWindows.values()].reduce((sum,window)=>sum+window.ids.length,0),selectedHostWindows:this.loadedFloors.size,cursors:{turns:this.cursors.size,native:this.nativeCursors.size,mixed:this.mixedCursors.size,prefix:this.prefixCursors.size,recall:this.recallCursors.size,coordination:this.coordinationCursors.size},peerBufferedBytes:[...this.peers].reduce((sum,peer)=>sum+peer.socket.bufferedAmount,0),handshakeQueuedEvents:[...this.peers].reduce((sum,peer)=>sum+peer.buffer.length,0),handshakeQueuedBytes:[...this.peers].reduce((sum,peer)=>sum+peer.bufferBytes,0)},
     retainedReplay:this.store.db.prepare('SELECT count(*) events,coalesce(sum(bytes),0) bytes FROM actions').get(),
     pendingQueue:this.store.db.prepare("SELECT count(*) messages,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM queue_intents WHERE status='pending'").get()
@@ -2381,7 +2383,7 @@ export class AmplifierHost {
     for(const peer of this.peers)peer.socket.terminate();
     const agents=[...this.active.values()];await Promise.all(agents.map(active=>{active.retireReason='host-shutdown';return active.agent.retire();}));await Promise.all([...this.stoppedCallbacks]);await Promise.allSettled(agents.map(active=>active.run));await Promise.all([...this.settledCallbacks]);this.active.clear();
     await new Promise<void>(resolve=>this.ws.close(()=>resolve()));await new Promise<void>(resolve=>this.http.close(()=>resolve()));
-    await this.config.catalog?.close?.();this.managed?.close();this.store.close();
+    await this.presentation?.close();await this.config.catalog?.close?.();this.managed?.close();this.store.close();
   }
 }
 
