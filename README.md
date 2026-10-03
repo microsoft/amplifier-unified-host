@@ -618,3 +618,14 @@ external filesystem edits or grant authority over a noncooperating writer.
 A selected session removed from discovery retains readable history and carries
 `state._meta['amplifier.dev/lifecycle']={version:1,deleted:true,...}` via standard
 `session/metaChanged`; confirmed restore changes `deleted` to false.
+
+`refreshSessionHistory(session,{limit?:1..50,expectedHistoryRevision?})`, also
+`x-amplifier/sessionLifecycle` operation `history.refresh`, explicitly loads a
+bounded canonical native page and verifies its revision. Only stable-ID-matched
+host turns with completed receipts receive saved native response boundaries;
+admission outcomes, input provenance and original attachment references remain
+host-owned. Active or unknown execution refuses the refresh. The result contains
+`{refreshed:true,chat,revision,refreshedTurns,view:{turns:limit},requiresSubscribe:true}`.
+The requesting client then obtains a fresh standard subscription snapshot. Existing
+viewers keep their current projection until they request a fresh snapshot; no fake
+truncation action, native rewrite, global reload or text-based identity match occurs.

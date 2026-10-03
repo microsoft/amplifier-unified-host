@@ -671,6 +671,33 @@ export class AmplifierHost {
     if(result.sessionId!==record.nativeSessionId||typeof result.historyRevision!=='string'||result.historyRevision.length>512||result.location?.historyCwd!==record.workingDirectory)throw new RpcFault(-32000,'Native lifecycle inspection returned a different identity');
     return {session:record.uri,...result,lifecycleFence:this.store.db.prepare("SELECT command_id,operation,status FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown') LIMIT 1").get(record.uri)};
   }
+  /** Explicit bounded canonical rebaseline; clients request a fresh standard snapshot afterwards. */
+  async refreshSessionHistory(session:string,input:{limit?:number;expectedHistoryRevision?:string}={}) {
+    if(!input||typeof input!=='object'||Object.keys(input).some(key=>!['limit','expectedHistoryRevision'].includes(key))||input.expectedHistoryRevision!==undefined&&(typeof input.expectedHistoryRevision!=='string'||input.expectedHistoryRevision.length>512))throw new RpcFault(-32602,'Bounded selected history refresh options required');
+    const limit=bounded(input.limit,50,50),selected=await this.record(session);
+    return this.withLock(selected.uri,async()=>{
+      const record=this.getRecord(selected.uri)!;
+      if(this.active.get(record.uri)?.busy||this.active.get(record.uri)?.controlDepth||record.chat.activeTurn||this.store.unknown(record.chat.resource)||this.relocationFence(record.uri)||this.transferFence(record.uri))throw new RpcFault(-32011,'History refresh requires conclusively idle execution; active or unknown inputs were preserved',{executed:false});
+      const page=await this.nativeHistory(record,limit);
+      if(input.expectedHistoryRevision!==undefined&&page.revision!==input.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed before selected refresh',{executed:false});
+      if((await this.inspectSessionHistory(record.uri)).historyRevision!==page.revision)throw new RpcFault(-32011,'Native history changed during selected refresh',{executed:false});
+      let refreshedTurns=0;
+      this.store.transaction(()=>{
+        for(const canonical of page.turns){
+          const row=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,canonical.id);
+          if(!row||this.store.receipt(canonical.id)?.status!=='completed')continue;
+          const live=JSON.parse(String(row.payload)) as Turn;
+          // Native history is canonical for persisted response boundaries; the
+          // live host remains authority for admission outcome and input provenance.
+          const responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
+          const boundary=canonical.message._meta?.['amplifier.dev/history'] as Json|undefined;
+          this.store.saveTurn(record.chat.resource,{...live,responseParts,message:{...live.message,_meta:{...live.message._meta,'amplifier.dev/history':{...(live.message._meta?.['amplifier.dev/history'] as Json),messageId:boundary?.messageId,turnId:canonical.id,boundaryRevision:page.revision}}}});refreshedTurns++;
+        }
+        record.chat._meta={...record.chat._meta,'amplifier.dev/history':{source:'native',available:true,revision:page.revision,diagnostics:page.diagnostics}};this.store.save(record);
+      });
+      return {refreshed:true,chat:record.chat.resource,revision:page.revision,refreshedTurns,view:{turns:limit},requiresSubscribe:true};
+    });
+  }
   /** Shared organization is host-owned; native history remains unchanged. */
   async archiveSession(session:string,isArchived:boolean) {
     if(typeof isArchived!=='boolean')throw new RpcFault(-32602,'isArchived must be boolean');const record=await this.record(session);
@@ -765,7 +792,7 @@ export class AmplifierHost {
   }
   private sessionLifecycleRequest(session:string,operation:string,args:Json) {
     if(typeof session!=='string'||!session.startsWith('ahp-session:/'))throw new RpcFault(-32602,'Selected session channel required');
-    if(operation==='history.revise')return this.reviseHistory(session,args as any);if(operation==='inspect')return this.inspectSessionHistory(session);if(operation==='delete.preview')return this.previewDeleteSession(session);if(operation==='receipt')return this.inspectSessionLifecycleReceipt(session,args.commandId);
+    if(operation==='history.refresh')return this.refreshSessionHistory(session,args);if(operation==='history.revise')return this.reviseHistory(session,args as any);if(operation==='inspect')return this.inspectSessionHistory(session);if(operation==='delete.preview')return this.previewDeleteSession(session);if(operation==='receipt')return this.inspectSessionLifecycleReceipt(session,args.commandId);
     if(['fork','export','delete','restore'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
   }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {

@@ -757,3 +757,13 @@ test('passive response parts preserve distinct canonical native message boundari
   const client=await f.connect(),{session,chat}=await f.create(client);await f.host.invalidateNativeHistory(session);const state=(await client.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as any;const parts=state.turns[0].responseParts.filter((part:any)=>part.kind==='markdown');assert.deepEqual(parts.map((part:any)=>[part.content,part._meta['amplifier.dev/history'].messageId]),[['First answer','native:first'],['Second answer','native:second']]);
  }finally{await f.cleanup();}
 });
+
+
+test('explicit canonical refresh preserves active and unknown execution without reading history',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),first=randomUUID();await f.host.submitTurn(session,{commandId:first,text:'slow',clientId:'refresh'});
+  await assert.rejects(f.host.refreshSessionHistory(session),/conclusively idle/);assert.equal((await f.host.waitForTurn(session,first)).completed,true);
+  const uncertain=randomUUID();await f.host.submitTurn(session,{commandId:uncertain,text:'crash',clientId:'refresh'});assert.equal((await f.host.waitForTurn(session,uncertain)).status,'unknown');
+  await assert.rejects(f.host.refreshSessionHistory(session),/conclusively idle/);assert.equal(f.host.store.receipt(uncertain)?.status,'unknown');assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,2);
+ }finally{await f.cleanup();}
+});
