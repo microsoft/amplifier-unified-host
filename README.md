@@ -629,3 +629,22 @@ host-owned. Active or unknown execution refuses the refresh. The result contains
 The requesting client then obtains a fresh standard subscription snapshot. Existing
 viewers keep their current projection until they request a fresh snapshot; no fake
 truncation action, native rewrite, global reload or text-based identity match occurs.
+
+Mixed native/host history uses canonical native turn order and exact turn IDs to
+retain host receipt outcomes and input provenance. A requested view is one merged
+window, rather than one native window plus another live window. The native reader
+looks behind at most twice the requested turn count to find exact ordering anchors;
+completed host rows are looked up by indexed ID. A shared window can expand through
+another subscriber's larger view, explicit older-history paging, and new completed
+turns; it is released after the last subscriber leaves. These are AHP advisory views,
+not a promise to discard already-delivered turns from another client's reduced state.
+
+Merged cursors verify the exact prior suffix and native revision before publishing
+an older prefix through `chat/turnsLoaded`. Paging reprojects the explicitly expanded
+selected window; it is not a per-delta transcript path. Omitting a view still returns
+all retained turns. A native-only tail with no shared ordering anchor, or a native
+and host-only receipt in the same unindexed interval, returns an explicit
+`unindexed-ordering-boundary` error. No timestamp/text guesses or full-history scan
+are substituted for a bounded request. Widening the explicit view may establish an
+anchor; genuinely unmatched failed/unknown receipts require native-owner ordering
+provenance. Both sources and admission receipts remain preserved.

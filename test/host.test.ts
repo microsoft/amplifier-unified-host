@@ -767,3 +767,59 @@ test('explicit canonical refresh preserves active and unknown execution without 
   await assert.rejects(f.host.refreshSessionHistory(session),/conclusively idle/);assert.equal(f.host.store.receipt(uncertain)?.status,'unknown');assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,2);
  }finally{await f.cleanup();}
 });
+
+test('mixed canonical voice and live receipts use one bounded shared window and a complete cursor',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'ahp-mixed-')),history=join(dir,'history.json');await writeFile(history,'[]');
+  const f=await setup({allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('./agent.mjs',import.meta.url))],env:{FIXTURE_HISTORY:history}}]});
+  try{
+    const a=await f.connect(),b=await f.connect(),session='ahp-session:/'+randomUUID(),chat=session.replace('ahp-session:','ahp-chat:');
+    await a.request('createSession',{channel:session,provider:'fixture',workingDirectories:[pathToFileURL(dir).href]});
+    const first=action('before voice'),last=action('after voice');
+    for(const input of [first,last]){a.dispatch(chat,input);await waitFor(()=>f.host.store.receipt(input.turnId)?.status==='completed');}
+    const text=(id:string,value:string)=>({id,state:'unknown',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:value}},{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'saved '+value}}]});
+    const voice={id:'native-voice-only',recordedOnly:true,updates:[{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'spoken between chats'},_meta:{'amplifier.dev/history':{via:'call',callId:'call',itemId:'speech',recordedOnly:true}}}]};
+    const older=Array.from({length:58},(_,i)=>text('older-'+i,'older '+i));
+    await writeFile(history,JSON.stringify([...older,text(first.turnId,'before voice'),voice,text(last.turnId,'after voice')]));
+    const record=f.host.store.get(session)!;record.chat._meta={'amplifier.dev/history':{source:'native'}};f.host.store.save(record);
+    const one=await a.subscribe(chat,{view:{turns:1}});let state=one.result.snapshot!.state as ChatState;assert.deepEqual(state.turns.map(turn=>turn.id),[last.turnId]);
+    void(async()=>{for await(const event of one.subscription)if(event.type==='action'&&!event.params.rejectionReason)state=chatReducer(state,event.params.action as any);})();
+    const two=(await b.subscribe(chat,{view:{turns:2}})).result.snapshot!.state as ChatState;
+    assert.deepEqual(two.turns.map(turn=>turn.id),[voice.id,last.turnId]);assert.equal(two.turns.length,2);assert.equal(two.turns[1].state,'complete');assert.equal(two.turns[0].message.text,'');assert.equal(two.turns[0].message.origin?.kind,'agent');
+    await waitFor(()=>state.turns.length===2);assert.deepEqual(state.turns.map(turn=>turn.id),two.turns.map(turn=>turn.id));
+    const smaller=(await b.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as ChatState;assert.equal(smaller.turns.length,2,'shared window cannot shrink under another viewer');
+    await b.request('fetchTurns',{channel:chat,cursor:two.turnsNextCursor});await waitFor(()=>state.turns.length===52);
+    assert.deepEqual(state.turns.slice(-3).map(turn=>turn.id),[first.turnId,voice.id,last.turnId]);assert.equal(state.turns.find(turn=>turn.id===first.turnId)!.state,'complete');assert.ok(state.turnsNextCursor);
+    await a.request('fetchTurns',{channel:chat,cursor:state.turnsNextCursor});await waitFor(()=>state.turns.length===61);assert.equal(new Set(state.turns.map(turn=>turn.id)).size,61);assert.equal(state.turnsNextCursor,undefined);
+    assert.deepEqual(state.turns.map(turn=>turn.id),[...older.map(turn=>turn.id),first.turnId,voice.id,last.turnId]);
+    await a.unsubscribe(chat);await b.unsubscribe(chat);await waitFor(()=>!(f.host as any).hasSubscribers(chat));
+    const reset=(await a.subscribe(chat,{view:{turns:2}})).result.snapshot!.state as ChatState;assert.equal(reset.turns.length,2);assert.ok(reset.turnsNextCursor);
+    const context=await f.host.readSessionContext(session,3);assert.ok(context.messages.some(row=>row.text==='spoken between chats'));assert.ok(context.messages.findIndex(row=>row.text==='before voice')<context.messages.findIndex(row=>row.text==='spoken between chats'));
+    const full=(await a.subscribe(chat)).result.snapshot!.state as ChatState;assert.equal(full.turns.length,61);assert.equal(full.turnsNextCursor,undefined);
+  }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
+});
+
+test('native mixed window refuses an unindexed ordering gap without scanning all history',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'ahp-gap-')),history=join(dir,'history.json'),log=join(dir,'calls');await writeFile(history,'[]');
+  const f=await setup({allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('./agent.mjs',import.meta.url))],env:{FIXTURE_HISTORY:history,FIXTURE_LOG:log}}]});
+  try{
+    const client=await f.connect(),session='ahp-session:/'+randomUUID(),chat=session.replace('ahp-session:','ahp-chat:');await client.request('createSession',{channel:session,provider:'fixture',workingDirectories:[pathToFileURL(dir).href]});
+    const input=action('host');client.dispatch(chat,input);await waitFor(()=>f.host.store.receipt(input.turnId)?.status==='completed');
+    const groups=Array.from({length:5000},(_,i)=>({id:'native-'+i,recordedOnly:true,updates:[{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'voice '+i}}]}));await writeFile(history,JSON.stringify(groups));
+    const record=f.host.store.get(session)!;record.chat._meta={'amplifier.dev/history':{source:'native'}};f.host.store.save(record);
+    await assert.rejects(client.subscribe(chat,{view:{turns:2}}),(error:any)=>error.code===-32013&&error.data?.reason==='unindexed-ordering-boundary');
+    assert.equal((await readFile(log+'.passive','utf8')).trim(),'page');assert.equal(f.host.store.receipt(input.turnId)?.status,'completed');assert.equal(f.host.store.turns(chat).turns.length,1);
+  }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
+});
+
+test('native views above one owner page preserve the full requested window and reject changed paging baselines',async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'ahp-pages-')),history=join(dir,'history.json');
+  const groups=Array.from({length:300},(_,i)=>({id:'saved-'+i,recordedOnly:true,updates:[{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'answer '+i}}]}));await writeFile(history,JSON.stringify(groups));
+  const f=await setup({allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('./agent.mjs',import.meta.url))],env:{FIXTURE_HISTORY:history}}]});
+  try{
+    const client=await f.connect(),session='ahp-session:/'+randomUUID(),chat=session.replace('ahp-session:','ahp-chat:');await client.request('createSession',{channel:session,provider:'fixture',workingDirectories:[pathToFileURL(dir).href]});const record=f.host.store.get(session)!;record.chat._meta={'amplifier.dev/history':{source:'native'}};f.host.store.save(record);
+    const selected=(await client.subscribe(chat,{view:{turns:250}})).result.snapshot!.state as ChatState;assert.equal(selected.turns.length,250);assert.equal(selected.turns[0].id,'saved-50');assert.ok(selected.turnsNextCursor);
+    const other='ahp-session:/'+randomUUID();await client.request('createSession',{channel:other,provider:'fixture',workingDirectories:[pathToFileURL(dir).href]});await assert.rejects(client.request('fetchTurns',{channel:other.replace('ahp-session:','ahp-chat:'),cursor:selected.turnsNextCursor}),/another chat/);
+    groups[100].id='rewritten-turn';await writeFile(history,JSON.stringify(groups));await assert.rejects(client.request('fetchTurns',{channel:chat,cursor:selected.turnsNextCursor}),/fresh canonical baseline/);
+    const fresh=(await client.subscribe(chat,{view:{turns:250}})).result.snapshot!.state as ChatState;await client.request('fetchTurns',{channel:chat,cursor:fresh.turnsNextCursor});assert.equal(((await client.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as ChatState).turns.length,300);
+  }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
+});

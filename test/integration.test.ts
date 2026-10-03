@@ -214,3 +214,16 @@ test('canonical native history revision precedes bounded AHP truncation and one 
   const snapshot=(await a.subscribe(chat,{view:{turns:10}})).result.snapshot!.state as any;assert.deepEqual(snapshot.turns.map((turn:any)=>turn.id),[ids[0],input.commandId]);const native=await host.readRecallSource(session,{expectedRevision:(await host.inspectRecallSource(session)).revision,limit:10});assert.ok(native.rows.some(row=>row.text==='Revised second turn'));assert.ok(!native.rows.some(row=>row.text==='Original 1'||row.text==='Original 2'));
  }finally{await a.shutdown();await b.shutdown();await host.close();await rm(dir,{recursive:true,force:true});}
 });
+
+test('actual native recorded voice stays between two admitted chat turns through refresh and paging',{skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-mixed-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!),{randomUUID}=await import('node:crypto');
+ const host=await createHost({stateDirectory:directory,allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}]}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'mixed-native-history',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID(),chat=session.replace('ahp-session:','ahp-chat:');await client.request('createSession',{channel:session,workingDirectories:[pathToFileURL(workspace).href]});
+  const first=randomUUID(),last=randomUUID();await host.submitTurn(session,{commandId:first,text:'Before native voice',clientId:'mixed-native-history'});assert.equal((await host.waitForTurn(session,first,30000)).completed,true);
+  const saved=await host.nativeControl(session,'voice.transcript.record',{commandId:randomUUID(),callId:'qualification-call',itemId:'qualification-speech',role:'assistant',text:'Speech between ordinary turns',append:false});assert.equal(saved.recorded,true);assert.equal(saved.executed,false);
+  await host.submitTurn(session,{commandId:last,text:'After native voice',clientId:'mixed-native-history'});assert.equal((await host.waitForTurn(session,last,30000)).completed,true);await host.refreshSessionHistory(session,{limit:3});
+  const tail=(await client.subscribe(chat,{view:{turns:2}})).result.snapshot!.state as any;assert.equal(tail.turns.length,2);assert.equal(tail.turns[1].id,last);assert.equal(tail.turns[0].message.origin.kind,'agent');assert.equal(tail.turns[0].message.text,'');assert.ok(tail.turns[0].responseParts.some((part:any)=>part.content==='Speech between ordinary turns'));assert.ok(tail.turnsNextCursor);
+  await client.request('fetchTurns',{channel:chat,cursor:tail.turnsNextCursor});const full=(await client.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as any;assert.deepEqual(full.turns.map((turn:any)=>turn.id),[first,tail.turns[0].id,last]);assert.equal(full.turnsNextCursor,undefined);assert.equal(full.turns[0].state,'complete');assert.equal(full.turns[2].state,'complete');
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});

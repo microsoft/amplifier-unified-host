@@ -9,6 +9,7 @@ import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, Session
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { Store, type SessionRecord } from './store.js';
 import { AcpProcess, type EngineConfig, type AgentHandlers } from './acp.js';
+import { mergeHistoryTurns, turnIdentityHash } from './history.js';
 import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
@@ -88,6 +89,8 @@ export class AmplifierHost {
   private prefixCursors=new Map<string,{chat:string;beforeTurnId:string}>();
   private nativeCursors=new Map<string,{chat:string;cursor:string;revision:string}>();
   private loadedFloors=new Map<string,number>();
+  private nativeWindows=new Map<string,{ids:string[];unbounded:boolean}>();
+  private mixedCursors=new Map<string,{chat:string;count:number;first:string;hash:string;revision:string}>();
   private passiveReads=0;
   private recallCursors=new Map<string,{scope:string;cursor?:string;after?:{modified:string;uri:string}}>();
   private hotRecords=new Map<string,SessionRecord>();
@@ -151,7 +154,7 @@ export class AmplifierHost {
   private accept(socket:WebSocket) {
     const peer:Peer={socket,connectionId:randomUUID(),initialized:false,ready:false,buffer:[],bufferBytes:0,cuts:new Map(),lastClientSeq:-1,seenClientSeq:new Set(),subscriptions:new Set(),pending:0,queue:Promise.resolve(),channels:new Map(),cursors:new Map()};this.peers.add(peer);
     socket.on('error',()=>{});
-    socket.on('close',()=>{this.peers.delete(peer);const subscriptions=[...peer.subscriptions];peer.subscriptions.clear();peer.cursors.clear();for(const uri of subscriptions){this.removeActiveClient(uri,peer.clientId);if(!this.hasSubscribers(uri))this.loadedFloors.delete(uri);}for(const [uri,watch] of this.watches)if(watch.owner===peer&&!this.hasSubscribers(uri))this.watches.delete(uri);});
+    socket.on('close',()=>{this.peers.delete(peer);const subscriptions=[...peer.subscriptions];peer.subscriptions.clear();peer.cursors.clear();for(const uri of subscriptions){this.removeActiveClient(uri,peer.clientId);if(!this.hasSubscribers(uri)){this.loadedFloors.delete(uri);this.nativeWindows.delete(uri);}}for(const [uri,watch] of this.watches)if(watch.owner===peer&&!this.hasSubscribers(uri))this.watches.delete(uri);});
     socket.on('message',data=>{
       let message:Json;try {message=JSON.parse(data.toString());if(message.jsonrpc!=='2.0'||typeof message.method!=='string')throw new Error();}catch {this.send(peer,{jsonrpc:'2.0',id:null,error:{code:-32700,message:'Invalid JSON-RPC request'}});return;}
       if(++peer.pending>(this.config.maxInFlightRequests??32)){socket.close(1013,'Inbound capacity exceeded');return;}
@@ -339,8 +342,10 @@ export class AmplifierHost {
       if(capability?.version!==1||capability?.paging!=='complete-turns'||capability?.passive!==true)throw new RpcFault(-32601,'Agent does not advertise a passive native history reader');
       let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[];
       do {
-        const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit??200,200),...(before??{}),...(next?{cursor:next}:{})}) as Json;
+        const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(before??{}),...(next?{cursor:next}:{})}) as Json;
         if(!Array.isArray(result.turnGroups)||typeof result.revision!=='string')throw new Error('Malformed native history page');
+        if(revision&&revision!==result.revision)throw new RpcFault(-32013,'Native history changed while assembling the selected window');
+        if(result.nextCursor&&(!result.turnGroups.length||result.nextCursor===next))throw new RpcFault(-32013,'Native history cursor did not advance');
         revision=result.revision;diagnostics.push(...(result.diagnostics??[]));const page:Turn[]=[];
         for(const group of result.turnGroups) {
           const inputs=(group.updates as Json[]).filter(update=>update.sessionUpdate==='user_message_chunk').map(update=>update.content);
@@ -357,11 +362,31 @@ export class AmplifierHost {
           state=chatReducer(state,action as any);page.push(...state.turns);
         }
         turns=[...page,...turns];next=result.nextCursor??undefined;
-      } while(limit===undefined&&next);
+      } while(next&&(limit===undefined||turns.length<limit));
       let nextCursor:string|undefined;
       if(next){nextCursor=randomUUID();this.nativeCursors.set(nextCursor,{chat:record.chat.resource,cursor:next,revision});if(this.nativeCursors.size>4096)this.nativeCursors.delete(this.nativeCursors.keys().next().value!);}
       return {turns,nextCursor,revision,diagnostics};
     } finally {this.passiveReads--;await agent.retire();}
+  }
+  private rememberMixedCursor(chat:string,page:{turns:Turn[];hasOlder:boolean;revision:string}) {
+    if(!page.hasOlder||!page.turns.length)return;
+    const token=randomUUID();this.mixedCursors.set(token,{chat,count:page.turns.length,first:page.turns[0].id,hash:turnIdentityHash(page.turns),revision:page.revision});
+    if(this.mixedCursors.size>4096)this.mixedCursors.delete(this.mixedCursors.keys().next().value!);return token;
+  }
+  /** Only selected pages are read. Canonical order and live receipts have separate authority. */
+  private async selectedHistory(record:SessionRecord,limit?:number) {
+    const native=await this.nativeHistory(record,limit===undefined?undefined:limit*2),live=this.store.turns(record.chat.resource,limit);
+    // A page containing only native-only rows has no proof of where an unmatched
+    // host receipt belongs. Request a wider explicit view instead of scanning the
+    // whole transcript, inventing timestamps, or treating omission as deletion.
+    const liveIds=new Set(live.turns.map(turn=>turn.id));
+    if(native.nextCursor&&native.turns.length&&live.turns.length&&!native.turns.some(turn=>liveIds.has(turn.id)))throw new RpcFault(-32013,'History ordering boundary is outside this view; subscribe with a wider view or explicitly request all retained history',{reason:'unindexed-ordering-boundary',available:false});
+    const activeId=this.getRecord(record.uri)?.chat.activeTurn?.id;
+    const indexed=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?');
+    const canonical=native.turns.filter(turn=>turn.id!==activeId).map(turn=>{const row=indexed.get(record.chat.resource,turn.id);return row?JSON.parse(String(row.payload)) as Turn:turn;});
+    let merged:Turn[];try{merged=mergeHistoryTurns(canonical,live.turns);}catch(error){throw new RpcFault(-32013,'Native and host history have an unindexed ordering interval; preserve both sources and reconcile their boundary',{reason:'unindexed-ordering-boundary',available:false,detail:String(error)});}
+    const turns=limit===undefined?merged:merged.slice(-limit);
+    return {turns,hasOlder:!!native.nextCursor||!!live.before||merged.length>turns.length,revision:native.revision,diagnostics:native.diagnostics};
   }
   private async snapshot(uri:string,turns?:number):Promise<Snapshot> {
     let state:any;
@@ -371,9 +396,12 @@ export class AmplifierHost {
       else {
         const page=this.store.turns(uri,turns);
         if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native') {
-          const native=await this.nativeHistory(record,turns);
-          const fresh=this.getRecord(record.uri)!,live=this.store.turns(uri,turns),liveIDs=new Set(live.turns.map(turn=>turn.id));
-          state={...fresh.chat,turns:[...native.turns.filter(turn=>!liveIDs.has(turn.id)),...live.turns],turnsNextCursor:native.nextCursor,_meta:{...fresh.chat._meta,'amplifier.dev/history':{source:'native',available:true,revision:native.revision,diagnostics:native.diagnostics}}};
+          const previous=this.nativeWindows.get(uri),unbounded=turns===undefined||previous?.unbounded===true;
+          const page=await this.selectedHistory(record,unbounded?undefined:Math.max(turns!,previous?.ids.length??0)),fresh=this.getRecord(record.uri)!;
+          const nextCursor=this.rememberMixedCursor(uri,page),ids=page.turns.map(turn=>turn.id);
+          if(previous?.ids.length){const offset=ids.indexOf(previous.ids[0]);if(offset>0&&turnIdentityHash(ids.slice(offset,offset+previous.ids.length))===turnIdentityHash(previous.ids))this.emit(uri,{type:'chat/turnsLoaded',turns:page.turns.slice(0,offset),turnsNextCursor:nextCursor} as StateAction);}
+          this.nativeWindows.set(uri,{ids,unbounded});
+          state={...fresh.chat,turns:page.turns,turnsNextCursor:nextCursor,_meta:{...fresh.chat._meta,'amplifier.dev/history':{source:'native',available:true,revision:page.revision,diagnostics:page.diagnostics}}};
         } else {
           const oldFloor=this.loadedFloors.get(uri),requestedFloor=page.first??Number.MAX_SAFE_INTEGER;
           const floor=Math.min(oldFloor??requestedFloor,requestedFloor);
@@ -421,7 +449,7 @@ export class AmplifierHost {
     if(!peer.initialized)throw new RpcFault(-32600,'initialize must be the first request');
     switch(method) {
       case 'subscribe':return {snapshot:await this.subscribe(peer,p.channel,p.view?.turns===undefined?undefined:bounded(p.view.turns,50,10000))};
-      case 'unsubscribe':peer.subscriptions.delete(p.channel);this.removeActiveClient(p.channel,peer.clientId);if(!this.hasSubscribers(p.channel)){this.loadedFloors.delete(p.channel);this.watches.delete(p.channel);}return null;
+      case 'unsubscribe':peer.subscriptions.delete(p.channel);this.removeActiveClient(p.channel,peer.clientId);if(!this.hasSubscribers(p.channel)){this.loadedFloors.delete(p.channel);this.nativeWindows.delete(p.channel);this.watches.delete(p.channel);}return null;
       case 'listSessions': {
         const limit=bounded(p.limit,50,200);
         if(this.config.catalog) {const result=await this.config.catalog.list({connectionId:peer.connectionId,limit,cursor:p.cursor,allowedWorkspaceRoots:this.roots});return {...result,items:result.items.filter(row=>!this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(row.uri)).map(row=>this.catalogSummary(row))};}
@@ -433,6 +461,15 @@ export class AmplifierHost {
       case 'createSession':return this.createSessionResource(p);
       case 'fetchTurns': {
         const record=await this.record(p.channel);if(p.channel!==record.chat.resource)throw new RpcFault(-32602,'fetchTurns requires chat channel');
+        const mixed=this.mixedCursors.get(p.cursor);
+        if(mixed){
+          if(mixed.chat!==p.channel)throw new RpcFault(-32602,'History cursor belongs to another chat');
+          const window=this.nativeWindows.get(p.channel),page=await this.selectedHistory(record,window?.unbounded?undefined:Math.max(mixed.count+50,window?.ids.length??0));
+          const offset=page.turns.findIndex(turn=>turn.id===mixed.first);
+          if(page.revision!==mixed.revision||offset<0||turnIdentityHash(page.turns.slice(offset,offset+mixed.count))!==mixed.hash)throw new RpcFault(-32013,'History changed; subscribe for a fresh canonical baseline before paging',{reason:'history-baseline-changed'});
+          const nextCursor=this.rememberMixedCursor(p.channel,page);this.nativeWindows.set(p.channel,{ids:page.turns.map(turn=>turn.id),unbounded:window?.unbounded??false});
+          this.emit(p.channel,{type:'chat/turnsLoaded',turns:page.turns.slice(0,offset),turnsNextCursor:nextCursor} as StateAction);return {};
+        }
         const prefix=this.prefixCursors.get(p.cursor);if(prefix){if(prefix.chat!==p.channel)throw new RpcFault(-32602,'History prefix cursor belongs to another chat');const current=await this.inspectSessionHistory(record.uri),page=await this.nativeHistory(record,50,undefined,{beforeTurnId:prefix.beforeTurnId,expectedRevision:current.historyRevision});this.emit(p.channel,{type:'chat/turnsLoaded',turns:page.turns,turnsNextCursor:this.rememberPrefixCursor(record.chat.resource,page)} as StateAction);return {};}
         const native=this.nativeCursors.get(p.cursor);
         if(native&&native.chat===p.channel){const page=await this.nativeHistory(record,50,native.cursor);this.emit(p.channel,{type:'chat/turnsLoaded',turns:page.turns,turnsNextCursor:page.nextCursor} as StateAction);return {};}
@@ -524,7 +561,7 @@ export class AmplifierHost {
     });
     for(const [id,cursor] of this.nativeCursors)if(cursor.chat===chat)this.nativeCursors.delete(id);
     for(const [id,cursor] of this.cursors)if(cursor.chat===chat)this.cursors.delete(id);
-    this.loadedFloors.delete(chat);revision.confirmed=true;this.projectPendingTurn(uri,active);
+    this.loadedFloors.delete(chat);this.nativeWindows.delete(chat);for(const [id,cursor] of this.mixedCursors)if(cursor.chat===chat)this.mixedCursors.delete(id);revision.confirmed=true;this.projectPendingTurn(uri,active);
   }
   /** Canonical native rewind plus one replacement execution; never accepts a host transcript. */
   async reviseHistory(session:string,input:{commandId:string;operationId:string;targetMessageId:string;expectedHistoryRevision:string;text:string}) {
@@ -859,7 +896,7 @@ export class AmplifierHost {
         if(channel===record.chat.resource) {
           // The projection holds only the active turn. Completed history is independently indexed.
           const reduced=chatReducer({...record.chat,turns:[]},action as any);
-          if(action.type!=='chat/turnsLoaded')for(const turn of reduced.turns){const ordinal=this.store.saveTurn(channel,turn);if(this.loadedFloors.has(channel))this.loadedFloors.set(channel,Math.min(this.loadedFloors.get(channel)!,ordinal));}
+          if(action.type!=='chat/turnsLoaded')for(const turn of reduced.turns){const ordinal=this.store.saveTurn(channel,turn);if(this.loadedFloors.has(channel))this.loadedFloors.set(channel,Math.min(this.loadedFloors.get(channel)!,ordinal));const window=this.nativeWindows.get(channel);if(window&&!window.ids.includes(turn.id))window.ids.push(turn.id);}
           record.chat={...reduced,turns:[]};
         } else record.state=sessionReducer(record.state,action as any);
         record.summary={...record.summary,title:record.state.title,status:(record.chat.status & ~(SessionStatus.IsArchived|SessionStatus.IsRead)) | (record.state.status & (SessionStatus.IsArchived|SessionStatus.IsRead)),modifiedAt:record.chat.modifiedAt};
@@ -1222,7 +1259,7 @@ export class AmplifierHost {
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
     limit=bounded(limit,12,50);const record=await this.record(session);let turns:Array<Turn|NonNullable<ChatState['activeTurn']>>=this.store.turns(record.chat.resource,limit).turns;
-    if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native'){const native=await this.nativeHistory(record,limit),ids=new Set(turns.map(t=>t.id));turns=[...native.turns.filter(t=>!ids.has(t.id)),...turns].slice(-limit);}
+    if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native')turns=(await this.selectedHistory(record,limit)).turns;
     const current=this.getRecord(record.uri)!.chat.activeTurn;
     if(current)turns=[...turns.filter(turn=>turn.id!==current.id),current].slice(-limit);
     const messages:Json[]=[];
