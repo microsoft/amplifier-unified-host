@@ -1063,7 +1063,7 @@ launcher-configured alias plus its reviewed SHA256 revision; omission uses the
 configured engine default. No directory or arbitrary bundle path is accepted.
 
 Initialize advertises `_meta['amplifier.dev/managedCreation']` with method
-`x-amplifier/managedSession`; root-channel operations are `create` with the same
+`x-amplifier/managedSession`; root-channel operations are `options`, `defaults`, `create` with the same
 arguments and `receipt` with `{commandId}`. Success returns
 `{session,uri,creationConfirmed:true,location,configurationScope:'global-and-session',runtimeStarted:false,workReplayed:false,receipt}`.
 A created chat has a ready AHP resource, but provider/account/runtime readiness
@@ -1083,10 +1083,43 @@ use independent `allowedManagedRoots`, while workspace authorization and file
 browsing continue to exclude the private allocation root. Selected trusted I/O
 uses `withSessionWorkspace` and the exact allocation authority.
 
-This initial creation boundary explicitly refuses managed configuration clones,
-history forks, relocation and transfer until those operations can obtain a
-fresh or transitioned allocation. It does not implement permanent deletion.
+History forks (including readable recovery and configured bundle choice) and exact
+configuration clones reserve new owned allocations. They preserve source history,
+leave generated files at the source, and do not start a target runtime. Relocation
+and transfer still require an explicit ownership transition and refuse before
+effects. This boundary does not implement permanent deletion.
 Native global/session policy is authenticated on every mount; project/local
 settings and routing are excluded. Canonical history, events and user files are
 preserved. Full-product backup must include this separate configured host owner
 root; native session backups alone do not cover its allocation journal/files.
+
+### Managed choices and fresh copies
+
+`managedSessionOptions({provider?})` / root operation `options` returns bounded
+configured bundle aliases `{id,name,revision}`, `defaultBundle:{kind:'engine-default'}`,
+and `runtimeStarted:false`. `managedSessionDefaults({provider?,bundle?,bundleRevision?})`
+/ operation `defaults` resolves only that exact launcher choice with global settings.
+It returns sanitized `{providers,effective,globalOnly:true,bundleSelection,configurationScope,runtimeStarted:false}`.
+The Foundation provider metadata probe can prepare configured dependencies but
+never creates a Core conversation, mounts tools/hooks or calls a model. Do not
+pass these aliases to unrelated bundle-path APIs. No caller workspace is accepted.
+
+Existing `forkSession` reserves a fresh UUID, directory and two durable creation
+records for a managed source. Native canonical history stays authoritative;
+managed fork result adds `location` and `generatedFilesCopied:false`. File-access
+paths contained within the source allocation are rebound to the target allocation;
+other explicit restrictions remain. Historical text/path references are unchanged.
+Ordinary workspace forks retain their existing semantics.
+
+Existing `createSession` with source/configuration hash uses an exact persisted
+native snapshot for managed sources and leaves the target cold with empty history.
+An unexecuted source without a saved effective configuration is explicitly
+unavailable; creating a runtime only to guess its configuration is not a fallback.
+`managedSessionReceipt(originalCommandId)` can repair an uncertain clone projection
+from its original native receipt. Both copy kinds retain source identity/revision
+in the host allocation ledger and compare the independent native proof.
+
+Any failure after host reservation reports `{receipt,outcome:'unknown',allocationOccurred:true}`
+for ordinary managed creation, even when native reports its own pre-effect refusal.
+Allocated folders remain evidence. Never retry mkdir/native creation; only inspect
+the exact original receipt. Live/restarted receipt repair never replays inputs.

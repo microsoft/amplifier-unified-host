@@ -14,6 +14,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     const file=process.env.FIXTURE_LOG+'.managed',rows=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{};
     if(p.operation==='receipt'){reply(message.id,rows[p.commandId]??null);continue;}
     appendFileSync(process.env.FIXTURE_LOG+'.creations',JSON.stringify(p)+'\n');
+    if(p.commandId==='refused-managed'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,error:{code:-32011,message:'Native preflight refused',data:{executed:false}}})+'\n');continue;}
     const result={sessionId:p.sessionId,historyCwd:p.cwd,executionDirectory:p.cwd,executionRevision:0,creationConfirmed:true,location:{version:1,kind:'managed',allocationId:p.sessionId,creationReceipt:p.commandId,allocationHash:p.allocationHash,owner:'amplifier-unified'},title:p.title??'New chat',bundle:'fixture',configurationScope:'global-and-session',runtimeStarted:false,workReplayed:false};
     const receipt={commandId:p.commandId,status:p.commandId.startsWith('unknown-')?'unknown':'completed',result,replayed:false};rows[p.commandId]=receipt;writeFileSync(file,JSON.stringify(rows));
     if(p.commandId.startsWith('lost-')||p.commandId.startsWith('unknown-')){process.exit(17);continue;}reply(message.id,receipt);

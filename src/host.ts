@@ -536,7 +536,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
@@ -586,7 +586,7 @@ export class AmplifierHost {
         this.emit(p.channel,{type:'chat/turnsLoaded',turns:page.turns,turnsNextCursor:this.turnCursor(p.channel,page.before)} as StateAction);return {};
       }
       case 'dispatchAction':await this.dispatch(peer,p);return null;
-      case 'x-amplifier/managedSession':if(p.channel!==ROOT)throw new RpcFault(-32602,'Managed creation uses the root channel');if(p.operation==='create')return this.createManagedSession(p.args);if(p.operation==='receipt'&&Object.keys(p.args??{}).length===1)return this.managedSessionReceipt(p.args.commandId);throw new RpcFault(-32602,'Unknown managed creation operation');
+      case 'x-amplifier/managedSession':if(p.channel!==ROOT)throw new RpcFault(-32602,'Managed creation uses the root channel');if(p.operation==='options')return this.managedSessionOptions(p.args);if(p.operation==='defaults')return this.managedSessionDefaults(p.args);if(p.operation==='create')return this.createManagedSession(p.args);if(p.operation==='receipt'&&Object.keys(p.args??{}).length===1)return this.managedSessionReceipt(p.args.commandId);throw new RpcFault(-32602,'Unknown managed creation operation');
       case 'x-amplifier/sessionLifecycle':return this.sessionLifecycleRequest(p.channel,p.operation,p.args??{});
       case 'x-commandReceipt': {
         const receipt=this.store.receipt(p.commandId);if(!receipt)throw new RpcFault(-32008,'Command receipt not found');
@@ -637,10 +637,11 @@ export class AmplifierHost {
   private async confirmManaged(receipt:Json,proof:Json){
     const native=proof?.result,location=this.managed!.location(receipt);
     if(proof?.commandId!==receipt.commandId||proof.status!=='completed'||native?.sessionId!==location.allocationId||native.historyCwd!==receipt.marker.workspace||native.executionDirectory!==receipt.marker.workspace||native.creationConfirmed!==true||native.workReplayed!==false||native.runtimeStarted!==false||native.configurationScope!=='global-and-session'||managedHash(native.location)!==managedHash(location))throw new RpcFault(-32011,'Native managed creation proof is unavailable or differs; original allocation preserved');
+    if(receipt.copySource&&managedHash(native.source)!==managedHash(receipt.copySource))throw new RpcFault(-32011,'Managed copy source differs from its retained command authority');
     await this.managed!.inspect(receipt);
     const existing=this.getRecord(receipt.session),indexed=await this.config.catalog?.get(receipt.session);
     for(const row of [existing,indexed])if(row&&(row.nativeSessionId!==location.allocationId||row.workingDirectory!==receipt.marker.workspace||row.engineId!==receipt.request.provider))throw new RpcFault(-32011,'Managed session identity collides with an existing mapping');
-    if(!existing){const timestamp=now(),meta={'amplifier.dev/location':location},chat:ChatState={resource:chatURI(receipt.session),title:receipt.request.title??'New chat',status:1,modifiedAt:timestamp,turns:[]};
+    if(!existing){const timestamp=now(),meta={'amplifier.dev/location':location},chat:ChatState={resource:chatURI(receipt.session),title:receipt.request.title??'New chat',status:1,modifiedAt:timestamp,turns:[],...(native.source?.operation==='fork'?{_meta:{'amplifier.dev/history':{source:'native',available:true}}}:{})};
       const summary:SessionSummary={resource:receipt.session,provider:receipt.request.provider,title:chat.title,status:1,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(receipt.marker.workspace).href],_meta:meta};
       const state:SessionState={provider:receipt.request.provider,title:chat.title,status:1,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:meta};
       this.store.save({uri:receipt.session,engineId:receipt.request.provider,nativeSessionId:location.allocationId,workingDirectory:receipt.marker.workspace,executionDirectory:receipt.marker.workspace,summary,state,chat});
@@ -648,8 +649,22 @@ export class AmplifierHost {
     const result={session:receipt.session,uri:receipt.session,creationConfirmed:true,location,configurationScope:'global-and-session',runtimeStarted:false,workReplayed:false,receipt:receipt.commandId};
     // Native creation is complete; retrying catalog projection can never replay it.
     await this.syncCatalog(this.getRecord(receipt.session)!);this.managed!.settle(receipt.commandId,'completed',result);
+    if(receipt.copySource?.operation==='configuration-clone'&&this.store.db.prepare('SELECT 1 FROM creation_keys WHERE command_id=? AND uri=?').get(receipt.commandId,receipt.session))this.store.finish(receipt.commandId,'completed');
     if(!existing){this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);this.notify('root/sessionAdded',{channel:ROOT,summary:this.getRecord(receipt.session)!.summary});}
     return result;
+  }
+  /** Selected configured engine choices only; no allocation or runtime preparation. */
+  async managedSessionOptions(input:{provider?:string}={}){
+    if(!this.managed)throw new RpcFault(-32601,'Managed allocation is not configured',{executed:false});
+    if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(k=>k!=='provider')||input.provider!==undefined&&(typeof input.provider!=='string'||!input.provider||input.provider.length>200))throw new RpcFault(-32602,'Configured provider selector required',{executed:false});
+    const provider=input.provider??this.config.engines[0].id;
+    return this.intake.inspectOnly(()=>this.managedAgent(provider,async agent=>{const value:Json=await agent.client.extMethod('_amplifier/managed',{operation:'options'});if(value.version!==1||value.runtimeStarted!==false||value.configurationScope!=='global-and-session'||!Array.isArray(value.bundles)||value.bundles.length>64||value.bundles.some((row:Json)=>typeof row.id!=='string'||!row.id||row.id.length>200||row.name!==row.id||typeof row.revision!=='string'||!/^[a-f0-9]{64}$/.test(row.revision)))throw new RpcFault(-32000,'Invalid configured managed choices');return {provider,version:1,bundles:value.bundles,defaultBundle:{kind:'engine-default'},configurationScope:'global-and-session',runtimeStarted:false};}));
+  }
+  async managedSessionDefaults(input:{provider?:string;bundle?:string;bundleRevision?:string}={}){
+    if(!this.managed)throw new RpcFault(-32601,'Managed allocation is not configured',{executed:false});
+    if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(k=>!['provider','bundle','bundleRevision'].includes(k))||input.provider!==undefined&&(typeof input.provider!=='string'||!input.provider||input.provider.length>200)||input.bundle!==undefined&&(typeof input.bundle!=='string'||!input.bundle||input.bundle.length>200||! /^[a-f0-9]{64}$/.test(input.bundleRevision??''))||input.bundle===undefined&&input.bundleRevision!==undefined)throw new RpcFault(-32602,'Exact configured provider/bundle choice required',{executed:false});
+    const provider=input.provider??this.config.engines[0].id;
+    return this.intake.inspectOnly(()=>this.managedAgent(provider,async agent=>{if((agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.managedCreation?.defaults?.version!==1)throw new RpcFault(-32601,'Engine does not expose managed defaults',{executed:false});const {provider:_,...args}=input;const value:Json=await agent.client.extMethod('_amplifier/managed',{operation:'defaults',...args});if(value.runtimeStarted!==false||value.configurationScope!=='global-and-session'||!Array.isArray(value.providers)||value.providers.length>64||Buffer.byteLength(JSON.stringify(value))>262144||input.bundle!==undefined&&(value.bundleSelection?.id!==input.bundle||value.bundleSelection?.revision!==input.bundleRevision))throw new RpcFault(-32000,'Invalid managed provider defaults');return {provider,...value};}));
   }
   /** Allocates only upon an explicit creation command; never mounts a native runtime. */
   async createManagedSession(input:ManagedSessionCreate){
@@ -662,7 +677,7 @@ export class AmplifierHost {
       return this.managedAgent(request.provider,async agent=>this.withLock('@directory-reservations',async()=>{
         const receipt=this.managed!.reserve(request);
         try{await this.managed!.allocate(receipt);this.managed!.settle(request.commandId,'dispatching');const proof:Json=await agent.client.extMethod('_amplifier/managed',this.managedNativeParams(receipt,'create'));return await this.confirmManaged(receipt,proof);}
-        catch(error){this.managed!.settle(request.commandId,'unknown');throw error;}
+        catch(error){this.managed!.settle(request.commandId,'unknown');throw new RpcFault(-32011,(error as Error).message,{receipt:request.commandId,outcome:'unknown',allocationOccurred:true});}
       }));
     }));
   }
@@ -1080,14 +1095,21 @@ export class AmplifierHost {
     const operation=String(entry.operation),args=JSON.parse(String(entry.payload)),timestamp=now();let result:Json;
     if(operation==='fork') {
       if(args.mode==='recovery'&&(native.mode!=='recovery'||native.preservedSource!==true)||args.bundle!==undefined&&native.bundleSelection!==args.bundle)throw new Error('Native copy mode does not match the reviewed request');
-      if(native.creationConfirmed!==true||native.sessionId!==entry.target?.slice('ahp-session:/'.length)||native.historyCwd!==record.workingDirectory||native.workReplayed!==false||native.source?.sessionId!==record.nativeSessionId||native.source?.historyRevision!==args.expectedHistoryRevision||typeof native.executionDirectory!=='string')throw new Error('Native fork confirmation does not match reserved identity');
-      await this.workspace(pathToFileURL(native.executionDirectory).href);
+      const allocation=this.managed?.bySession(String(entry.target));
+      const historyCwd=allocation?.marker.workspace??record.workingDirectory;
+      if(native.creationConfirmed!==true||native.sessionId!==entry.target?.slice('ahp-session:/'.length)||native.historyCwd!==historyCwd||native.workReplayed!==false||native.source?.sessionId!==record.nativeSessionId||native.source?.historyRevision!==args.expectedHistoryRevision||typeof native.executionDirectory!=='string')throw new Error('Native fork confirmation does not match reserved identity');
+      if(record.state._meta?.['amplifier.dev/location']){
+        if(!allocation||native.executionDirectory!==historyCwd||managedHash(native.location)!==managedHash(this.managed!.location(allocation))||native.generatedFilesCopied!==false)throw new Error('Managed copy lacks its fresh allocation proof');
+        const proof:Json=await this.managedAgent(record.engineId,agent=>agent.client.extMethod('_amplifier/managed',this.managedNativeParams(allocation,'receipt')));
+        if(proof.result?.source?.operation!=='fork'||proof.result.source.commandId!==entry.command_id||proof.result.source.sessionId!==record.nativeSessionId||proof.result.source.historyRevision!==args.expectedHistoryRevision)throw new Error('Managed copy receipt differs from original source command');
+        await this.confirmManaged(allocation,proof);
+      }else{if(allocation)throw new Error('Ordinary copy cannot adopt a managed allocation');await this.workspace(pathToFileURL(native.executionDirectory).href);}
       const uri=String(entry.target),existing=this.getRecord(uri),title=args.title??record.summary.title;
       const chat:ChatState={resource:chatURI(uri),title,status:SessionStatus.Idle,modifiedAt:timestamp,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:true}}};
       const summary:SessionSummary={resource:uri,provider:record.engineId,title,status:SessionStatus.Idle,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(record.workingDirectory).href]};
       const target:SessionRecord=existing??{uri,engineId:record.engineId,nativeSessionId:native.sessionId,workingDirectory:record.workingDirectory,executionDirectory:native.executionDirectory,summary,chat,state:{provider:record.engineId,title,status:SessionStatus.Idle,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories}};
-      if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==record.workingDirectory)throw new Error('Reserved fork target now has a different identity');
-      this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,workReplayed:false,mode:native.mode??'complete',...(native.bundleSelection!==undefined?{bundleSelection:native.bundleSelection}:{}),preservedSource:true,receipt:native.receipt};
+      if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==historyCwd)throw new Error('Reserved fork target now has a different identity');
+      this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,workReplayed:false,...(allocation?{location:native.location,generatedFilesCopied:false}:{}),mode:native.mode??'complete',...(native.bundleSelection!==undefined?{bundleSelection:native.bundleSelection}:{}),preservedSource:true,receipt:native.receipt};
       this.notify('root/sessionAdded',{channel:ROOT,summary:target.summary});
     }else if(operation==='legacyCopy.purge'){
       if(native.receipt.operation!==operation||native.sessionId!==record.nativeSessionId||native.historyCwd!==record.workingDirectory||native.historyRevision!==args.expectedHistoryRevision||native.previewId!==args.previewId||native.previewHash!==args.previewHash||native.canonicalFilesDeleted!==0||native.eventsDeleted!==0||native.legacyWriterCoverage!=='launcher-attested-retired'||!Array.isArray(native.removed)||!native.removed.length||native.removed.length>3||new Set(native.removed.map((f:Json)=>f.name)).size!==native.removed.length||native.removed.some((f:Json)=>!['transcript.jsonl','metadata.json','checkpoint.json'].includes(f.name)||!Number.isSafeInteger(f.bytes)||f.bytes<0||f.bytes>64*1024*1024||typeof f.sha256!=='string'||!/^[a-f0-9]{64}$/.test(f.sha256)))throw new Error('Retired-copy effect lacks exact duplicate-only native receipt proof');
@@ -1134,7 +1156,6 @@ export class AmplifierHost {
   private async mutateLifecycle(session:string,operation:string,args:Json) {
     return this.intake.run(async()=>{
     this.lifecycleArgs(operation,args);const record=await this.record(session);
-    if(operation==='fork'&&record.state._meta?.['amplifier.dev/location'])throw new RpcFault(-32601,'Managed history copy requires a fresh target allocation',{executed:false});
     return this.withLock(record.uri,async()=>{
       if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
       const previous=this.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(args.commandId);
@@ -1149,18 +1170,27 @@ export class AmplifierHost {
         if(args.mode==='recovery'&&capability?.recoveryCopy?.version!==1||args.bundle!==undefined&&capability?.bundleFork?.version!==1||descendants.length&&capability?.descendantGuard?.version!==1)throw new RpcFault(-32601,'Configured engine does not support this guarded copy operation',{executed:false});
         if(operation==='legacyCopy.purge'&&(capability?.retiredCopies?.version!==1||capability.retiredCopies.duplicateFilesOnly!==true))throw new RpcFault(-32601,'Configured engine does not support verified retired-copy purge',{executed:false});
         const inspected=await this.nativeLifecycle(agent,record,'inspect');if(inspected.historyRevision!==args.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed; inspect a fresh revision',{executed:false});
+        const managedCopy=operation==='fork'&&!!record.state._meta?.['amplifier.dev/location'];
+        if(managedCopy&&(!this.managed||(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.managedCreation?.historyCopy?.version!==1))throw new RpcFault(-32601,'Configured engine does not support fresh managed history copies',{executed:false});
         const target=operation==='fork'?'ahp-session:/'+randomUUID():null;
+        const allocationRequest=managedCopy?{session:target!,provider:record.engineId,commandId:'managed-copy:'+managedHash([record.uri,args.commandId]),title:args.title??record.summary.title}:null;
+        if(allocationRequest)this.managed!.validate(allocationRequest);
         const entry={command_id:args.commandId,session:record.uri,operation,target,status:'dispatching',payload:JSON.stringify(args)};
         this.store.transaction(()=>{this.store.admission(record.uri,{operation,args},args.commandId,'host:lifecycle',this.store.extensionSequence('host:lifecycle'));this.store.db.prepare('INSERT INTO lifecycle_commands(command_id,session,operation,target,status,payload) VALUES(?,?,?,?,?,?)').run(entry.command_id,entry.session,operation,target,entry.status,entry.payload);this.store.finish(args.commandId,'dispatching');});
         const {title,...nativeArgs}=args;
-        try{return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,operation,{...nativeArgs,...(target?{targetSessionId:target.slice('ahp-session:/'.length),...(capability?.descendantGuard?.version===1?{descendants}: {})}:{})}));}
+        let allocation:Json|undefined;
+        try{
+          if(allocationRequest)await this.withLock('@directory-reservations',async()=>{allocation=this.managed!.reserve(allocationRequest,{operation:'fork',sessionId:record.nativeSessionId,historyRevision:args.expectedHistoryRevision,commandId:args.commandId});await this.managed!.allocate(allocation);this.managed!.settle(allocation.commandId,'dispatching');});
+          return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,operation,{...nativeArgs,...(target?{targetSessionId:target.slice('ahp-session:/'.length),...(capability?.descendantGuard?.version===1?{descendants}: {})}:{ }),...(allocation?{managedTarget:{cwd:allocation.marker.workspace,commandId:allocation.commandId,allocationHash:allocation.marker.allocationHash}}:{})}));
+        }
         catch(error){
+          if(allocation&&this.managed!.receipt(allocation.commandId)?.state!=='completed')this.managed!.settle(allocation.commandId,'unknown');
           let proof:Json|undefined;try{proof=await this.nativeLifecycle(agent,record,'receipt',{commandId:args.commandId});}catch{}
           if(proof?.receipt?.status==='completed'){try{return await this.applyLifecycleResult(record,entry,{...proof.receipt.result,receipt:proof.receipt});}catch{}}
           const status=proof?.receipt===null?'failed':'unknown';this.store.transaction(()=>{this.store.db.prepare('UPDATE lifecycle_commands SET status=? WHERE command_id=?').run(status,args.commandId);this.store.finish(args.commandId,status,(error as Error).message);});throw new RpcFault(-32011,(error as Error).message,{receipt:args.commandId,outcome:status,...(status==='failed'?{executed:false}: {})});
         }
       });
-      return operation==='fork'?this.withLifecycleFamily(record,!!(args.mode==='recovery'||args.bundle),execute):execute([]);
+      return operation==='fork'?this.withLifecycleFamily(record,!!(args.mode==='recovery'||args.bundle||record.state._meta?.['amplifier.dev/location']),execute):execute([]);
     });
       });
   }
@@ -1587,7 +1617,7 @@ export class AmplifierHost {
   async createSession(input:{commandId:string;idempotencyKey:string;sourceSession:string;expectedConfigurationHash:string;title?:string}) {
     return this.intake.run(async()=>{
     if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.idempotencyKey!=='string'||!input.idempotencyKey||input.idempotencyKey.length>512||typeof input.expectedConfigurationHash!=='string'||(input.title!==undefined&&(typeof input.title!=='string'||input.title.length>1000)))throw new RpcFault(-32602,'Bounded creation identity and expected configuration required');
-    const source=await this.record(input.sourceSession);if(source.state._meta?.['amplifier.dev/location'])throw new RpcFault(-32601,'Managed configuration copy requires a fresh target allocation',{executed:false});const identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
+    const source=await this.record(input.sourceSession);const identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
     const nativeId=identity.slice(0,8)+'-'+identity.slice(8,12)+'-5'+identity.slice(13,16)+'-a'+identity.slice(17,20)+'-'+identity.slice(20,32),uri='ahp-session:/'+nativeId;
     const fingerprint=createHash('sha256').update(JSON.stringify(input)).digest('hex');
     return this.withLock(source.uri,async()=>{
@@ -1599,6 +1629,7 @@ export class AmplifierHost {
         throw new RpcFault(-32011,'Creation outcome unknown or incomplete; it must not be automatically repeated');
       }
       if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed');
+      if(source.state._meta?.['amplifier.dev/location'])return this.cloneManagedSession(source,input,uri,identity,fingerprint);
       const active=await this.ensureAgent(source.uri);
       if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.configurationClone?.version!==1)throw new RpcFault(-32601,'Agent does not advertise exact configuration cloning');
       if(active.busy)throw new RpcFault(-32011,'Source must be idle while its configuration is captured');
@@ -1610,6 +1641,25 @@ export class AmplifierHost {
       return {uri,creationConfirmed:true as const,receipt:this.store.receipt(input.commandId)};
     });
       });
+  }
+  private async cloneManagedSession(source:SessionRecord,input:{commandId:string;title?:string;expectedConfigurationHash:string},uri:string,identity:string,fingerprint:string){
+    this.guardSessionLifecycle(source.uri);this.guardTransfer(source.uri);
+    if(this.store.unknown(source.chat.resource)||this.relocationFence(source.uri))throw new RpcFault(-32011,'Source execution is unresolved; configuration cannot be copied',{executed:false});
+    const request={session:uri,commandId:input.commandId,provider:source.engineId,title:input.title??source.summary.title};this.managed!.validate(request);
+    await this.quiesceLifecycle(source);
+    return this.managedAgent(source.engineId,async agent=>{
+      if((agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.managedCreation?.configurationCopy?.version!==1)throw new RpcFault(-32601,'Engine does not support passive managed configuration copies',{executed:false});
+      const snapshot:Json=await agent.client.extMethod('_amplifier/managed',{operation:'configuration.snapshot',sessionId:source.nativeSessionId,cwd:source.workingDirectory});
+      if(snapshot.version!==1||snapshot.sourceSessionId!==source.nativeSessionId||snapshot.sourceCwd!==source.workingDirectory||snapshot.executionDirectory!==source.workingDirectory||typeof snapshot.configurationHash!=='string'||!/^[a-f0-9]{64}$/.test(snapshot.configurationHash))throw new RpcFault(-32000,'Invalid exact native configuration reference');
+      if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed while preparing creation',{executed:false});
+      this.store.transaction(()=>{this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);this.store.admission(uri,{operation:'managed.configuration-clone',source:source.uri,snapshot},input.commandId,'host:create',this.store.extensionSequence('host:create'));this.store.finish(input.commandId,'dispatching');});
+      let allocation:Json|undefined;
+      try{
+        await this.withLock('@directory-reservations',async()=>{allocation=this.managed!.reserve(request,{operation:'configuration-clone',sessionId:source.nativeSessionId,configurationHash:snapshot.configurationHash});await this.managed!.allocate(allocation);this.managed!.settle(input.commandId,'dispatching');});
+        const proof:Json=await agent.client.extMethod('_amplifier/managed',{...this.managedNativeParams(allocation!,'create'),operation:'clone',source:snapshot});
+        await this.confirmManaged(allocation!,proof);return {uri,creationConfirmed:true as const,receipt:this.store.receipt(input.commandId)};
+      }catch(error){if(allocation)this.managed!.settle(input.commandId,'unknown');this.store.finish(input.commandId,'unknown');throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',allocationOccurred:!!allocation});}
+    });
   }
   /** Compare-and-admit scheduled work under the same session lock as user turns and stop. */
   async submitScheduled(session:string,input:{commandId:string;text:string;taskId:string;taskRevision:number;kind:'task'|'monitor';expectedInterruptionRevision:number;expectedExecutionRevision:number;expectedConfigurationHash:string;scheduledRunId?:string}) {

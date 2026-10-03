@@ -8,6 +8,7 @@ test('actual native managed creation is cold, indexed once, global-only, private
  const hostConfig={stateDirectory:join(dir,'host'),managedSessionRoot:root,allowedWorkspaceRoots:[workspace],engines};let host=await createHost({...hostConfig,catalog}),client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
  try{
   const init=await client.initialize({clientId:'managed-client',protocolVersions:['0.9.0']});assert.equal((init._meta?.['amplifier.dev/managedCreation'] as any).passive,true);
+  const choices:any=await client.request('x-amplifier/managedSession',{channel:'ahp-root://',operation:'options',args:{}});assert.deepEqual(choices.bundles,[]);assert.equal(choices.runtimeStarted,false);const defaults:any=await client.request('x-amplifier/managedSession',{channel:'ahp-root://',operation:'defaults',args:{}});assert.equal(defaults.providers[0].id,'fixture');assert.equal(defaults.runtimeStarted,false);assert.equal(host.diagnostics().activeAgents,0);
   const session='ahp-session:/'+randomUUID(),commandId='create-from-private-draft',args={session,commandId,selection:{instance:'fixture',model:'specific-fixture-model'}};
   const result:any=await client.request('x-amplifier/managedSession',{channel:'ahp-root://',operation:'create',args});assert.equal(result.runtimeStarted,false);assert.equal(host.diagnostics().activeAgents,0);
   let info=await host.inspectSession(session);const cwd=info.executionDirectory;await assert.rejects(host.authorizeWorkspace(cwd),/selected-session/);
@@ -24,5 +25,27 @@ test('actual native managed creation is cold, indexed once, global-only, private
   assert.equal((await catalog.list({connectionId:'ordinary',limit:50,allowedWorkspaceRoots:[workspace]})).items.length,0);
   await host.submitTurn(session,{commandId:'second-explicit-input',text:'Continue in same private directory',clientId:'managed-client'});assert.equal((await host.waitForTurn(session,'second-explicit-input')).completed,true);
   assert.equal((await readdir(join(root,'chats'))).length,1);assert.equal((await host.inspectSession(session)).nativeSessionId,info.nativeSessionId);
+  await writeFile(join(cwd,'original-output.txt'),'Source output retained');
+  const snapshot=await host.inspectSessionHistory(session),forkArgs={commandId:'managed-fork',expectedHistoryRevision:snapshot.historyRevision,mode:'recovery' as const};
+  const upsert=catalog.upsert.bind(catalog);catalog.upsert=async row=>{if(row.uri!==session)throw new Error('fixture loses target projection reply');return upsert(row);};
+  await assert.rejects(host.forkSession(session,forkArgs),(error:any)=>error.data?.outcome==='unknown');
+  catalog.upsert=upsert;await host.close();catalog=new StdioCatalog(catalogConfig);host=await createHost({...hostConfig,catalog});
+  const repaired=await host.inspectSessionLifecycleReceipt(session,'managed-fork');assert.equal(repaired.status,'completed');const fork=repaired.result;assert.equal(fork.generatedFilesCopied,false);assert.equal(host.diagnostics().activeAgents,0);
+  const copy=await host.inspectSession(fork.uri);assert.notEqual(copy.executionDirectory,cwd);assert.equal(copy.location.allocationId,copy.nativeSessionId);assert.deepEqual(await readdir(copy.executionDirectory),[]);
+  await assert.rejects(host.authorizeWorkspace(copy.executionDirectory),/selected-session/);assert.equal(await readFile(join(cwd,'original-output.txt'),'utf8'),'Source output retained');
+  assert.equal((await host.forkSession(session,forkArgs)).uri,fork.uri);assert.equal((await readdir(join(root,'chats'))).length,2);
+  const copyNative=join(home,'projects',copy.historyHome.replaceAll('/','-'),'sessions',copy.nativeSessionId!);const copiedBefore=await readFile(join(copyNative,'transcript.jsonl'));assert.match(copiedBefore.toString(),/Managed real graph request/);
+  const originalBefore=await readFile(join(native,'transcript.jsonl'));await host.submitTurn(fork.uri,{commandId:'copy-first-input',text:'Only copied chat runs this',clientId:'managed-client'});assert.equal((await host.waitForTurn(fork.uri,'copy-first-input')).completed,true);assert.deepEqual(await readFile(join(native,'transcript.jsonl')),originalBefore);
+  await host.close();catalog=new StdioCatalog(catalogConfig);host=await createHost({...hostConfig,catalog});assert.equal((await host.inspectSessionLifecycleReceipt(session,'managed-fork')).status,'completed');assert.equal((await host.inspectSession(fork.uri)).executionDirectory,copy.executionDirectory);
+  const current=await host.inspectSession(session),cloneInput={commandId:'managed-config-copy',idempotencyKey:'one-independent-target',sourceSession:session,expectedConfigurationHash:current.configurationHash};
+  const cloneUpsert=catalog.upsert.bind(catalog);catalog.upsert=async row=>{if(row.uri!==session&&row.uri!==fork.uri)throw new Error('fixture loses clone projection reply');return cloneUpsert(row);};
+  await assert.rejects(host.createSession(cloneInput),(error:any)=>error.data?.outcome==='unknown');catalog.upsert=cloneUpsert;
+  const cloneProof=await host.managedSessionReceipt(cloneInput.commandId);assert.equal(cloneProof?.status,'completed');
+  const cloned=await host.createSession(cloneInput);assert.equal(cloned.creationConfirmed,true);assert.equal(host.diagnostics().activeAgents,0);assert.deepEqual(await host.createSession(cloneInput),cloned);
+  const cloneInfo=await host.inspectSession(cloned.uri);assert.notEqual(cloneInfo.executionDirectory,cwd);assert.notEqual(cloneInfo.executionDirectory,copy.executionDirectory);
+  const cloneNative=join(home,'projects',cloneInfo.historyHome.replaceAll('/','-'),'sessions',cloneInfo.nativeSessionId!);assert.equal((await readFile(join(cloneNative,'transcript.jsonl'))).length,0);
+  await host.submitTurn(cloned.uri,{commandId:'config-copy-first',text:'New conversation cloned configuration',clientId:'managed-client'});assert.equal((await host.waitForTurn(cloned.uri,'config-copy-first')).completed,true);assert.deepEqual(await readFile(join(native,'transcript.jsonl')),originalBefore);
+
+
  }finally{await client.shutdown().catch(()=>{});await host.close().catch(()=>{});await catalog.close().catch(()=>{});await rm(dir,{recursive:true,force:true});}
 });
