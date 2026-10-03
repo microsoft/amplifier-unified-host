@@ -34,7 +34,7 @@ test('a long capability RPC never holds the handshake barrier or same-resource c
   const effects=await Promise.allSettled([client.request('x-amplifier/capabilityAction' as any,action('control','control-one') as any),client.request('x-amplifier/capabilityAction' as any,action('control','control-one') as any)]);
   assert.equal(effects.filter(value=>value.status==='fulfilled').length,1);assert.equal(effects.filter(value=>value.status==='rejected').length,1);
   const receipt:any=await client.request('x-commandReceipt' as any,{channel:'ahp-root://',commandId:'control-one'} as any);assert.equal(receipt.status,'completed');
-  await client.request('listSessions',{channel:'ahp-root://',limit:50});await client.request('resourceRead',{channel:'ahp-root://',uri:'fixture://topic',encoding:'utf-8'});
+  await client.request('listSessions',{channel:'ahp-root://',limit:50});await client.request('resourceRead',{channel:'ahp-root://',uri:'fixture://topic?scope=host',encoding:'utf-8'});
   assert.ok(performance.now()-start<2000);assert.equal(settled,false);assert.equal(calls.filter(id=>id==='control-one').length,1);
   release();await pending;assert.equal(host.diagnostics().activeAgents,0);
  }finally{ready();release();await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}

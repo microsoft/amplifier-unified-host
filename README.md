@@ -1179,3 +1179,23 @@ family membership must match the product-reviewed family before file effects.
 Foundation's public retained historical identity support is required; generic
 engines without the capability are explicitly unsupported. These ownership gates
 do not freeze non-cooperating external filesystem editors.
+
+### Capability v1 conformance
+
+Host-only authority is declared by `manifest.topics[action.topic].scope === 'host'`.
+Such actions require `channel: 'ahp-root://'`; the host rejects other channels
+before creating a receipt or invoking the provider. The explicit selected session
+inside an owner's typed arguments remains subject to that owner's authorization.
+Context topics retain their authorized host or selected-session behavior.
+
+Advertised capability resource reads and watches require exactly one explicit
+`scope` query value: `host` or an AHP session URI. Host-only topics require
+`scope=host`. Missing, empty, duplicate, and invalid scopes are refused before
+provider reads or watch creation. Clients must not treat the bare advertised URI
+as an implicit host-scope request.
+
+New v1 capability commands accept 1–256 characters in `commandId`, matching the
+public extension schema. IDs are never truncated. Existing durable receipts,
+including 257–512-character IDs admitted by earlier builds, remain available
+through passive `x-commandReceipt` after restart. Re-reading a receipt does not
+re-admit or replay its effect.

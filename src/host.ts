@@ -71,7 +71,7 @@ export interface HostConfig {
   /** Optional bounded handshake metadata, resolved by the authenticated distribution. */
   clientMetadata?:(context:{clientId:string;metadata:Json})=>Promise<Json|undefined>;
   capabilities?: {
-    manifest:{version:1;topics:Record<string,{uri:string;version:number}>;actions:Record<string,{topic:string;operation:string;method:string}>};
+    manifest:{version:1;topics:Record<string,{uri:string;version:number;watch?:boolean;scope?:'context'|'host'}>;actions:Record<string,{topic:string;operation:string;method:string}>};
     /** Trusted exact manifest action classification; no ordinary mutation rights are inherited. */
     quiescenceAccess?:Record<string,'read'|'reconcile'>;
     read:(request:{uri:string;topic:string;scope:string;clientId:string})=>Promise<{topic:string;scope:string;revision:number;data:unknown}>;
@@ -286,7 +286,11 @@ export class AmplifierHost {
     const config=this.config.capabilities;if(!config)return;
     let parsed:URL;try{parsed=new URL(uri);}catch{return;}
     const base=uri.split('?')[0],entry=Object.entries(config.manifest.topics).find(([,topic])=>topic.uri===base);
-    if(!entry)return;return {topic:entry[0],scope:parsed.searchParams.get('scope')??'host'};
+    if(!entry)return;
+    const scopes=parsed.searchParams.getAll('scope'),scope=scopes[0];
+    if(scopes.length!==1||!scope||(scope!=='host'&&!/^ahp-session:\/[^?#\s]+$/.test(scope)))throw new RpcFault(-32602,'Capability URI requires one explicit host or AHP session scope',{executed:false});
+    if(entry[1].scope==='host'&&scope!=='host')throw new RpcFault(-32602,'Host capability topic requires scope=host',{executed:false});
+    return {topic:entry[0],scope};
   }
   private resourceProvider(uri:string){let scheme;try{scheme=new URL(uri).protocol.slice(0,-1);}catch{return;}return this.config.resourceProviders?.find(provider=>provider.scheme===scheme);}
   /** Called by independent capability owners after their authoritative commit. */
@@ -2242,7 +2246,8 @@ export class AmplifierHost {
     const access=namedAction&&provider?.quiescenceAccess?.[namedAction[0]];
     const execute=async()=>{
     if(!provider||request.version!==1||!Object.values(provider.manifest.actions).some(action=>action.topic===request.topic&&action.operation===request.operation&&action.method==='x-amplifier/capabilityAction'))throw new RpcFault(-32601,'Capability action/version not advertised');
-    if(typeof request.commandId!=='string'||!request.commandId||request.commandId.length>512||typeof actor.actorId!=='string'||!actor.actorId)throw new RpcFault(-32602,'Durable command and actor identities required');
+    if(typeof request.commandId!=='string'||!request.commandId||request.commandId.length>512||[...request.commandId].length>256||typeof actor.actorId!=='string'||!actor.actorId)throw new RpcFault(-32602,'Capability commandId must contain 1 to 256 characters and actor identity is required',{executed:false});
+    if(provider.manifest.topics[request.topic]?.scope==='host'&&request.channel!==ROOT)throw new RpcFault(-32602,'Host capability action requires the root channel',{executed:false});
     const session=request.channel===ROOT?undefined:await this.record(request.channel);
     this.store.transaction(()=>this.store.admission(request.channel,request,request.commandId,actor.actorId,this.store.extensionSequence(actor.actorId)));
     this.store.finish(request.commandId,'dispatching');

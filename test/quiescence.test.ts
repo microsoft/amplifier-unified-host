@@ -48,7 +48,7 @@ test('closed intake precedes participant acquisition and blocks public writes wh
   await assert.rejects(client.request('createSession',{channel:'ahp-session:/'+randomUUID(),provider:'fixture',workingDirectories:[pathToFileURL(f.directory).href]}),/intake is closed/);
   await assert.rejects(client.request('resourceWrite' as any,{channel:'ahp-root://',uri:'fixture://body',data:'x'} as any),/intake is closed/);
   await assert.rejects(client.request('x-amplifier/capabilityAction' as any,{channel:'ahp-root://',topic:'fixture',version:1,operation:'effect',args:{},commandId:'never'} as any),/intake is closed/);
-  await client.request('listSessions',{channel:'ahp-root://',limit:50});await client.request('resourceRead',{channel:'ahp-root://',uri:'fixture://topic',encoding:'utf-8'});await client.subscribe(session);
+  await client.request('listSessions',{channel:'ahp-root://',limit:50});await client.request('resourceRead',{channel:'ahp-root://',uri:'fixture://topic?scope=host',encoding:'utf-8'});await client.subscribe(session);
   const reconnect=new AhpClient(await WebSocketTransport.connect(f.host.url));reconnect.connect();try{await reconnect.reconnect({clientId:randomUUID(),lastSeenServerSeq:0,subscriptions:['ahp-root://']});}finally{await reconnect.shutdown();}
   assert.equal(effects,0);acquiring.release();const lease=await admitted;assert.equal(lease.admitted,true);
   assert.deepEqual(await f.host.admitQuiescence({commandId:'atomic-gate',purpose:'recovery'}),lease);
