@@ -970,3 +970,10 @@ coverage only. Configured catalogs lacking descendant support refuse copy effect
 `inspectSessionHistory` exposes negotiated per-engine `lifecycleCapabilities` and
 optional bounded native `failure` guidance. It never fabricates historical failure
 causes from a generic host error. Capability absent means the operation is unavailable.
+
+Read state uses standard AHP `session/isReadChanged` actions and is shared across
+clients. New input, resumed work, required input and completion clear a previous
+read flag. These boundary events are durable; token streaming and historical
+page loads do not emit read-state writes. Reading a conversation never answers
+or dismisses its pending tool approvals. Normal AHP server ordering governs
+concurrent client actions; no private required revision field is added.

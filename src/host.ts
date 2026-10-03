@@ -1116,7 +1116,22 @@ export class AmplifierHost {
     if(this.config.catalog.projectSessionArchives)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(record.uri,Number(!!(record.summary.status & SessionStatus.IsArchived)));
   }
   private emit(channel:string,action:StateAction,origin?:ActionEnvelope['origin'],rejectionReason?:string):ActionEnvelope {
-    const previous=this.getRecord(channel);let record=previous?{...previous}:undefined;
+    let previous=this.getRecord(channel);
+    // Read is shared session metadata. Record a standard unread action at work
+    // boundaries so the session reducer cannot preserve an obsolete read flag.
+    // History loading and token deltas never create read-state write traffic.
+    const unread=previous&&!rejectionReason&&(
+      channel===previous.uri&&action.type==='session/inputNeededSet'||
+      channel===previous.chat.resource&&(action.type==='chat/turnStarted'||
+        action.type==='chat/turnResume'||action.type==='chat/inputRequested'||
+        ['chat/turnComplete','chat/turnCancelled','chat/error'].includes(action.type)&&
+          'turnId' in action&&action.turnId===previous.chat.activeTurn?.id));
+    if(unread&&(previous!.state.status&SessionStatus.IsRead)!==0){
+      this.emit(previous!.uri,{type:'session/isReadChanged',isRead:false} as StateAction);
+      previous=this.getRecord(channel)!;
+      this.notify('root/sessionSummaryChanged',{channel:ROOT,session:previous.uri,changes:{status:previous.summary.status}});
+    }
+    let record=previous?{...previous}:undefined;
     const priorSummary=record&&JSON.stringify(this.chatSummary(record.chat));
     const envelope=this.store.transaction(()=>{
       const terminal=this.terminalState(channel);
