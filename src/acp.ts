@@ -3,7 +3,7 @@ import { Readable, Writable, Transform } from 'node:stream';
 import { readFile, writeFile, realpath, stat } from 'node:fs/promises';
 import { dirname, resolve, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { ClientSideConnection, ndJsonStream, type InitializeResponse, type Client, type SessionNotification, type RequestPermissionRequest, type RequestPermissionResponse } from '@agentclientprotocol/sdk';
+import { ClientSideConnection, RequestError, ndJsonStream, type InitializeResponse, type Client, type SessionNotification, type RequestPermissionRequest, type RequestPermissionResponse } from '@agentclientprotocol/sdk';
 
 export interface EngineConfig { id: string; label: string; command: string; args?: string[]; env?: Record<string,string>; }
 export interface AgentHandlers {
@@ -12,6 +12,8 @@ export interface AgentHandlers {
   hostRequest?(method: string, params: Record<string,unknown>): Promise<Record<string,unknown>>;
   nativeEvent?(params:Record<string,unknown>):Promise<void>;
   hostCapabilities?:Record<string,unknown>;
+  /** Host admission for filesystem and terminal effects, including idle peer callbacks. */
+  admitEffect?<T>(work:()=>Promise<T>):Promise<T>;
   stopped?(event:{exitCode?:number;signal?:string}):void;
   terminal?(event:{terminalId:string;kind:'created'|'data'|'exited';title?:string;cwd?:string;data?:string;exitCode?:number}):void;
 }
@@ -53,12 +55,12 @@ export class AcpProcess {
         const start = Math.max(0,(params.line ?? 1)-1);
         return {content: lines.slice(start,params.limit == null ? undefined : start+params.limit).join('\n')};
       },
-      writeTextFile: async params => {
+      writeTextFile: async params => this.effect(async()=>{
         this.validateSession(params.sessionId);
         if (Buffer.byteLength(params.content)>8*1024*1024) throw new Error('File exceeds 8 MiB callback limit');
         await writeFile(await this.scoped(params.path,true),params.content); return {};
-      },
-      createTerminal: async params => {
+      }),
+      createTerminal: async params => this.effect(async()=>{
         this.validateSession(params.sessionId);
         if (this.terminals.size>=16) throw new Error('Session terminal limit reached');
         const cwd = params.cwd ? await this.scoped(params.cwd) : this.cwd;
@@ -71,11 +73,11 @@ export class AcpProcess {
         child.stdout.on('data',append); child.stderr.on('data',append);
         terminal.done = new Promise(resolveDone=>{child.once('close',(code,signal)=>{terminal.exit={...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})};this.handlers.terminal?.({terminalId,kind:'exited',exitCode:code??undefined});resolveDone();});child.once('error',()=>{terminal.exit={exitCode:127};resolveDone();});});
         this.terminals.set(terminalId,terminal);return {terminalId};
-      },
+      }),
       terminalOutput: async params => {this.validateSession(params.sessionId);const t=this.terminal(params.terminalId);return {output:t.output.toString('utf8'),truncated:t.truncated,...(t.exit?{exitStatus:t.exit}:{})};},
       waitForTerminalExit: async params => {this.validateSession(params.sessionId);const t=this.terminal(params.terminalId);await t.done;return t.exit!;},
-      killTerminal: async params => {this.validateSession(params.sessionId);this.terminal(params.terminalId).process.kill();return {};},
-      releaseTerminal: async params => {this.validateSession(params.sessionId);const t=this.terminal(params.terminalId);t.process.kill();this.terminals.delete(params.terminalId);return {};},
+      killTerminal: async params => this.effect(async()=>{this.validateSession(params.sessionId);this.terminal(params.terminalId).process.kill();return {};}),
+      releaseTerminal: async params => this.effect(async()=>{this.validateSession(params.sessionId);const t=this.terminal(params.terminalId);t.process.kill();this.terminals.delete(params.terminalId);return {};}),
       extMethod: async (method,params) => {
         if (!handlers.hostRequest || method !== '_amplifier/host') throw new Error(`Unsupported client extension: ${method}`);
         this.validateSession(String(params.sessionId)); return handlers.hostRequest(method,params);
@@ -86,6 +88,10 @@ export class AcpProcess {
     let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;for(const terminal of this.terminals.values())terminal.process.kill();handlers.stopped?.(event);};
     this.process.once('close',(code,signal)=>reportStopped({...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})}));
     this.process.once('error',()=>reportStopped({}));
+  }
+  private async effect<T>(work:()=>Promise<T>):Promise<T> {
+    try{return await (this.handlers.admitEffect?this.handlers.admitEffect(work):work());}
+    catch(error){const fault=error as {code?:unknown;message?:string;data?:unknown};if(Number.isSafeInteger(fault?.code))throw new RequestError(fault.code as number,fault.message??'Host effect was refused',fault.data);throw error;}
   }
   private validateSession(sessionId:string) {
     // session/new can emit updates before returning the newly allocated identity.

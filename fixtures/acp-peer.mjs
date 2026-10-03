@@ -34,6 +34,8 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     send({id:message.id,error:{code:-32601,message:'Unsupported fixture lifecycle operation'}});
   }
   else if(message.method==='_amplifier/retire'){
+    if(process.env.FIXTURE_RETIRE_CALLBACK){const id=permissionId++;pending.set(id,result=>appendFileSync(process.env.FIXTURE_LOG+'.late-write',JSON.stringify(result)+'\n'));send({id,method:'fs/write_text_file',params:{sessionId:p.sessionId,path:process.cwd()+'/blocked-native-write',content:'must not write'}});}
+    if(process.env.FIXTURE_RETIRE_LOST){retired=true;appendFileSync(process.env.FIXTURE_LOG+'.retired','retired without acknowledgement\n');continue;}
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
   }
@@ -143,10 +145,10 @@ for await(const line of readline.createInterface({input:process.stdin})) {
         const outcome=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'ui.inspect',args:{}}});});
         update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:JSON.stringify(outcome)}});
       }
-      if(text==='terminal'){
+      if(text==='terminal'||text==='terminal-background'){
         const call=method=>async params=>{const requestId=permissionId++;return new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method,params:{sessionId:p.sessionId,...params}});});};
-        const terminal=await call('terminal/create')({command:process.execPath,args:['-e','process.stdout.write("terminal proof")']});
-        await call('terminal/wait_for_exit')({terminalId:terminal.terminalId});
+        const terminal=await call('terminal/create')({command:process.execPath,args:['-e',text==='terminal-background'?'setInterval(()=>process.stdout.write("owned terminal work\\n"),10)':'process.stdout.write("terminal proof")']});
+        if(text==='terminal')await call('terminal/wait_for_exit')({terminalId:terminal.terminalId});
         update(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'terminal-tool',title:'Run process',kind:'execute',status:'completed',content:[{type:'terminal',terminalId:terminal.terminalId}]});
       }
       if(text==='many')for(let i=0;i<100;i++)update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'x'}});

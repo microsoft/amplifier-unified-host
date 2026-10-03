@@ -5,3 +5,5 @@ export { StdioCatalog, type CatalogProcessConfig } from './catalog.js';
 
 export { RECALL_LIMITS, type RecallSource, type RecallRow } from './recall.js';
 export { type TransferCommand, type BeginTransfer, type AdoptTransfer } from './host.js';
+
+export type {QuiescenceFence,QuiescenceConfig,QuiescenceParticipant,QuiescenceLease,QuiescenceContext,QuiescenceProof,QuiescenceOutcome,QuiescencePurpose} from './quiescence.js';

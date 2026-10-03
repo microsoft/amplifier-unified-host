@@ -717,3 +717,93 @@ agent for history or starts an execution worker.
 RPCs for shared registration/visibility; the host does not own workspace folders
 or mirror client selection. Native history and filesystem creation remain with
 their respective owners.
+
+# Held quiescence for restart and recovery
+
+An optional trusted `HostConfig.quiescence` closes execution intake before checking
+work. It is a supervisor/library API, not a browser-provided readiness claim.
+Configuration includes the actual launch `instanceId`, exact `dataScope`,
+`requiredOwners`, `coverage`, `participants`, and authenticated `verifyRelease`.
+
+```ts
+const result = await host.admitQuiescence({
+  commandId: durableJobId,
+  purpose: 'distribution-update', // or 'recovery'
+});
+if (result.admitted) {
+  // result.fenceId and result.commandId identify this exact durable intake gate.
+  // result.evidence: {activeWork:0, intakeClosed:true, instanceId, dataScope, observedAt}
+}
+```
+
+Known busy/no-effect admission returns `{admitted:false,executed:false,
+intakeClosed:false,reason,work?}`. Unknown acquisition, retirement, or release keeps
+`intakeClosed:true` and `fence.phase:'unknown'`. Retrying the same command reads its
+receipt, never repeats acquisition. `inspectQuiescence()` and
+`quiescenceReceipt(commandId)` are passive exact inspections. An existing gate
+survives process replacement, including a replacement accidentally omitting this
+configuration; it never opens on a timeout or restart.
+
+`coverage.capabilities` maps execution-capable manifest topics to owner IDs;
+`coverage.resources` maps writable URI schemes; `coverage.nativeHost` identifies
+the trusted native callback bridge owner. `requiredOwners` additionally names all
+execution authorities without those surfaces: timers, scheduling, voice, upload
+processing, native administration, and other background work. Each ID requires a
+real `QuiescenceParticipant`. Undeclared coverage refuses admission. A participant
+implements `acquire(context)` atomically, closing its intake and returning a held
+`{ownerId,fenceId,release}` lease, or `null` for a proven no-effect busy refusal.
+Sampling an idle flag is insufficient. Acquisition errors are uncertain. A durable
+participant implements `reconcileRelease` for its exact fence after replacement.
+Releasing a lease must be idempotent: recovery can revisit one whose release
+acknowledgement was lost. Owner intake must also honor the aggregate host gate
+until it is released, including when another owner's reconciliation is uncertain.
+
+The host checks admitted turns, finishing turns, controls, callbacks, approvals,
+client tools, terminal work, and preserved queued/steering intents. Viewer counts
+are irrelevant. Every resident agent must support negotiated atomic native
+`_amplifier/retire`: only a confirmed retired handle is closed. Busy owned work
+stays alive; unconfirmed retirement keeps intake fenced. Generic engines without
+this lifecycle proof cannot be declared safe for automatic restart. Native-home
+writer exclusion and external legacy writers require the separately configured
+native maintenance authority; the host does not claim filesystem-wide exclusion.
+
+Ordinary AHP mutations, resource writes, capability mutations, direct host
+admissions, native controls, and ACP filesystem/terminal effects pass the gate.
+Passive native inspection peers cannot request filesystem or terminal effects. Composition wraps other effects in
+`withExternalMutation(ownerId, callback)`. Existing result delivery can finish but
+cannot inherit permission to start new work. Passive reads, subscriptions,
+reconnection and receipt lookup remain available. Trusted composition may declare
+`capabilities.quiescenceAccess` by **exact manifest action name**, with value
+`'read'` or `'reconcile'`. Names are not heuristically classified. Such callbacks
+inherit no mutation admission; reads must be side-effect free, and reconciliation
+may only inspect/release an existing authoritative receipt/fence. It must not
+start, retry, or schedule work. Unclassified actions remain mutations. Pure
+read-only topics need no synthetic participant; background authorities still
+belong in `requiredOwners` even if all their advertised actions are reads.
+
+Recovery uses `withQuiescenceMaintenance({fenceId,commandId}, callback)` only after
+admission. The callback performs bounded trusted maintenance I/O while the exact
+gate is held. It cannot enter ordinary host/native execution methods, run alongside
+another maintenance callback, or release while the callback is pending. A thrown
+callback conservatively leaves the gate unknown. A recovery action must save and
+return its job before its background worker asks for quiescence; otherwise its own
+active action correctly prevents idle admission. A participant may exempt only
+that exact pre-effect coordinator job, never unrelated work.
+
+`releaseQuiescence({fenceId,commandId,outcome,evidence})` accepts `unknown` to retain
+the gate. `ready`/`unchanged` require `verifyRelease` to read authenticated,
+durable supervisor/recovery evidence and return `{verified:true,fenceId,
+commandId,outcome,instanceId,dataScope,receiptId}`. `ready` requires the currently
+running replacement identity to differ from the admitting instance; `unchanged`
+requires the same instance with a proven no-replacement/conclusive-maintenance
+outcome. Client assertions and an open socket do not prove this. The host opens
+intake only after exact proof and all participant releases succeed. No history,
+prompt, queue, uncertain operation, or mutation is replayed by reconciliation.
+The external supervisor must survive the child it replaces. Existing `close()`
+is shutdown, not an idle proof; restart composition must acquire this gate first.
+
+`onMayBeIdle` is an advisory wakeup after tracked work settles, not authorization.
+The next attempt uses a new durable command after the prior known busy result;
+unknown remains a reconciliation case. Acquisition/release callbacks have a
+bounded `timeoutMs` (25–30,000; default 10,000). The public gate API does not invent
+release version/digest, account readiness, or complete owner coverage.
