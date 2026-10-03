@@ -1,3 +1,4 @@
+import {ManagedFilesJournal,type ManagedFilesProtection,type ManagedFilesApply,type ManagedFilesActor} from './managed-files.js';
 import {ManagedAllocations,managedHash,type ManagedSessionCreate,type ManagedLocation} from './managed.js';
 import {Retention,type RetentionProtection,type RetentionPreviewRequest,type RetentionApplyRequest} from './retention.js';
 import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest} from './quiescence.js';
@@ -63,6 +64,7 @@ export interface HostConfig {
   defaultWorkingDirectory?:string;
   /** Private allocation owner; never grants workspace browsing or arbitrary cwd access. */
   managedSessionRoot?:string;
+  managedFilesProtection?:ManagedFilesProtection;
   quiescence?:QuiescenceConfig;
   /** SHA256 of this TransferNode's Ed25519 raw public key; never caller-selected. */
   transferIdentity?:string;
@@ -105,6 +107,7 @@ export class AmplifierHost {
   private peers=new Set<Peer>();
   private retention:Retention;
   private managed?:ManagedAllocations;
+  private managedFiles:ManagedFilesJournal;
   private retentionChanging=new Set<string>();
   private active=new Map<string,Active>();
   private starting=new Map<string,Promise<Active>>();
@@ -141,6 +144,7 @@ export class AmplifierHost {
     if(config.transferIdentity!==undefined&&!/^[a-f0-9]{64}$/.test(config.transferIdentity))throw new Error('transferIdentity must be an exact node public-key fingerprint');
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
     this.store=new Store(config.stateDirectory,config.replayLimit);
+    this.managedFiles=new ManagedFilesJournal(this.store.db);
     try{if(config.managedSessionRoot)this.managed=new ManagedAllocations(config.managedSessionRoot);}catch(error){this.store.close();throw error;}
     this.retention=new Retention(this.store.db,{list:async input=>{
       if(!config.catalog?.retentionCandidates)throw new RpcFault(-32601,'Catalog retention metadata is unavailable',{executed:false});
@@ -260,6 +264,8 @@ export class AmplifierHost {
     if(!location)return this.workspace(pathToFileURL(execution?(record.executionDirectory??record.workingDirectory):record.workingDirectory).href);
     const receipt=this.managed?.bySession(record.uri);
     if(!receipt||receipt.state!=='completed'||managedHash(location)!==managedHash(this.managed!.location(receipt))||record.nativeSessionId!==location.allocationId||record.engineId!==receipt.request.provider)throw new RpcFault(-32009,'Managed session has no confirmed local allocation authority');
+    const disposed=this.managedFiles.fence(record.uri);
+    if(disposed){if(execution)throw new RpcFault(-32011,'Managed files disposal prevents execution; inspect its receipt or create an independent recovery copy');if(record.workingDirectory!==receipt.marker.workspace)throw new RpcFault(-32009,'Disposed managed history identity differs');return receipt.marker.workspace;}
     const cwd=await this.managed!.inspect(receipt);
     if(record.workingDirectory!==cwd||execution&&(record.executionDirectory??cwd)!==cwd)throw new RpcFault(-32009,'Managed session directory differs from its allocation');
     return cwd;
@@ -355,7 +361,7 @@ export class AmplifierHost {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
     if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Passive native source is unavailable');
-    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    this.passiveReads++;const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try{
       const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
       if(capability?.version!==1||capability.paging!=='complete-turns'||capability.passive!==true||capability.passiveInspect!==true)throw new RpcFault(-32601,'Agent does not advertise revision-checked passive history');
@@ -395,7 +401,7 @@ export class AmplifierHost {
     const record=await this.record(session),engine=this.config.engines.find(engine=>engine.id===record.engineId);if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native worker index identity is unavailable');
     const live=this.active.get(record.uri)?.agent,owned=live&&!live.closed?live:undefined;
     if(!owned&&this.passiveReads>=4)throw new RpcFault(-32000,'Passive worker inspection capacity reached');
-    if(!owned)this.passiveReads++;const agent=owned??new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    if(!owned)this.passiveReads++;const agent=owned??new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try{
       const initialized=owned?owned.initialized:await agent.initialize(),capability=(initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.workers;
       if(capability?.version!==1||capability.passiveInspection!==true)throw new RpcFault(-32601,'Agent does not advertise passive worker inspection');
@@ -410,7 +416,7 @@ export class AmplifierHost {
     const record=await this.record(session),engine=this.config.engines.find(engine=>engine.id===record.engineId);
     if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Passive native task state is unavailable');
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
-    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    this.passiveReads++;const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try{
       const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.taskState;
       if(capability?.version!==1||capability.passive!==true)throw new RpcFault(-32601,'Agent does not advertise passive persisted task state');
@@ -441,7 +447,7 @@ export class AmplifierHost {
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
     if(!engine||!record.nativeSessionId)throw new RpcFault(-32000,'Native history reader is unavailable; no empty transcript was substituted');
     this.passiveReads++;
-    const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try {
       const init=await agent.initialize();
       const capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
@@ -587,7 +593,7 @@ export class AmplifierHost {
       }
       case 'dispatchAction':await this.dispatch(peer,p);return null;
       case 'x-amplifier/managedSession':if(p.channel!==ROOT)throw new RpcFault(-32602,'Managed creation uses the root channel');if(p.operation==='options')return this.managedSessionOptions(p.args);if(p.operation==='defaults')return this.managedSessionDefaults(p.args);if(p.operation==='models')return this.managedSessionModels(p.args);if(p.operation==='create')return this.createManagedSession(p.args);if(p.operation==='receipt'&&Object.keys(p.args??{}).length===1)return this.managedSessionReceipt(p.args.commandId);throw new RpcFault(-32602,'Unknown managed creation operation');
-      case 'x-amplifier/sessionLifecycle':return this.sessionLifecycleRequest(p.channel,p.operation,p.args??{});
+      case 'x-amplifier/sessionLifecycle':return this.sessionLifecycleRequest(p.channel,p.operation,p.args??{},{actorId:peer.clientId!,clientId:peer.clientId!});
       case 'x-commandReceipt': {
         const receipt=this.store.receipt(p.commandId);if(!receipt)throw new RpcFault(-32008,'Command receipt not found');
         if(receipt.channel!==ROOT)await this.record(receipt.channel);return receipt;
@@ -774,7 +780,7 @@ export class AmplifierHost {
   private async transferAgent<T>(record:SessionRecord,work:(agent:AcpProcess)=>Promise<T>) {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached',{executed:false});
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native transfer identity is unavailable',{executed:false});
-    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    this.passiveReads++;const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try{const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.transfer;if(capability?.version!==1||capability.passiveInspection!==true)throw new RpcFault(-32601,'Agent does not advertise passive native transfer authority',{executed:false});return await work(agent);}finally{this.passiveReads--;await agent.retire();}
   }
   private async nativeTransfer(agent:AcpProcess,record:SessionRecord,operation:string,transferId:string):Promise<Json> {
@@ -1028,15 +1034,17 @@ export class AmplifierHost {
   }
   private guardSessionLifecycle(session:string) {
     this.guardTransfer(session);
+    if(this.managedFiles.fence(session))throw new RpcFault(-32011,'Managed files disposal is fenced; inspect its receipt or create an independent recovery copy');
     const allocation=this.managed?.bySession(session);if(allocation&&allocation.state!=='completed')throw new RpcFault(-32011,'Managed creation is unresolved; inspect its original receipt without replay');
     if(this.store.db.prepare("SELECT 1 FROM import_adoptions WHERE session=? AND status<>'completed' LIMIT 1").get(session))throw new RpcFault(-32011,'Imported session registration is unresolved; inspect its exact receipt');
     if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(session,session))throw new RpcFault(-32011,'Session lifecycle outcome is unresolved; inspect the original receipt without replay');
     if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(session))throw new RpcFault(-32008,'Session was removed from discovery; restore it before execution');
   }
+  private passiveProcessDirectory(record:SessionRecord){return this.managedFiles.fence(record.uri)?this.defaultWorkingDirectory:record.workingDirectory;}
   private async lifecycleAgent<T>(record:SessionRecord,work:(agent:AcpProcess)=>Promise<T>):Promise<T> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native lifecycle identity is unavailable');
-    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    this.passiveReads++;const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try{const initialized=await agent.initialize(),capability=(initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle;if(capability?.version!==1||capability.passive!==true||capability.deletion!=='preserve-history')throw new RpcFault(-32601,'Agent does not advertise passive preserve-history lifecycle');return await work(agent);}finally{this.passiveReads--;await agent.retire();}
   }
   private async nativeLifecycle(agent:AcpProcess,record:SessionRecord,operation:string,args:Json={}) {
@@ -1085,7 +1093,7 @@ export class AmplifierHost {
     return this.withLock(record.uri,async()=>{this.emit(record.uri,{type:'session/isArchivedChanged',isArchived} as StateAction);const current=this.getRecord(record.uri)!;this.notify('root/sessionSummaryChanged',{channel:ROOT,session:record.uri,changes:{status:current.summary.status}});await this.syncCatalog(current);return {session:record.uri,isArchived};});
       });
   }
-  private async quiesceLifecycle(record:SessionRecord) {
+  private async quiesceLifecycle(record:Pick<SessionRecord,'uri'>) {
     const active=this.active.get(record.uri);if(!active)return;
     if(active.busy||active.controlDepth||this.starting.has(record.uri))throw new RpcFault(-32008,'Session has active work; lifecycle change was not executed',{executed:false});
     active.controlDepth=(active.controlDepth??0)+1;
@@ -1154,12 +1162,15 @@ export class AmplifierHost {
     const descendants:Json[]=[];
     for(const row of family.items){
       const parent=row.parentUri&&rows.get(row.parentUri);if(!parent||!parent.nativeSessionId||!row.nativeSessionId||row.engineId!==record.engineId||parent.engineId!==row.engineId)throw new RpcFault(-32011,'Descendant ownership belongs to an unavailable engine or parent',{executed:false});
-      await this.workspace(pathToFileURL(row.workingDirectory).href);
+      // A proved allocation authorizes only this bounded native family check,
+      // never browsing, hydration, or execution of an arbitrary child cwd.
+      if(record.state._meta?.['amplifier.dev/location']&&row.workingDirectory===record.workingDirectory)await this.selectedWorkspace(record);
+      else await this.workspace(pathToFileURL(row.workingDirectory).href);
       descendants.push({sessionId:row.nativeSessionId,cwd:row.workingDirectory,parentSessionId:parent.nativeSessionId});
     }
     const lock=async(index:number):Promise<T>=>{
       if(index<family.items.length)return this.withLock(family.items[index].uri,()=>lock(index+1));
-      for(const row of family.items){validate?.(row);const child=await this.record(row.uri);this.guardSessionLifecycle(child.uri);if(this.store.unknown(child.chat.resource)||child.chat.activeTurn||this.relocationFence(child.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle(child);}
+      for(const row of family.items){validate?.(row);const child=this.getRecord(row.uri);if(child&&(child.engineId!==row.engineId||child.nativeSessionId!==row.nativeSessionId||child.workingDirectory!==row.workingDirectory))throw new RpcFault(-32011,'Indexed descendant differs from its admitted identity',{executed:false});this.guardSessionLifecycle(row.uri);if(this.store.unknown(chatURI(row.uri))||child?.chat.activeTurn||this.relocationFence(row.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle({uri:row.uri});}
       if((await catalog.descendants!({parentUri:record.uri,limit:100})).revision!==family.revision)throw new RpcFault(-32011,'Indexed family changed while acquiring ownership',{executed:false});
       return work(descendants,family.items.map(row=>row.uri));
     };
@@ -1173,7 +1184,7 @@ export class AmplifierHost {
       const previous=this.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(args.commandId);
       if(previous){if(previous.session!==record.uri||previous.operation!==operation||previous.payload!==JSON.stringify(args))throw new RpcFault(-32011,'Lifecycle command ID conflicts with its original request');if(previous.status==='completed')return JSON.parse(String(previous.result));throw new RpcFault(-32011,'Original lifecycle receipt is not completed; inspect it without replay',{receipt:args.commandId,outcome:previous.status,executed:previous.status==='failed'?false:undefined});}
       this.guardTransfer(record.uri);
-      if(!['restore','legacyCopy.purge'].includes(operation))this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
+      if(!['restore','legacyCopy.purge'].includes(operation)&&!((operation==='export'||operation==='fork'&&args.mode==='recovery')&&this.managedFiles.fence(record.uri)?.status==='completed'))this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
       if(this.store.unknown(record.chat.resource)&&!(operation==='fork'&&args.mode==='recovery')||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
       if(this.config.catalog&&['delete','restore'].includes(operation)&&!this.config.catalog.setVisibility)throw new RpcFault(-32601,'Catalog cannot project native visibility',{executed:false});
       await this.quiesceLifecycle(record);
@@ -1207,6 +1218,88 @@ export class AmplifierHost {
       });
   }
   async forkSession(session:string,args:{commandId:string;expectedHistoryRevision:string;throughMessageId?:string;title?:string;mode?:'complete'|'recovery';bundle?:string;bundleRevision?:string;resetModel?:boolean}) {return this.mutateLifecycle(session,'fork',args);}
+  private managedFilesActor(actor:ManagedFilesActor){if(!actor||typeof actor.actorId!=='string'||!actor.actorId||actor.actorId.length>200||actor.clientId!==undefined&&(typeof actor.clientId!=='string'||!actor.clientId||actor.clientId.length>200))throw new RpcFault(-32602,'Trusted actor identity required',{executed:false});}
+  private managedFilesMember(uri:string,protect:string[],actor:ManagedFilesActor){
+    const chat=uri.replace('ahp-session:','ahp-chat:');
+    if(protect.includes(uri)||[...this.peers].some(peer=>peer.clientId!==actor.clientId&&(peer.subscriptions.has(uri)||peer.subscriptions.has(chat))))throw new RpcFault(-32008,'Another selected client or protected session retains this allocation',{executed:false});
+    if(this.retentionChanging.has(uri)||this.active.get(uri)?.busy||this.active.get(uri)?.controlDepth||this.starting.has(uri)||this.store.unknown(chat)||this.store.db.prepare("SELECT 1 FROM queue_intents WHERE chat=? AND status='pending' UNION ALL SELECT 1 FROM steering_intents WHERE chat=? AND status IN ('pending','dispatching','unknown') LIMIT 1").get(chat,chat))throw new RpcFault(-32008,'Active, pending or unknown work protects managed files',{executed:false});
+    this.guardSessionLifecycle(uri);if(this.relocationFence(uri))throw new RpcFault(-32008,'Execution ownership transition protects managed files',{executed:false});
+  }
+  private managedFilesGuard(record:SessionRecord,protect:string[],actor:ManagedFilesActor){
+    if(!record.state._meta?.['amplifier.dev/location']||!this.managed)throw new RpcFault(-32601,'Only proved managed allocation files can be disposed',{executed:false});
+    const coverage=this.config.managedFilesProtection?.managedFiles;if(coverage?.version!==1||coverage.preservesCanonical!==true)throw new RpcFault(-32601,'Distinct dependent-owner managed-files protection is unavailable',{executed:false});
+    this.managedFilesMember(record.uri,protect,actor);
+  }
+  private managedFilesProtect(value:unknown){if(value===undefined)return [];if(!Array.isArray(value)||value.length>200||value.some(id=>typeof id!=='string'||!id.startsWith('ahp-session:/')||id.length>500))throw new RpcFault(-32602,'Bounded protected session IDs required',{executed:false});return value as string[];}
+  async previewManagedFiles(session:string,input:{protectSessionIds?:string[]}={},actor:ManagedFilesActor){
+    return this.intake.run(async()=>{this.managedFilesActor(actor);if(!input||Object.keys(input).some(k=>k!=='protectSessionIds'))throw new RpcFault(-32602,'Managed files preview accepts protected identities only',{executed:false});const protect=this.managedFilesProtect(input.protectSessionIds),record=await this.record(session);
+      return this.withLock(record.uri,async()=>{this.managedFilesGuard(record,protect,actor);await this.quiesceLifecycle(record);return this.withLifecycleFamily(record,true,()=>this.lifecycleAgent(record,async agent=>{
+        const cap=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.sessionLifecycle?.managedFiles;if(cap?.version!==1||cap.preservesCanonical!==true)throw new RpcFault(-32601,'Configured engine has no reviewed managed-file disposal',{executed:false});
+        const result=await this.nativeLifecycle(agent,record,'managedFiles.preview'),allocation=this.managed!.bySession(record.uri)!;
+        if(result.sessionId!==record.nativeSessionId||result.historyCwd!==record.workingDirectory||result.allocationId!==record.nativeSessionId||result.allocationHash!==allocation.marker.allocationHash||result.preservesCanonical!==true||result.manifestComplete!==true||result.canonicalFilesDeleted!==0||result.eventsDeleted!==0||typeof result.reviewId!=='string'||!result.reviewId||result.reviewId.length>200||typeof result.historyRevision!=='string'||!result.historyRevision||result.historyRevision.length>200||![result.reviewHash,result.treeHash].every(v=>typeof v==='string'&&/^[a-f0-9]{64}$/.test(v))||!Number.isFinite(result.expiresAt)||result.expiresAt<=Date.now()/1000||result.expiresAt>Date.now()/1000+601||!Number.isSafeInteger(result.entryCount)||result.entryCount<1||result.entryCount>10000||!Number.isSafeInteger(result.bytes)||result.bytes<0||result.bytes>256*1024*1024)throw new RpcFault(-32000,'Invalid bounded native managed-files review');
+        const saved={...result,session:record.uri,actorId:actor.actorId,protectSessionIds:protect};this.managedFiles.saveReview(saved);return {...result,session:record.uri,operation:'dispose-owned-files',dependencyCheck:'held-at-apply'};
+      }),row=>this.managedFilesMember(row.uri,protect,actor));});});
+  }
+  managedFilesEffectReceipt(session:string,commandId:string){return this.managedFiles.receipt(session,commandId)??null;}
+  readManagedFilesEffectReceipt(session:string,commandId:string){return this.managedFilesEffectReceipt(session,commandId);}
+  private async projectManagedFiles(record:SessionRecord,effect:Json){
+    this.store.db.prepare('INSERT INTO session_visibility VALUES(?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=1,command_id=excluded.command_id').run(record.uri,1,effect.commandId);
+    if(this.config.catalog){if(!this.config.catalog.setVisibility)throw new Error('Catalog cannot project confirmed disposal');await this.config.catalog.setVisibility({uri:record.uri,nativeSessionId:record.nativeSessionId!,workingDirectory:record.workingDirectory,deleted:true,commandId:effect.commandId,evidence:'native-completed-receipt'});}
+    this.store.db.prepare('UPDATE sessions SET hidden=1 WHERE uri=?').run(record.uri);this.emit(record.uri,{type:'session/metaChanged',_meta:{...record.state._meta,'amplifier.dev/lifecycle':{version:1,deleted:true,managedFilesDisposed:true,preservesCanonical:true,receipt:effect.commandId}}} as StateAction);this.notify('root/sessionRemoved',{channel:ROOT,session:record.uri});this.managedFiles.update({...effect,projection:'completed'});this.store.finish(effect.commandId,'completed');
+  }
+  private confirmManagedFiles(record:SessionRecord,effect:Json,native:Json){
+    const result=native?.receipt?.result??native,allocation=effect.allocation;
+    if(native.receipt?.status!=='completed'||native.receipt.commandId!==effect.commandId||native.receipt.operation!=='managedFiles.dispose'||result.commandId!==effect.commandId||result.sessionId!==record.nativeSessionId||result.historyCwd!==record.workingDirectory||result.reviewHash!==effect.reviewHash||result.reviewId!==effect.request.reviewId||result.historyRevision!==effect.request.expectedHistoryRevision||result.allocationId!==allocation.allocationId||result.allocationHash!==allocation.allocationHash||result.treeHash!==allocation.treeHash||result.entryCount!==allocation.entryCount||result.bytes!==allocation.bytes||result.preservesCanonical!==true||result.directoryRemoved!==true||result.canonicalFilesDeleted!==0||result.eventsDeleted!==0||result.familyGuard?.ownersHeld!==true||result.familyGuard.count!==effect.familyCount)throw new Error('Managed disposal has no exact durable native completion proof');
+    const confirmed={...effect,status:'completed',projection:'pending',native:result};this.managedFiles.update(confirmed);return confirmed;
+  }
+  async disposeManagedFiles(session:string,input:ManagedFilesApply,actor:ManagedFilesActor){
+    return this.intake.run(async()=>{
+      this.managedFilesActor(actor);if(!input||Object.keys(input).some(k=>!['commandId','reviewId','reviewHash','expectedHistoryRevision','protectSessionIds'].includes(k))||![input.commandId,input.reviewId,input.expectedHistoryRevision].every(v=>typeof v==='string'&&v.length>0&&v.length<=200)||typeof input.reviewHash!=='string'||!/^[a-f0-9]{64}$/.test(input.reviewHash))throw new RpcFault(-32602,'Exact managed-files review and command required',{executed:false});
+      const protect=this.managedFilesProtect(input.protectSessionIds),signature=managedHash({input,actorId:actor.actorId});
+      const previous=()=>{const prior=this.managedFiles.command(input.commandId);if(!prior)return;if(prior.session!==session||prior.signature!==signature)throw new RpcFault(-32011,'Disposal command differs from its original request',{executed:false});return this.managedFilesEffectReceipt(session,input.commandId);};
+      const record=await this.record(session),prior=previous();if(prior)return prior;
+      return this.withLock(record.uri,async()=>{
+        const prior=previous();if(prior)return prior;
+        this.managedFilesGuard(record,protect,actor);const review=this.managedFiles.review(input.reviewId);if(!review||review.session!==session||review.actorId!==actor.actorId||review.reviewHash!==input.reviewHash||review.historyRevision!==input.expectedHistoryRevision||review.expiresAt<=Date.now()/1000||managedHash(review.protectSessionIds)!==managedHash(protect))throw new RpcFault(-32011,'Managed files review expired, changed or belongs to another actor',{executed:false});
+        const allocation={allocationId:review.allocationId,executionDirectory:record.workingDirectory,allocationHash:review.allocationHash,treeHash:review.treeHash,entryCount:review.entryCount,bytes:review.bytes};
+        const effect:Json={commandId:input.commandId,session,reviewHash:input.reviewHash,operation:'dispose-owned-files',status:'unknown',preservesCanonical:true,request:input,allocation,projection:'pending'};
+        const fenced=new Set<string>();const fence=(uri:string)=>{this.retentionChanging.add(uri);this.retentionChanging.add(uri.replace('ahp-session:','ahp-chat:'));fenced.add(uri);};fence(session);
+        try{await this.quiesceLifecycle(record);return await this.withLifecycleFamily(record,true,async(descendants,sessions)=>{
+          effect.descendants=sessions;effect.familyCount=descendants.length;
+          this.store.transaction(()=>{this.store.admission(session,{operation:'dispose-owned-files',input},input.commandId,'host:managed-files',this.store.extensionSequence('host:managed-files'));this.managedFiles.reserve(session,input.commandId,signature,effect);this.store.finish(input.commandId,'dispatching');});
+          let lease:Awaited<ReturnType<ManagedFilesProtection['acquire']>>|undefined,dispatched=false;
+          const settleError=(error:any,known:boolean)=>{this.managedFiles.update({...effect,status:known?'refused':'unknown',...(known?{executed:false}:{}),reason:String(error.message).slice(0,1000)});this.store.finish(input.commandId,known?'failed':'unknown');return new RpcFault(-32011,String(error.message),{receipt:input.commandId,outcome:known?'refused':'unknown',...(known?{executed:false}:{})});};
+          try{
+            lease=await this.config.managedFilesProtection!.acquire({commandId:input.commandId,session,descendants:sessions,operation:'dispose-owned-files',reviewHash:input.reviewHash,allocation});
+            if(!lease||!Array.isArray(lease.ownerIds)||!lease.ownerIds.length||lease.ownerIds.length>64||lease.ownerIds.some(id=>typeof id!=='string'||!id)||typeof lease.release!=='function')throw new Error('Managed files protection did not supply held owner coverage');
+            return await this.lifecycleAgent(record,async agent=>{
+              try{
+                const cap=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.sessionLifecycle?.managedFiles;if(cap?.version!==1||cap.preservesCanonical!==true)throw new RpcFault(-32601,'Native reviewed disposal is unavailable',{executed:false});
+                dispatched=true;const native=await this.nativeLifecycle(agent,record,'managedFiles.dispose',{commandId:input.commandId,reviewId:input.reviewId,reviewHash:input.reviewHash,expectedHistoryRevision:input.expectedHistoryRevision,descendants});const confirmed=this.confirmManagedFiles(record,effect,native);await this.projectManagedFiles(record,confirmed);return this.managedFilesEffectReceipt(session,input.commandId);
+              }catch(error){
+                let proof:Json|undefined;if(dispatched)try{proof=await this.nativeLifecycle(agent,record,'managedFiles.receipt',{commandId:input.commandId});}catch{}
+                if(proof?.receipt?.status==='completed'){const confirmed=this.confirmManagedFiles(record,effect,{...proof.receipt.result,receipt:proof.receipt});try{await this.projectManagedFiles(record,confirmed);}catch{}return this.managedFilesEffectReceipt(session,input.commandId);}
+                // A missing receipt alone does not prove no effect: an earlier
+                // request may still be running after a transport timeout.
+                throw settleError(error,!dispatched||(error as any)?.data?.executed===false&&proof?.receipt===null);
+              }
+            });
+          }catch(error){
+            if(this.managedFilesEffectReceipt(session,input.commandId)?.status==='unknown'&&!dispatched)throw settleError(error,(error as any)?.data?.executed===false||!!lease&&typeof lease.release==='function');
+            throw error;
+          }finally{
+            if(lease&&typeof lease.release==='function')try{await lease.release();this.managedFiles.update({...this.managedFilesEffectReceipt(session,input.commandId),protectionRelease:'confirmed'});}catch(error){this.managedFiles.update({...this.managedFilesEffectReceipt(session,input.commandId),protectionRelease:'unconfirmed'});throw new RpcFault(-32011,'Managed files protection release is unresolved; inspect original receipt',{receipt:input.commandId,outcome:this.managedFilesEffectReceipt(session,input.commandId)?.status,protectionRelease:'unconfirmed'});}
+          }
+        },row=>{this.managedFilesMember(row.uri,protect,actor);fence(row.uri);});}finally{for(const uri of fenced){this.retentionChanging.delete(uri);this.retentionChanging.delete(uri.replace('ahp-session:','ahp-chat:'));}}
+      });
+    });
+  }
+  async managedFilesReceipt(session:string,commandId:string){
+    if(typeof commandId!=='string'||!commandId||commandId.length>200)throw new RpcFault(-32602,'Bounded original managed-files command required');
+    const record=await this.record(session),effect=this.managedFilesEffectReceipt(session,commandId);if(!effect)return null;if(effect.status==='refused'||effect.status==='completed'&&effect.projection==='completed')return effect;
+    return this.intake.inspectOnly(()=>this.withLock(session,async()=>{let confirmed=effect;if(effect.status!=='completed'){const proof=await this.lifecycleAgent(record,agent=>this.nativeLifecycle(agent,record,'managedFiles.receipt',{commandId}));if(proof?.receipt?.status==='completed')confirmed=this.confirmManagedFiles(record,effect,{...proof.receipt.result,receipt:proof.receipt});}
+      if(confirmed.status==='completed'&&!this.intake.inspect().intakeClosed)await this.intake.run(()=>this.projectManagedFiles(record,confirmed));return this.managedFilesEffectReceipt(session,commandId);}));
+  }
   /** Selected retired copy operations never accept filesystem paths or start an agent runtime. */
   async inventoryRetiredCopies(session:string) {return this.readRetiredCopies(session,'legacyCopy.inventory',{});}
   async previewRetiredCopyPurge(session:string,input:{rootId:string}) {
@@ -1242,8 +1335,9 @@ export class AmplifierHost {
     if(result.offset!==offset||result.encoding!=='base64'||typeof result.data!=='string'||Buffer.byteLength(result.data,'base64')>limit||result.contentHash!==metadata.contentHash||result.nextOffset!==null&&result.nextOffset!==offset+Buffer.byteLength(result.data,'base64'))throw new RpcFault(-32000,'Native export page failed its immutable bounded contract');
     return {data:result.data,encoding:'base64',offset:result.offset,nextOffset:result.nextOffset,contentHash:metadata.contentHash,mimeType:metadata.mimeType,totalBytes:metadata.summary.bytes};
   }
-  private sessionLifecycleRequest(session:string,operation:string,args:Json) {
+  private sessionLifecycleRequest(session:string,operation:string,args:Json,actor?:ManagedFilesActor) {
     if(typeof session!=='string'||!session.startsWith('ahp-session:/'))throw new RpcFault(-32602,'Selected session channel required');
+    if(operation==='managedFiles.preview')return this.previewManagedFiles(session,args,actor!);if(operation==='managedFiles.dispose')return this.disposeManagedFiles(session,args as ManagedFilesApply,actor!);if(operation==='managedFiles.receipt')return this.managedFilesReceipt(session,args.commandId);
     if(operation==='history.refresh')return this.refreshSessionHistory(session,args);if(operation==='history.revise')return this.reviseHistory(session,args as any);if(operation==='inspect')return this.inspectSessionHistory(session);if(operation==='delete.preview')return this.previewDeleteSession(session);if(operation==='receipt')return this.inspectSessionLifecycleReceipt(session,args.commandId);
     if(operation==='legacyCopy.inventory')return this.inventoryRetiredCopies(session);if(operation==='legacyCopy.preview')return this.previewRetiredCopyPurge(session,args as any);if(operation==='legacyCopy.receipt')return this.retiredCopyPurgeReceipt(session,args.commandId);
     if(['fork','export','delete','restore','legacyCopy.purge'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
@@ -2065,7 +2159,7 @@ export class AmplifierHost {
     if(!record.nativeSessionId)throw new RpcFault(-32008,'Native identity is unavailable');
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
     const engine=this.config.engines.find(e=>e.id===record.engineId);if(!engine)throw new RpcFault(-32008,'Native engine is unavailable');
-    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
+    this.passiveReads++;const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive native inspection cannot perform filesystem or terminal effects');}});
     try {
       const initialized=await agent.initialize();
       if((initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.relocation?.version!==1)throw new RpcFault(-32601,'Native relocation was not negotiated');

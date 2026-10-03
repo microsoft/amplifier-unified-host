@@ -1133,3 +1133,49 @@ Only the selected provider's public metadata API runs (which may use network or
 prepare dependencies). No Core runtime, session allocation, or prompt occurs.
 Responses preserve exact bundle selection, `modelsSupported`, and
 `runtimeStarted:false`. A discovered model is not a readiness assertion.
+
+### Reviewed managed allocation files
+
+Optional `managedFilesProtection` is a distinct held reference-owner contract;
+retention-hide coverage never grants file removal. Its marker must be
+`{managedFiles:{version:1,preservesCanonical:true}}`. `acquire` receives the exact
+command/session, bounded descendant identities, `operation:'dispose-owned-files'`,
+reviewHash and allocation `{allocationId,executionDirectory,allocationHash,
+treeHash,entryCount,bytes}`. It must hold every configured product owner's intake
+and file-reference protection and return `{ownerIds,release}`. Missing, partial,
+retained or uncertain reference coverage refuses; no no-op adapter is supported.
+
+`previewManagedFiles(session,{protectSessionIds?},{actorId,clientId?})` performs a
+bounded selected native review without starting a runtime. `disposeManagedFiles`
+uses `{commandId,reviewId,reviewHash,expectedHistoryRevision,protectSessionIds?}`
+and the same authenticated actor. It fences source/family admissions and other
+selected clients, acquires real owner protection, then invokes the negotiated
+native storage owner. No filesystem path supplied by a client confers ownership.
+The caller's selected client may review its own chat; other selected clients and
+explicit protect IDs refuse. Dirty drafts remain private to each client.
+
+`readManagedFilesEffectReceipt(session,commandId)` is a local passive coordinator
+read. It returns `{commandId,session,reviewHash,operation:'dispose-owned-files',
+status:'completed'|'refused'|'unknown',preservesCanonical:true,allocation,request,
+descendants,familyCount,projection:'pending'|'completed',native?,executed?,
+protectionRelease?}`. `executed:false` appears only on conclusive no-effect
+refusal. `completed` proves the exact native durable file effect, written before
+catalog repair or owner release. `protectionRelease:'unconfirmed'` does not erase
+completed effect evidence or grant permission to replay. Duplicate commands read
+the same journal and never perform removal again. Changed command arguments or
+actor identity refuse. `managedFilesReceipt` additionally queries the original
+native receipt and repairs derived catalog projection; it never repeats removal.
+The browser wire uses existing `x-amplifier/sessionLifecycle` operations
+`managedFiles.preview`, `managedFiles.dispose`, `managedFiles.receipt`.
+
+Canonical native metadata/transcript/events and ownership journals are preserved.
+Unknown stages and receipts remain fenced. Historical reads use the original
+native identity and a valid private process cwd, never recreate the removed
+folder. After confirmed disposal, an explicit recovery fork creates a new owned
+allocation; old execution and restore-by-unhiding refuse. Known descendants in
+the same private allocation are checked only under the source's proved authority,
+without hydrating them or granting general managed-directory browsing. Native
+family membership must match the product-reviewed family before file effects.
+Foundation's public retained historical identity support is required; generic
+engines without the capability are explicitly unsupported. These ownership gates
+do not freeze non-cooperating external filesystem editors.

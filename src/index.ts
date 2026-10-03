@@ -11,3 +11,5 @@ export type {QuiescenceFence,QuiescenceConfig,QuiescenceParticipant,QuiescenceLe
 export type {RetentionProtection,RetentionPreviewRequest,RetentionApplyRequest} from './retention.js';
 
 export type {ManagedSessionCreate,ManagedLocation} from './managed.js';
+
+export type {ManagedFilesProtection,ManagedFilesActor,ManagedFilesApply} from './managed-files.js';
