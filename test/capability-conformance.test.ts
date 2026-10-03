@@ -55,3 +55,18 @@ test('new command IDs obey the published bound without truncation; legacy durabl
   const unicode='🧪'.repeat(256);await host.invokeCapability(action(unicode),{actorId:'conformance'});assert.equal(calls[1].action.commandId,unicode);await assert.rejects(host.invokeCapability(action(unicode+'x'),{actorId:'conformance'}),/256/);
  }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
 });
+
+test('trusted native origin survives a root-scoped action without accepting client session claims',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-capability-origin-')),calls:any[]=[],config=configuration(directory,calls),one='ahp-session:/one',two='ahp-session:/two';
+ const rows=new Map([one,two].map(uri=>[uri,{uri,engineId:'unused',nativeSessionId:uri.slice('ahp-session:/'.length),workingDirectory:directory,title:uri,createdAt:new Date().toISOString(),modifiedAt:new Date().toISOString(),status:'historical',kind:'root',availability:'available',workspaceAvailability:'present'}]));
+ const host=await createHost({...config,catalog:{list:async()=>({items:[...rows.values()]}),get:async(uri:string)=>rows.get(uri)??null,upsert:async(record:any)=>record} as any}),client=await connect(host);
+ try{
+  await host.invokeCapability({...action('native-root'),args:{sessionId:one}},{actorId:'native:one',origin:'agent',session:one});assert.equal(calls[0].context.session.uri,one);
+  await host.invokeCapability({...action('native-foreign-args'),args:{sessionId:two}},{actorId:'native:one',origin:'agent',session:one});assert.equal(calls[1].context.session.uri,one,'Arguments cannot replace authenticated native origin; the owner validates its own selector');
+  for(const actor of [{actorId:'ui',origin:'ui' as const,session:one},{actorId:'unspecified',session:one}])await assert.rejects(host.invokeCapability(action('bad-'+actor.actorId),actor),/trusted agent/);
+  await assert.rejects(host.invokeCapability(action('foreign-channel','selected',two),{actorId:'native:one',origin:'agent',session:one}),/differs/);
+  await assert.rejects(client.request('x-commandReceipt' as any,{channel:ROOT,commandId:'foreign-channel'} as any),/not found/);
+  await client.request('x-amplifier/capabilityAction' as any,{...action('client-claim'),args:{sessionId:one},actor:{origin:'agent',session:one},session:one} as any);assert.equal(calls[2].context.session,undefined);assert.equal(calls[2].context.origin,'ui');
+  await host.invokeCapability(action('native-context','selected',one),{actorId:'native:one',origin:'agent',session:one});assert.equal(calls[3].context.session.uri,one);assert.equal(host.diagnostics().activeAgents,0);
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});

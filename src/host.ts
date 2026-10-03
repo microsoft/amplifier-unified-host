@@ -2240,7 +2240,7 @@ export class AmplifierHost {
   /** Advertised tools only: no client drafts, DOM, editing buffers or rendered state. */
   async listClientTools(session:string) {const record=await this.record(session);return structuredClone(record.state.activeClients);}
   /** Shared admission path for authenticated clients and trusted native-host callbacks. */
-  async invokeCapability(request:Json,actor:{actorId:string;clientId?:string;origin?:'agent'|'ui'}) {
+  async invokeCapability(request:Json,actor:{actorId:string;clientId?:string;origin?:'agent'|'ui';session?:string}) {
     const provider=this.config.capabilities;
     const namedAction=Object.entries(provider?.manifest.actions??{}).find(([,action])=>action.topic===request.topic&&action.operation===request.operation&&action.method==='x-amplifier/capabilityAction');
     const access=namedAction&&provider?.quiescenceAccess?.[namedAction[0]];
@@ -2248,7 +2248,10 @@ export class AmplifierHost {
     if(!provider||request.version!==1||!Object.values(provider.manifest.actions).some(action=>action.topic===request.topic&&action.operation===request.operation&&action.method==='x-amplifier/capabilityAction'))throw new RpcFault(-32601,'Capability action/version not advertised');
     if(typeof request.commandId!=='string'||!request.commandId||request.commandId.length>512||[...request.commandId].length>256||typeof actor.actorId!=='string'||!actor.actorId)throw new RpcFault(-32602,'Capability commandId must contain 1 to 256 characters and actor identity is required',{executed:false});
     if(provider.manifest.topics[request.topic]?.scope==='host'&&request.channel!==ROOT)throw new RpcFault(-32602,'Host capability action requires the root channel',{executed:false});
-    const session=request.channel===ROOT?undefined:await this.record(request.channel);
+    if(actor.session!==undefined&&(actor.origin!=='agent'||typeof actor.session!=='string'||!actor.session.startsWith('ahp-session:/')))throw new RpcFault(-32602,'Only trusted agent embedding may bind an originating session',{executed:false});
+    const channelSession=request.channel===ROOT?undefined:await this.record(request.channel);
+    const session=actor.session===undefined?channelSession:await this.record(actor.session);
+    if(channelSession&&session?.uri!==channelSession.uri)throw new RpcFault(-32602,'Capability channel differs from the trusted agent session',{executed:false});
     this.store.transaction(()=>this.store.admission(request.channel,request,request.commandId,actor.actorId,this.store.extensionSequence(actor.actorId)));
     this.store.finish(request.commandId,'dispatching');
     try {const result=await provider.action(request,{actorId:actor.actorId,clientId:actor.clientId??'',origin:actor.origin??'ui',session});this.store.finish(request.commandId,result.accepted?'completed':'failed');for(const topic of result.invalidate??[])this.invalidateCapability(topic,request.channel===ROOT?'host':request.channel);for(const update of result.updates??[])this.invalidateCapability(update.topic,update.scope);return result;}

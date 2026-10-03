@@ -1199,3 +1199,12 @@ public extension schema. IDs are never truncated. Existing durable receipts,
 including 257–512-character IDs admitted by earlier builds, remain available
 through passive `x-commandReceipt` after restart. Re-reading a receipt does not
 re-admit or replay its effect.
+
+Trusted native embedding may pass `invokeCapability(request, {actorId,
+origin:'agent', session})` to retain the authenticated originating conversation
+when a host-only action uses the root channel. The host resolves that exact
+session; a non-root channel must resolve to the same identity. UI actors cannot
+set this binding. The WebSocket handler never derives it from request fields,
+`args.sessionId`, or client metadata. Providers continue to authorize their typed
+selectors against `context.session`; routing an action on the root channel does
+not grant agents authority over other sessions.
