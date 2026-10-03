@@ -11,8 +11,11 @@ export class StdioCatalog implements Catalog {
   private stderr='';
   private maintenance?:ReturnType<typeof setInterval>;
   private closed=false;
+  private exited:Promise<void>;
+  private shutdown?:Promise<void>;
   constructor(readonly config:CatalogProcessConfig) {
     this.process=spawn(config.command,config.args??[],{env:{...process.env,...config.env},stdio:'pipe'});
+    this.exited=new Promise(resolve=>this.process.once('close',()=>resolve()));
     this.process.stdout.setEncoding('utf8');
     this.process.stderr.on('data',chunk=>{this.stderr=(this.stderr+chunk.toString()).slice(-8192);});
     this.process.stdout.on('data',(chunk:string)=>{
@@ -22,7 +25,7 @@ export class StdioCatalog implements Catalog {
         const line=this.buffer.slice(0,newline);this.buffer=this.buffer.slice(newline+1);
         let message;try{message=JSON.parse(line);}catch{this.fail(new Error('Malformed catalog protocol frame'));this.process.kill();return;}
         const pending=this.pending.get(message.id);if(!pending)continue;this.pending.delete(message.id);clearTimeout(pending.timer);
-        if(message.error)pending.reject(Object.assign(new Error(message.error.message),{code:message.error.code}));else pending.resolve(message.result);
+        if(message.error)pending.reject(Object.assign(new Error(message.error.message),{code:message.error.code,catalogResponseSettled:true}));else pending.resolve(message.result);
       }
     });
     this.process.on('error',error=>this.fail(error));this.process.on('close',()=>this.fail(new Error('Catalog process closed')));
@@ -50,11 +53,21 @@ export class StdioCatalog implements Catalog {
   retentionCandidates(params:Parameters<NonNullable<Catalog['retentionCandidates']>>[0]){const {protectSessionIds,...query}=params;return this.request('retentionCandidates',query);}
   descendants(params:{parentUri:string;limit:number}){return this.request('descendants',params);}
   directoryInUse(path:string){return this.request('directoryInUse',{path});}
-  hint(sessionDirectory:string){return this.request('hint',{sessionDirectory});}
+  async hint(sessionDirectory:string,_context?:{attemptId:string}){try{return await this.request('hint',{sessionDirectory});}catch(error){
+    // A timed-out RPC can still be writing. Join this owned process's actual exit
+    // before claiming discovery is quiet; a kill signal or new PID is not proof.
+    if(!(error as any)?.catalogResponseSettled)await this.close();throw Object.assign(error instanceof Error?error:new Error(String(error)),{catalogDiscoverySettled:true});
+  }}
   listWorkspaces(params:Record<string,unknown>){return this.request('listWorkspaces',params);}
   getWorkspace(params:{id:string}){return this.request('getWorkspace',params);}
   projectWorkspaces(params:Record<string,unknown>){return this.request('projectWorkspaces',params);}
   workspaceProjectionStatus(params:{source:string}){return this.request('workspaceProjectionStatus',params);}
   diagnostics(){return {closed:this.closed,pending:this.pending.size,stderrTail:this.stderr};}
-  async close(){clearInterval(this.maintenance);this.fail(new Error('Catalog closed by owner'));this.process.stdin.end();await Promise.race([new Promise<void>(resolve=>this.process.once('close',()=>resolve())),new Promise<void>(resolve=>setTimeout(resolve,1000))]);if(this.process.exitCode===null)this.process.kill();}
+  async close(){
+    if(this.shutdown)return this.shutdown;
+    this.shutdown=(async()=>{clearInterval(this.maintenance);this.fail(new Error('Catalog closed by owner'));this.process.stdin.end();
+      const terminate=setTimeout(()=>this.process.kill('SIGTERM'),1000),kill=setTimeout(()=>this.process.kill('SIGKILL'),2000);
+      try{await this.exited;}finally{clearTimeout(terminate);clearTimeout(kill);}
+    })();return this.shutdown;
+  }
 }

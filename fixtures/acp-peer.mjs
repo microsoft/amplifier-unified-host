@@ -69,6 +69,9 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     },50);
   }
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.stop'){clearInterval(background);background=undefined;reply(message.id,{});}
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.history.persisted'){
+    send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'history.persisted',metadataPath:p.args.metadataPath}}});reply(message.id,{});
+  }
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.runtime.loss'){
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});setTimeout(()=>process.exit(17),20);
   }
@@ -111,7 +114,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   }
   else if(message.method==='_amplifier/native'&&p.operation==='configuration.snapshot')reply(message.id,{version:1,sourceSessionId:p.sessionId,sourceCwd:process.cwd(),configurationHash:'fixture-native-config'});
   else if(message.method==='_amplifier/session/new'){if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({creation:p})+'\n');if(process.env.FIXTURE_CLONE_CRASH)process.exit(17);sessions.set(p.sessionId,{});reply(message.id,{sessionId:p.sessionId,configOptions:[],_meta:{'amplifier.dev/native':{creationConfirmed:true,configurationHash:p.source.configurationHash}}});}
-  else if(message.method==='session/new'){const sessionId='native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});reply(message.id,{sessionId,...(process.env.FIXTURE_LEGACY?{modes:{currentModeId:'safe',availableModes:[{id:'safe',name:'Safe'},{id:'fast',name:'Fast'}]}}:{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]})});
+  else if(message.method==='session/new'){const sessionId=process.env.FIXTURE_STARTUP_NATIVE_ID??'native-'+Math.random().toString(36).slice(2);sessions.set(sessionId,{});if(process.env.FIXTURE_STARTUP_HINT)send({method:'_amplifier/event',params:{sessionId,event:{type:'history.persisted',metadataPath:process.env.FIXTURE_STARTUP_HINT}}});reply(message.id,{sessionId,...(process.env.FIXTURE_LEGACY?{modes:{currentModeId:'safe',availableModes:[{id:'safe',name:'Safe'},{id:'fast',name:'Fast'}]}}:{configOptions:[{id:'mode',name:'Mode',type:'select',currentValue:'safe',options:[{value:'safe',name:'Safe'},{value:'fast',name:'Fast'}]}]})});
     if(process.env.FIXTURE_LEGACY)setTimeout(()=>{update(sessionId,{sessionUpdate:'available_commands_update',availableCommands:[{name:'inspect',description:'Inspect local context',input:{hint:'path'}}]});update(sessionId,{sessionUpdate:'usage_update',used:123,size:4096,cost:{amount:0.12,currency:'USD'}});update(sessionId,{sessionUpdate:'session_info_update',title:'Idle peer title',updatedAt:'2026-10-02T00:00:00Z'});update(sessionId,{sessionUpdate:'current_mode_update',currentModeId:'fast'});},30);
   }
   else if(message.method==='session/resume'||message.method==='session/load'){sessions.set(p.sessionId,{});if(process.env.FIXTURE_LOCATIONS)appendFileSync(process.env.FIXTURE_LOG,JSON.stringify({resumed:p,processCwd:process.cwd()})+'\n');reply(message.id,{configOptions:[]});}

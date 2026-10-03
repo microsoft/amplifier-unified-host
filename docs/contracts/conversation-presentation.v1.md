@@ -32,7 +32,7 @@ native identity, originating agent session or filesystem authority.
 - `withConversationCatalogRead(callback)` guards discovery reads before and after projection changes. It is not an execution-admission or exact-ID authorization boundary.
 
 `HostConfig.conversationPresentation` enables this owner when the configured
-catalog supports the visibility projection protocol. Its only optional port is
+catalog supports the visibility projection protocol. Its optional metadata port is
 `reconstructMetadata({commandId,source,readMappings})`, a trusted scheduler for
 repairing lost metadata. Existing complete metadata can be reprojected without
 that callback. Missing metadata without a reconstruction owner remains explicitly
@@ -119,6 +119,39 @@ For metadata loss, the trusted reconstruction owner launches the catalog without
 retained storage paths before requesting a new scan. Await the new scan's runId
 completing with zero issues, not a previous scan's complete status. Automatic
 scans/hints must not race seeding; later maintenance needs its own ordered owner.
+
+Native `history.persisted` hints and hints buffered during session creation use
+one durable host outbox. It coalesces at most 512 native directory paths, each at
+most 8 KiB. A presentation transaction pauses discovery dispatch synchronously
+and joins an already admitted hint before metadata reconstruction. Pending hints
+remain saved across failed projection and host restart. They drain only after
+confirmed metadata and visibility readiness. Exact host mapping writes, exact-ID
+reads, original receipts and native execution do not take this discovery hold.
+No native command is queued or replayed by this outbox.
+
+Capacity overflow records an explicit reconstruction requirement; it never
+grows an unbounded queue or claims complete discovery. A successful full metadata
+reconstruction clears only overflow observed before its scan boundary. New
+overflow during that reconstruction keeps listing unavailable until another
+explicit metadata repair. Counts and uncertainty, never paths, appear in host
+`diagnostics().catalogHints`.
+
+Each dispatched hint records a private `attemptId` before sending. A timeout
+cannot establish writer quiescence. The built-in `StdioCatalog.hint` waits for its
+owned child process's actual exit on timeout/transport failure before reporting
+settlement; an ordinary complete RPC refusal leaves a healthy process running.
+A custom adapter's unclassified error, or host death with an unresolved attempt,
+keeps reconstruction unknown before any seeding or scan. Exact-ID work remains
+available. The optional trusted `settleDiscovery(attempt)` callback may return
+`{attemptId,evidence:'response-settled'|'process-exited',ownerReceipt}` only from
+retained evidence for that original writer. `Catalog.hint(path,{attemptId})`
+receives the same private attempt identity so a catalog owner can bind its
+receipt. A replacement PID, a new catalog, caller assertions, or elapsed time
+are not evidence. Without that owner evidence the host refuses repair. Accepted
+settlement is retained durably; the original failed rebuild receipt is unchanged
+and a new explicit derived repair is needed. This callback never reissues the
+hint or an original user operation. Independent scanner/inbox writers still
+require the reconstruction owner's launch and exclusion policy described above.
 
 The host independently verifies every exact mapping, native storage path,
 visibility flag, manifest count and final projection checkpoint before opening
