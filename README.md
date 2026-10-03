@@ -1051,3 +1051,42 @@ it never resends the removal. A source hidden by retention can still be selected
 through its known identity for this separate reviewed operation. This feature
 does not implement permanent managed-chat deletion or blanket legacy-directory
 purge. Independent installed host/catalog/Core tests use fixture-owned roots only.
+
+## Private managed chats
+
+`managedSessionRoot` is an optional private allocation owner, separate from
+`allowedWorkspaceRoots`. `createManagedSession({session,commandId,provider?,title?,bundle?,bundleRevision?,selection?})`
+creates `<managedSessionRoot>/chats/<UUID>/files` only on an explicit request.
+The canonical AHP UUID, allocation UUID, and reserved native UUID are identical.
+`selection` is exactly `{instance,model,effort?}`. An explicit bundle is a
+launcher-configured alias plus its reviewed SHA256 revision; omission uses the
+configured engine default. No directory or arbitrary bundle path is accepted.
+
+Initialize advertises `_meta['amplifier.dev/managedCreation']` with method
+`x-amplifier/managedSession`; root-channel operations are `create` with the same
+arguments and `receipt` with `{commandId}`. Success returns
+`{session,uri,creationConfirmed:true,location,configurationScope:'global-and-session',runtimeStarted:false,workReplayed:false,receipt}`.
+A created chat has a ready AHP resource, but provider/account/runtime readiness
+is established only on the later explicit first prompt. Unsent drafts do not
+allocate. Engines without the native managed-creation capability are refused
+before directory allocation.
+
+The allocation root has an OS lifetime lease and durable SQLite journal. The
+host verifies marker bytes, directory identities, configured engine, native
+identity and the adapter's committed creation proof. An interrupted allocation
+or native request is retained as unknown. `managedSessionReceipt(commandId)`
+may query only the original passive native receipt and repair its derived
+mapping; it never repeats native creation, mkdir or input. Folder names, cwd,
+self-hashed markers and catalog rows alone never grant managed ownership.
+Native metadata includes the bounded location projection; catalog list calls
+use independent `allowedManagedRoots`, while workspace authorization and file
+browsing continue to exclude the private allocation root. Selected trusted I/O
+uses `withSessionWorkspace` and the exact allocation authority.
+
+This initial creation boundary explicitly refuses managed configuration clones,
+history forks, relocation and transfer until those operations can obtain a
+fresh or transitioned allocation. It does not implement permanent deletion.
+Native global/session policy is authenticated on every mount; project/local
+settings and routing are excluded. Canonical history, events and user files are
+preserved. Full-product backup must include this separate configured host owner
+root; native session backups alone do not cover its allocation journal/files.

@@ -15,7 +15,7 @@ test('native and client capability effects share durable admission and never rer
   await assert.rejects(host.invokeCapability(request,{actorId:'agent:root',origin:'agent'}),/uncertain/);
   assert.equal(host.store.receipt(request.commandId)?.status,'unknown');
   await assert.rejects(host.invokeCapability(request,{actorId:'agent:root'}),/already admitted/);
-  assert.equal(calls.length,1);assert.equal(calls[0].context.clientId,'');assert.equal(calls[0].context.origin,'agent');assert.equal(host.diagnostics().activeAgents,0);
+  assert.equal(calls.length,1);assert.equal(calls[0].context.actorId,'agent:root');assert.equal(calls[0].context.clientId,'');assert.equal(calls[0].context.origin,'agent');assert.equal(host.diagnostics().activeAgents,0);
  }finally{await host.close();await rm(directory,{recursive:true,force:true});}
 });
 

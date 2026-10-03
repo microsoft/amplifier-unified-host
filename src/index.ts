@@ -9,3 +9,5 @@ export { type TransferCommand, type BeginTransfer, type AdoptTransfer, type Adop
 export type {QuiescenceFence,QuiescenceConfig,QuiescenceParticipant,QuiescenceLease,QuiescenceContext,QuiescenceProof,QuiescenceOutcome,QuiescencePurpose,ServiceIdentity,ServiceStopRequest,ServiceStopReleaseRequest,ServiceReleaseProof,ServiceLifecycleConfig,ServiceStopAdmission,ServiceStopReleaseResult,ServiceStopReceipt} from './quiescence.js';
 
 export type {RetentionProtection,RetentionPreviewRequest,RetentionApplyRequest} from './retention.js';
+
+export type {ManagedSessionCreate,ManagedLocation} from './managed.js';

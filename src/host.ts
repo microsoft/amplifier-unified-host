@@ -1,3 +1,4 @@
+import {ManagedAllocations,managedHash,type ManagedSessionCreate,type ManagedLocation} from './managed.js';
 import {Retention,type RetentionProtection,type RetentionPreviewRequest,type RetentionApplyRequest} from './retention.js';
 import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest} from './quiescence.js';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
@@ -15,10 +16,10 @@ import { mergeHistoryTurns, turnIdentityHash } from './history.js';
 import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
-export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;isArchived?:boolean;}
+export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;isArchived?:boolean;location?:ManagedLocation;}
 export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};}
 export interface Catalog {
-  list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
+  list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];allowedManagedRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
   projectSessionArchives?(params:{items:Array<{uri:string;isArchived:boolean}>}):Promise<unknown>;
   get(uri:string):Promise<CatalogRecord|undefined>;
   upsert(record:CatalogRecord):Promise<unknown>;
@@ -60,6 +61,8 @@ export interface HostConfig {
   retentionProtection?:RetentionProtection;
   /** Existing directory used for new-client workspace hints; must be within allowed roots. */
   defaultWorkingDirectory?:string;
+  /** Private allocation owner; never grants workspace browsing or arbitrary cwd access. */
+  managedSessionRoot?:string;
   quiescence?:QuiescenceConfig;
   /** SHA256 of this TransferNode's Ed25519 raw public key; never caller-selected. */
   transferIdentity?:string;
@@ -70,7 +73,7 @@ export interface HostConfig {
     /** Trusted exact manifest action classification; no ordinary mutation rights are inherited. */
     quiescenceAccess?:Record<string,'read'|'reconcile'>;
     read:(request:{uri:string;topic:string;scope:string;clientId:string})=>Promise<{topic:string;scope:string;revision:number;data:unknown}>;
-    action:(request:Json,context:{clientId:string;origin:'agent'|'ui';session?:SessionRecord})=>Promise<{accepted:boolean;updates?:Array<{topic:string;scope:string;revision:number;data:unknown}>;invalidate?:string[]}>;
+    action:(request:Json,context:{actorId:string;clientId:string;origin:'agent'|'ui';session?:SessionRecord})=>Promise<{accepted:boolean;updates?:Array<{topic:string;scope:string;revision:number;data:unknown}>;invalidate?:string[]}>;
   };
   /** Scoped host capabilities receive trusted native identity and execution workspace. */
   nativeHostRequest?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<Json>;
@@ -101,6 +104,7 @@ export class AmplifierHost {
   readonly ws:WebSocketServer;
   private peers=new Set<Peer>();
   private retention:Retention;
+  private managed?:ManagedAllocations;
   private retentionChanging=new Set<string>();
   private active=new Map<string,Active>();
   private starting=new Map<string,Promise<Active>>();
@@ -137,10 +141,11 @@ export class AmplifierHost {
     if(config.transferIdentity!==undefined&&!/^[a-f0-9]{64}$/.test(config.transferIdentity))throw new Error('transferIdentity must be an exact node public-key fingerprint');
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
     this.store=new Store(config.stateDirectory,config.replayLimit);
+    try{if(config.managedSessionRoot)this.managed=new ManagedAllocations(config.managedSessionRoot);}catch(error){this.store.close();throw error;}
     this.retention=new Retention(this.store.db,{list:async input=>{
       if(!config.catalog?.retentionCandidates)throw new RpcFault(-32601,'Catalog retention metadata is unavailable',{executed:false});
       if(input.workingDirectory)await this.workspace(pathToFileURL(input.workingDirectory).href);
-      return config.catalog.retentionCandidates({...input,allowedWorkspaceRoots:this.roots});
+      return config.catalog.retentionCandidates({...input,allowedWorkspaceRoots:this.roots,...(this.managed?{allowedManagedRoots:[this.managed.root]}:{})});
     },protected:(row,protect)=>this.retentionProtected(row,protect),hide:(row,input)=>this.hideRetained(row,input)});
     for(const [name,access] of Object.entries(config.capabilities?.quiescenceAccess??{})){
       const action=config.capabilities?.manifest.actions[name];
@@ -245,8 +250,19 @@ export class AmplifierHost {
   private async workspace(uri:string|undefined):Promise<string> {
     if(!uri)throw new RpcFault(-32602,'An explicit workingDirectories file URI is required');
     let path:string;try {path=await realpath(fileURLToPath(uri));}catch {throw new RpcFault(-32602,'Working directory must be an existing local directory');}
+    if(this.managed&&this.insideManaged(path))throw new RpcFault(-32009,'Managed chat folders are selected-session resources, not workspaces');
     if(!(await stat(path)).isDirectory()||!this.roots.some(root=>{const rel=relative(root,path);return !rel||rel!=='..'&&!rel.startsWith('../')&&!isAbsolute(rel);}))throw new RpcFault(-32009,'Working directory is outside allowed workspace roots');
     return path;
+  }
+  private insideManaged(path:string){if(!this.managed)return false;const r=relative(this.managed.root,path);return !r||r!=='..'&&!r.startsWith('../')&&!isAbsolute(r);}
+  private async selectedWorkspace(record:SessionRecord,execution=false):Promise<string>{
+    const location=record.state._meta?.['amplifier.dev/location'] as ManagedLocation|undefined;
+    if(!location)return this.workspace(pathToFileURL(execution?(record.executionDirectory??record.workingDirectory):record.workingDirectory).href);
+    const receipt=this.managed?.bySession(record.uri);
+    if(!receipt||receipt.state!=='completed'||managedHash(location)!==managedHash(this.managed!.location(receipt))||record.nativeSessionId!==location.allocationId||record.engineId!==receipt.request.provider)throw new RpcFault(-32009,'Managed session has no confirmed local allocation authority');
+    const cwd=await this.managed!.inspect(receipt);
+    if(record.workingDirectory!==cwd||execution&&(record.executionDirectory??cwd)!==cwd)throw new RpcFault(-32009,'Managed session directory differs from its allocation');
+    return cwd;
   }
   /** Read-only canonical workspace authority for trusted product owners. */
   async authorizeWorkspace(directory:string):Promise<string> {
@@ -255,6 +271,7 @@ export class AmplifierHost {
   }
   private async resourcePath(uri:string):Promise<string> {
     let path:string;try {path=await realpath(fileURLToPath(uri));}catch{throw new RpcFault(-32008,'Resource not found');}
+    if(this.managed&&this.insideManaged(path))throw new RpcFault(-32009,'Managed chat files require a selected-session resource owner');
     if(!this.roots.some(root=>{const rel=relative(root,path);return !rel||rel!=='..'&&!rel.startsWith('../')&&!isAbsolute(rel);}))throw new RpcFault(-32009,'Resource outside allowed workspace roots');
     return path;
   }
@@ -271,10 +288,11 @@ export class AmplifierHost {
     for(const [channel,watch] of this.watches){const target=this.capability(watch.root);if(target?.topic===topic&&target.scope===scope)this.emit(channel,{type:'resourceWatch/changed',changes:{items:[{uri:watch.root,type:'updated'}]}} as StateAction);}
   }
   private async record(uri:string):Promise<SessionRecord> {
-    let record=this.getRecord(uri);if(record){await this.workspace(pathToFileURL(record.workingDirectory).href);return this.getRecord(uri)!;}
+    let record=this.getRecord(uri);if(record){await this.selectedWorkspace(record);return this.getRecord(uri)!;}
     const session=uri.startsWith('ahp-chat:/')?`ahp-session:/${uri.slice('ahp-chat:/'.length)}`:uri;
     const discovered=await this.config.catalog?.get(session);
     if(!discovered)throw new RpcFault(-32008,'Unknown resource');
+    if(discovered.location?.kind==='managed')throw new RpcFault(-32009,'Managed session must be restored from its local allocation receipt before activation');
     await this.workspace(pathToFileURL(discovered.workingDirectory).href);
     // Metadata discovery never starts an agent. Native histories are read by the catalog/resource owner.
     const timestamp=discovered.modifiedAt;
@@ -287,7 +305,7 @@ export class AmplifierHost {
   private getRecord(uri:string):SessionRecord|undefined {return this.hotRecords.get(uri.startsWith('ahp-chat:/')?'ahp-session:/'+uri.slice('ahp-chat:/'.length):uri)??this.store.get(uri);}
   private catalogSummary(record:CatalogRecord):SessionSummary {
     const live=this.getRecord(record.uri);
-    return {resource:record.uri,provider:record.engineId,title:live?.summary.title??record.title,status:live?.summary.status??(1|(record.isArchived?SessionStatus.IsArchived:0)),createdAt:record.createdAt,modifiedAt:live?.summary.modifiedAt??record.modifiedAt,workingDirectories:[pathToFileURL(record.workingDirectory).href],_meta:{'amplifier.dev/native':{availability:record.availability??'available'}}};
+    return {resource:record.uri,provider:record.engineId,title:live?.summary.title??record.title,status:live?.summary.status??(1|(record.isArchived?SessionStatus.IsArchived:0)),createdAt:record.createdAt,modifiedAt:live?.summary.modifiedAt??record.modifiedAt,workingDirectories:[pathToFileURL(record.workingDirectory).href],_meta:{'amplifier.dev/native':{availability:record.availability??'available'},...(record.location?{'amplifier.dev/location':record.location}:{})}};
   }
   private chatSummary(chat:ChatState) {return {resource:chat.resource,title:chat.title,status:chat.status,modifiedAt:chat.modifiedAt};}
   private turnCursor(chat:string,before?:number):string|undefined {
@@ -320,7 +338,7 @@ export class AmplifierHost {
     const cursor=this.recallCursor(input.cursor,scope);
     if(input.scope==='task'){if(input.cursor)throw new RpcFault(-32602,'Task inventory has no next page');return {items:[selected.source],coverage:{source:'selected-root',children:false,internal:false}};}
     if(this.config.catalog){
-      const result=await this.config.catalog.list({connectionId:'recall:'+this.store.incarnation+':'+createHash('sha256').update(scope).digest('hex'),limit,cursor:cursor?.cursor,allowedWorkspaceRoots:this.roots,includeArchive:false,...(input.scope==='workspace'?{workingDirectory:selected.source.workspace}:{})});
+      const result=await this.config.catalog.list({connectionId:'recall:'+this.store.incarnation+':'+createHash('sha256').update(scope).digest('hex'),limit,cursor:cursor?.cursor,allowedWorkspaceRoots:this.roots,...(this.managed?{allowedManagedRoots:[this.managed.root]}:{}),includeArchive:false,...(input.scope==='workspace'?{workingDirectory:selected.source.workspace}:{})});
       if(result.items.length>limit)throw new RpcFault(-32000,'Catalog exceeded Recall page bound');
       const items=result.items.map(row=>this.recallMetadata(row));
       return {items,...(result.nextCursor?{nextCursor:this.rememberRecallCursor({scope,cursor:result.nextCursor})}:{}),coverage:{source:'indexed-catalog',freshness:result.freshness,children:false,internal:false}};
@@ -518,7 +536,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
@@ -541,7 +559,7 @@ export class AmplifierHost {
       case 'unsubscribe':peer.subscriptions.delete(p.channel);this.removeActiveClient(p.channel,peer.clientId);if(!this.hasSubscribers(p.channel)){this.loadedFloors.delete(p.channel);this.nativeWindows.delete(p.channel);this.watches.delete(p.channel);}return null;
       case 'listSessions': {
         const limit=bounded(p.limit,50,200);
-        if(this.config.catalog) {const result=await this.config.catalog.list({connectionId:peer.connectionId,limit,cursor:p.cursor,allowedWorkspaceRoots:this.roots});return {...result,items:result.items.filter(row=>!this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(row.uri)).map(row=>this.catalogSummary(row))};}
+        if(this.config.catalog) {const result=await this.config.catalog.list({connectionId:peer.connectionId,limit,cursor:p.cursor,allowedWorkspaceRoots:this.roots,...(this.managed?{allowedManagedRoots:[this.managed.root]}:{})});return {...result,items:result.items.filter(row=>!this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(row.uri)).map(row=>this.catalogSummary(row))};}
         const cursor=p.cursor?peer.cursors.get(p.cursor):undefined;if(p.cursor&&!cursor)throw new RpcFault(-32602,'Unknown cursor for this connection');
         const rows=this.store.list(limit+1,cursor as any),items=rows.slice(0,limit);let nextCursor;
         if(rows.length>limit){nextCursor=randomUUID();const last=items.at(-1)!;peer.cursors.set(nextCursor,{modified:last.modifiedAt,uri:last.resource});if(peer.cursors.size>256)peer.cursors.delete(peer.cursors.keys().next().value!);}
@@ -568,6 +586,7 @@ export class AmplifierHost {
         this.emit(p.channel,{type:'chat/turnsLoaded',turns:page.turns,turnsNextCursor:this.turnCursor(p.channel,page.before)} as StateAction);return {};
       }
       case 'dispatchAction':await this.dispatch(peer,p);return null;
+      case 'x-amplifier/managedSession':if(p.channel!==ROOT)throw new RpcFault(-32602,'Managed creation uses the root channel');if(p.operation==='create')return this.createManagedSession(p.args);if(p.operation==='receipt'&&Object.keys(p.args??{}).length===1)return this.managedSessionReceipt(p.args.commandId);throw new RpcFault(-32602,'Unknown managed creation operation');
       case 'x-amplifier/sessionLifecycle':return this.sessionLifecycleRequest(p.channel,p.operation,p.args??{});
       case 'x-commandReceipt': {
         const receipt=this.store.receipt(p.commandId);if(!receipt)throw new RpcFault(-32008,'Command receipt not found');
@@ -607,6 +626,55 @@ export class AmplifierHost {
       case 'resourceWrite':return this.intake.run(async()=>{const provider=this.resourceProvider(p.uri);if(provider?.write)return provider.write(p,{clientId:peer.clientId!});throw new RpcFault(-32009,'No authorized resource writer is registered for this URI');});
       default:throw new RpcFault(-32601,`Unsupported AHP method: ${method}`);
     }
+  }
+  private async managedAgent<T>(engineId:string,work:(agent:AcpProcess)=>Promise<T>):Promise<T>{
+    const engine=this.config.engines.find(e=>e.id===engineId);if(!engine)throw new RpcFault(-32602,'Unknown configured provider',{executed:false});
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native capacity reached',{executed:false});
+    this.passiveReads++;const agent=new AcpProcess(engine,this.defaultWorkingDirectory,{update:async()=>{throw new RpcFault(-32009,'Passive creation cannot stream execution');},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive creation cannot use client effects');}});
+    try{await agent.initialize();const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.managedCreation;if(capability?.version!==1||capability.passive!==true||capability.configurationScope!=='global-and-session'||capability.typedSelection!==true)throw new RpcFault(-32601,'Configured engine does not support passive managed creation',{executed:false});return await work(agent);}finally{this.passiveReads--;await agent.retire();}
+  }
+  private managedNativeParams(receipt:Json,operation:string):Json{return {operation,sessionId:receipt.marker.id,cwd:receipt.marker.workspace,commandId:receipt.commandId,allocationHash:receipt.marker.allocationHash,...(operation==='create'?Object.fromEntries(Object.entries(receipt.request).filter(([key])=>['title','bundle','bundleRevision','selection'].includes(key))):{})};}
+  private async confirmManaged(receipt:Json,proof:Json){
+    const native=proof?.result,location=this.managed!.location(receipt);
+    if(proof?.commandId!==receipt.commandId||proof.status!=='completed'||native?.sessionId!==location.allocationId||native.historyCwd!==receipt.marker.workspace||native.executionDirectory!==receipt.marker.workspace||native.creationConfirmed!==true||native.workReplayed!==false||native.runtimeStarted!==false||native.configurationScope!=='global-and-session'||managedHash(native.location)!==managedHash(location))throw new RpcFault(-32011,'Native managed creation proof is unavailable or differs; original allocation preserved');
+    await this.managed!.inspect(receipt);
+    const existing=this.getRecord(receipt.session),indexed=await this.config.catalog?.get(receipt.session);
+    for(const row of [existing,indexed])if(row&&(row.nativeSessionId!==location.allocationId||row.workingDirectory!==receipt.marker.workspace||row.engineId!==receipt.request.provider))throw new RpcFault(-32011,'Managed session identity collides with an existing mapping');
+    if(!existing){const timestamp=now(),meta={'amplifier.dev/location':location},chat:ChatState={resource:chatURI(receipt.session),title:receipt.request.title??'New chat',status:1,modifiedAt:timestamp,turns:[]};
+      const summary:SessionSummary={resource:receipt.session,provider:receipt.request.provider,title:chat.title,status:1,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(receipt.marker.workspace).href],_meta:meta};
+      const state:SessionState={provider:receipt.request.provider,title:chat.title,status:1,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:meta};
+      this.store.save({uri:receipt.session,engineId:receipt.request.provider,nativeSessionId:location.allocationId,workingDirectory:receipt.marker.workspace,executionDirectory:receipt.marker.workspace,summary,state,chat});
+    }
+    const result={session:receipt.session,uri:receipt.session,creationConfirmed:true,location,configurationScope:'global-and-session',runtimeStarted:false,workReplayed:false,receipt:receipt.commandId};
+    // Native creation is complete; retrying catalog projection can never replay it.
+    await this.syncCatalog(this.getRecord(receipt.session)!);this.managed!.settle(receipt.commandId,'completed',result);
+    if(!existing){this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);this.notify('root/sessionAdded',{channel:ROOT,summary:this.getRecord(receipt.session)!.summary});}
+    return result;
+  }
+  /** Allocates only upon an explicit creation command; never mounts a native runtime. */
+  async createManagedSession(input:ManagedSessionCreate){
+    if(!this.managed)throw new RpcFault(-32601,'Managed chat allocation is not configured',{executed:false});
+    const request={...input,provider:input?.provider??this.config.engines[0].id};this.managed.validate(request);
+    return this.intake.run(()=>this.withLock(request.session,async()=>{
+      const prior=this.managed!.receipt(request.commandId);
+      if(prior){if(prior.signature!==managedHash(request))throw new RpcFault(-32011,'Managed command conflicts with its original request',{executed:false});if(prior.state==='completed')return prior.result;throw new RpcFault(-32011,'Managed creation outcome is unresolved; inspect its exact receipt without replay',{receipt:request.commandId,outcome:'unknown'});}
+      if(this.getRecord(request.session))throw new RpcFault(-32003,'Session already exists',{executed:false});
+      return this.managedAgent(request.provider,async agent=>this.withLock('@directory-reservations',async()=>{
+        const receipt=this.managed!.reserve(request);
+        try{await this.managed!.allocate(receipt);this.managed!.settle(request.commandId,'dispatching');const proof:Json=await agent.client.extMethod('_amplifier/managed',this.managedNativeParams(receipt,'create'));return await this.confirmManaged(receipt,proof);}
+        catch(error){this.managed!.settle(request.commandId,'unknown');throw error;}
+      }));
+    }));
+  }
+  /** Passive exact native proof can repair a lost acknowledgement; never repeats creation. */
+  async managedSessionReceipt(commandId:string){
+    if(!this.managed)throw new RpcFault(-32601,'Managed allocation is not configured');const receipt=this.managed.receipt(commandId);if(!receipt)return null;
+    if(receipt.state==='completed')return {commandId,status:'completed',result:receipt.result,replayed:false};
+    return this.intake.inspectOnly(()=>this.withLock(receipt.session,async()=>{
+      const current=this.managed!.receipt(commandId)!;if(current.state==='completed')return {commandId,status:'completed',result:current.result,replayed:false};
+      try{await this.managed!.inspect(current);return await this.managedAgent(current.request.provider,async agent=>{const proof:Json=await agent.client.extMethod('_amplifier/managed',this.managedNativeParams(current,'receipt'));if(proof?.status==='completed'){if(this.intake.inspect().intakeClosed)return {commandId,status:'unknown',session:current.session,nativeStatus:'completed',metadataRepairPending:true,replayed:false};return this.intake.run(async()=>({commandId,status:'completed',result:await this.confirmManaged(current,proof),replayed:false}));}return {commandId,status:'unknown',session:current.session,nativeStatus:proof?.status??'not-recorded',replayed:false};});}
+      catch(error){return {commandId,status:'unknown',session:current.session,detail:(error as Error).message,replayed:false};}
+    }));
   }
   private async createSessionResource(p:Json,creation?:{sessionId:string;source:Json;commandId:string}) {
     return this.intake.run(async()=>{
@@ -697,6 +765,7 @@ export class AmplifierHost {
   private async sourceTransfer(session:string,operation:'source.fence'|'source.commit'|'source.cancel',input:BeginTransfer|TransferCommand) {
     return this.intake.run(async()=>{
     this.transferInput(input);const record=await this.record(session);
+    if(record.state._meta?.['amplifier.dev/location'])throw new RpcFault(-32601,'Managed transfer requires destination allocation adoption',{executed:false});
     return this.withLock(record.uri,async()=>{
       if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
       const previous=this.store.db.prepare('SELECT * FROM transfer_commands WHERE command_id=?').get(input.commandId),payload=JSON.stringify(input);
@@ -932,6 +1001,7 @@ export class AmplifierHost {
   }
   private guardSessionLifecycle(session:string) {
     this.guardTransfer(session);
+    const allocation=this.managed?.bySession(session);if(allocation&&allocation.state!=='completed')throw new RpcFault(-32011,'Managed creation is unresolved; inspect its original receipt without replay');
     if(this.store.db.prepare("SELECT 1 FROM import_adoptions WHERE session=? AND status<>'completed' LIMIT 1").get(session))throw new RpcFault(-32011,'Imported session registration is unresolved; inspect its exact receipt');
     if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(session,session))throw new RpcFault(-32011,'Session lifecycle outcome is unresolved; inspect the original receipt without replay');
     if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(session))throw new RpcFault(-32008,'Session was removed from discovery; restore it before execution');
@@ -1064,6 +1134,7 @@ export class AmplifierHost {
   private async mutateLifecycle(session:string,operation:string,args:Json) {
     return this.intake.run(async()=>{
     this.lifecycleArgs(operation,args);const record=await this.record(session);
+    if(operation==='fork'&&record.state._meta?.['amplifier.dev/location'])throw new RpcFault(-32601,'Managed history copy requires a fresh target allocation',{executed:false});
     return this.withLock(record.uri,async()=>{
       if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
       const previous=this.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(args.commandId);
@@ -1149,7 +1220,7 @@ export class AmplifierHost {
       if(count()>(this.config.maxActiveAgents??8))throw new RpcFault(-32000,'Active agent capacity reached; no historical workers are prewarmed');
       const record=await this.record(uri),engine=this.config.engines.find(e=>e.id===record.engineId);
       if(!engine)throw new RpcFault(-32002,'Session engine is not configured');
-      await this.workspace(pathToFileURL(record.executionDirectory??record.workingDirectory).href);
+      await this.selectedWorkspace(record,true);
       const active:Active={agent:null as any,busy:false,lastUsed:Date.now(),tools:new Set(),permissions:new Map()};
       const agent=new AcpProcess(engine,record.executionDirectory??record.workingDirectory,{
         hostCapabilities:this.config.nativeHostCapabilities,
@@ -1197,7 +1268,7 @@ export class AmplifierHost {
   }
   private async syncCatalog(record:SessionRecord) {
     if(!this.config.catalog)return;
-    await this.config.catalog.upsert({uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,isArchived:!!(record.summary.status & SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present'});
+    await this.config.catalog.upsert({uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,isArchived:!!(record.summary.status & SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present',...((record.state._meta?.['amplifier.dev/location'])?{location:record.state._meta!['amplifier.dev/location'] as ManagedLocation}:{})});
     if(this.config.catalog.projectSessionArchives)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(record.uri,Number(!!(record.summary.status & SessionStatus.IsArchived)));
   }
   private emit(channel:string,action:StateAction,origin?:ActionEnvelope['origin'],rejectionReason?:string):ActionEnvelope {
@@ -1516,7 +1587,7 @@ export class AmplifierHost {
   async createSession(input:{commandId:string;idempotencyKey:string;sourceSession:string;expectedConfigurationHash:string;title?:string}) {
     return this.intake.run(async()=>{
     if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.idempotencyKey!=='string'||!input.idempotencyKey||input.idempotencyKey.length>512||typeof input.expectedConfigurationHash!=='string'||(input.title!==undefined&&(typeof input.title!=='string'||input.title.length>1000)))throw new RpcFault(-32602,'Bounded creation identity and expected configuration required');
-    const source=await this.record(input.sourceSession),identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
+    const source=await this.record(input.sourceSession);if(source.state._meta?.['amplifier.dev/location'])throw new RpcFault(-32601,'Managed configuration copy requires a fresh target allocation',{executed:false});const identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
     const nativeId=identity.slice(0,8)+'-'+identity.slice(8,12)+'-5'+identity.slice(13,16)+'-a'+identity.slice(17,20)+'-'+identity.slice(20,32),uri='ahp-session:/'+nativeId;
     const fingerprint=createHash('sha256').update(JSON.stringify(input)).digest('hex');
     return this.withLock(source.uri,async()=>{
@@ -1904,7 +1975,7 @@ export class AmplifierHost {
     const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
     const active=this.active.get(record.uri),admission=active?.busy&&active.turnId?this.store.receipt(active.turnId):undefined;
     const observationAdmission=admission?.status==='dispatching'&&active?.observationAdmission?{...active.observationAdmission,status:admission.status}:undefined;
-    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,location:record.state._meta?.['amplifier.dev/location'],activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
   }
   /** Hold the selected session mapping through bounded trusted I/O. No filesystem snapshot is implied. */
   async withSessionWorkspace<T>(session:string,expected:SessionWorkspaceExpectation,capture:(workspace:Readonly<SessionWorkspace>)=>Promise<T>):Promise<T> {
@@ -1915,9 +1986,9 @@ export class AmplifierHost {
       const record=await this.record(selected.uri);
       this.guardTransfer(record.uri);
       if(this.relocationFence(record.uri))throw new RpcFault(-32011,'Session relocation is fenced; workspace capture was not started',{executed:false});
-      const executionDirectory=await this.workspace(pathToFileURL(record.executionDirectory??record.workingDirectory).href),executionRevision=this.store.revisions(record.uri).executionRevision;
+      const executionDirectory=await this.selectedWorkspace(record,true),executionRevision=this.store.revisions(record.uri).executionRevision;
       if(expected.expectedExecutionRevision!==undefined&&expected.expectedExecutionRevision!==executionRevision)throw new RpcFault(-32011,'Execution revision changed; workspace capture was not started',{executed:false});
-      if(expected.expectedDirectory!==undefined&&await this.workspace(pathToFileURL(expected.expectedDirectory).href)!==executionDirectory)throw new RpcFault(-32011,'Execution directory changed; workspace capture was not started',{executed:false});
+      if(expected.expectedDirectory!==undefined&&await realpath(expected.expectedDirectory)!==executionDirectory)throw new RpcFault(-32011,'Execution directory changed; workspace capture was not started',{executed:false});
       // The caller owns byte/time limits and may read files, but must not reenter host mutations.
       // Keep the mutex until its promise settles: a timeout must not free mapping while I/O runs.
       return capture(Object.freeze({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,historyHome:record.workingDirectory,executionDirectory,executionRevision}));
@@ -1963,7 +2034,7 @@ export class AmplifierHost {
     return this.intake.run(async()=>{
     if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.target!=='string'||!isAbsolute(input.target)||!Number.isSafeInteger(input.expectedExecutionRevision)||input.expectedExecutionRevision<0||Buffer.byteLength(JSON.stringify(input.evidence??null))>65536)throw new RpcFault(-32602,'Bounded relocation command, target and expected revision required');
     let record:SessionRecord,target:string;
-    try{record=await this.record(session);target=await this.workspace(pathToFileURL(input.target).href);}catch(error){return {applied:false,executed:false,reason:(error as Error).message};}
+    try{record=await this.record(session);if(record.state._meta?.['amplifier.dev/location'])throw new RpcFault(-32601,'Managed execution relocation requires an allocation transition',{executed:false});target=await this.workspace(pathToFileURL(input.target).href);}catch(error){return {applied:false,executed:false,reason:(error as Error).message};}
     return this.withLock(record.uri,async()=>{
       let admitted=false;
       try {
@@ -2019,7 +2090,7 @@ export class AmplifierHost {
     const session=request.channel===ROOT?undefined:await this.record(request.channel);
     this.store.transaction(()=>this.store.admission(request.channel,request,request.commandId,actor.actorId,this.store.extensionSequence(actor.actorId)));
     this.store.finish(request.commandId,'dispatching');
-    try {const result=await provider.action(request,{clientId:actor.clientId??'',origin:actor.origin??'ui',session});this.store.finish(request.commandId,result.accepted?'completed':'failed');for(const topic of result.invalidate??[])this.invalidateCapability(topic,request.channel===ROOT?'host':request.channel);for(const update of result.updates??[])this.invalidateCapability(update.topic,update.scope);return result;}
+    try {const result=await provider.action(request,{actorId:actor.actorId,clientId:actor.clientId??'',origin:actor.origin??'ui',session});this.store.finish(request.commandId,result.accepted?'completed':'failed');for(const topic of result.invalidate??[])this.invalidateCapability(topic,request.channel===ROOT?'host':request.channel);for(const update of result.updates??[])this.invalidateCapability(update.topic,update.scope);return result;}
     catch(error){this.store.finish(request.commandId,'unknown',(error as Error).message);throw error;}
     };
     return access?this.intake.inspectOnly(execute):this.intake.run(execute);
@@ -2081,7 +2152,7 @@ export class AmplifierHost {
     for(const peer of this.peers)peer.socket.terminate();
     const agents=[...this.active.values()];await Promise.all(agents.map(active=>{active.retireReason='host-shutdown';return active.agent.retire();}));await Promise.all([...this.stoppedCallbacks]);await Promise.allSettled(agents.map(active=>active.run));await Promise.all([...this.settledCallbacks]);this.active.clear();
     await new Promise<void>(resolve=>this.ws.close(()=>resolve()));await new Promise<void>(resolve=>this.http.close(()=>resolve()));
-    await this.config.catalog?.close?.();this.store.close();
+    await this.config.catalog?.close?.();this.managed?.close();this.store.close();
   }
 }
 
