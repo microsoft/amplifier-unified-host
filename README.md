@@ -1024,3 +1024,30 @@ outside the held session-lock callback. Thereafter passive retention item/batch
 reads recognize that completed host lifecycle proof as `hidden`, with
 `protectionRelease:'unconfirmed'`; an unknown batch remains non-replayable until
 its dependent owner release has been separately reconciled.
+# Verified retired private copies
+
+Optional native `sessionLifecycle.retiredCopies` v1 enables selected public
+`inventoryRetiredCopies(session)`, `previewRetiredCopyPurge(session,{rootId})`,
+`purgeRetiredCopy(session,{commandId,previewId,previewHash,expectedHistoryRevision})`
+and `retiredCopyPurgeReceipt(session,commandId)`. The browser wire uses the existing
+negotiated `x-amplifier/sessionLifecycle` method with `legacyCopy.inventory`,
+`legacyCopy.preview`, `legacyCopy.purge`, and `legacyCopy.receipt` respectively.
+Unconfigured and generic ACP engines explicitly refuse this optional feature.
+
+The native launcher alone identifies retired private app roots. Preview contains
+bounded file names/counts/hashes, expiry in Unix seconds, canonical revision and
+retained reasons. Caller-provided filesystem paths are rejected. The source
+must have complete canonical proof; only duplicate metadata/transcript or fully
+preserved checkpoint files can be removed. Directories, unique/unknown files,
+every events.jsonl and current native history remain. **Legacy writer retirement
+is a trusted launcher assertion**, not proof obtained from an old app lock.
+
+Host source admission, transfer/unknown guards and native canonical writer
+ownership protect the operation. The native receipt is checked for exact selected
+identity, preview/hash/revision, duplicate file allowlist and zero canonical/event
+deletions before host completion. Restart and changed command IDs cannot replay
+unknown work. Exact receipt recovery may confirm a completed native effect only;
+it never resends the removal. A source hidden by retention can still be selected
+through its known identity for this separate reviewed operation. This feature
+does not implement permanent managed-chat deletion or blanket legacy-directory
+purge. Independent installed host/catalog/Core tests use fixture-owned roots only.

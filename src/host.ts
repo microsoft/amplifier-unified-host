@@ -996,11 +996,12 @@ export class AmplifierHost {
   }
   async previewDeleteSession(session:string) {const record=await this.record(session);return this.lifecycleAgent(record,agent=>this.nativeLifecycle(agent,record,'delete.preview'));}
   private lifecycleArgs(operation:string,args:Json) {
-    const allowed:Record<string,string[]>={fork:['commandId','expectedHistoryRevision','throughMessageId','title','mode','bundle','bundleRevision','resetModel'],export:['commandId','expectedHistoryRevision','format','scope','fromMessageId','throughMessageId','minimal'],delete:['commandId','expectedHistoryRevision','confirmationToken'],restore:['commandId','expectedHistoryRevision']};
+    const allowed:Record<string,string[]>={fork:['commandId','expectedHistoryRevision','throughMessageId','title','mode','bundle','bundleRevision','resetModel'],export:['commandId','expectedHistoryRevision','format','scope','fromMessageId','throughMessageId','minimal'],delete:['commandId','expectedHistoryRevision','confirmationToken'],restore:['commandId','expectedHistoryRevision'],'legacyCopy.purge':['commandId','expectedHistoryRevision','previewId','previewHash']};
     if(!allowed[operation]||!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).some(key=>!allowed[operation].includes(key))||Buffer.byteLength(JSON.stringify(args))>32768||typeof args.commandId!=='string'||!args.commandId||args.commandId.length>200||typeof args.expectedHistoryRevision!=='string'||!args.expectedHistoryRevision||args.expectedHistoryRevision.length>512)throw new RpcFault(-32602,'Exact lifecycle operation, bounded command identity and history revision required');
     for(const key of ['throughMessageId','fromMessageId','title','confirmationToken'])if(args[key]!==undefined&&(typeof args[key]!=='string'||!args[key]||args[key].length>1000))throw new RpcFault(-32602,'Invalid lifecycle boundary or title');
     if(operation==='fork'&&(args.mode!==undefined&&!['complete','recovery'].includes(args.mode)||args.bundle!==undefined&&(typeof args.bundle!=='string'||!args.bundle||args.bundle.length>200)||args.resetModel!==undefined&&typeof args.resetModel!=='boolean'||args.bundle!==undefined&&!/^[a-f0-9]{64}$/.test(args.bundleRevision??'')||args.bundle===undefined&&(args.bundleRevision!==undefined||args.resetModel===true)))throw new RpcFault(-32602,'Negotiated fork mode and configured bundle identity required');
     if(operation==='export'&&(!['markdown','json'].includes(args.format)||args.scope!==undefined&&!['all','from','range'].includes(args.scope)||args.minimal!==undefined&&typeof args.minimal!=='boolean'))throw new RpcFault(-32602,'Unsupported native export shape');
+    if(operation==='legacyCopy.purge'&&(typeof args.previewId!=='string'||!/^[a-f0-9-]{36}$/.test(args.previewId)||typeof args.previewHash!=='string'||!/^[a-f0-9]{64}$/.test(args.previewHash)))throw new RpcFault(-32602,'Exact retired-copy preview identity and hash required');
     if(operation==='delete'&&typeof args.confirmationToken!=='string')throw new RpcFault(-32602,'Exact native delete preview token required');
   }
   private async applyLifecycleResult(record:SessionRecord,entry:Json,native:Json) {
@@ -1018,6 +1019,9 @@ export class AmplifierHost {
       if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==record.workingDirectory)throw new Error('Reserved fork target now has a different identity');
       this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,workReplayed:false,mode:native.mode??'complete',...(native.bundleSelection!==undefined?{bundleSelection:native.bundleSelection}:{}),preservedSource:true,receipt:native.receipt};
       this.notify('root/sessionAdded',{channel:ROOT,summary:target.summary});
+    }else if(operation==='legacyCopy.purge'){
+      if(native.receipt.operation!==operation||native.sessionId!==record.nativeSessionId||native.historyCwd!==record.workingDirectory||native.historyRevision!==args.expectedHistoryRevision||native.previewId!==args.previewId||native.previewHash!==args.previewHash||native.canonicalFilesDeleted!==0||native.eventsDeleted!==0||native.legacyWriterCoverage!=='launcher-attested-retired'||!Array.isArray(native.removed)||!native.removed.length||native.removed.length>3||new Set(native.removed.map((f:Json)=>f.name)).size!==native.removed.length||native.removed.some((f:Json)=>!['transcript.jsonl','metadata.json','checkpoint.json'].includes(f.name)||!Number.isSafeInteger(f.bytes)||f.bytes<0||f.bytes>64*1024*1024||typeof f.sha256!=='string'||!/^[a-f0-9]{64}$/.test(f.sha256)))throw new Error('Retired-copy effect lacks exact duplicate-only native receipt proof');
+      result={...native,session:record.uri};
     }else if(operation==='export'){
       if(typeof native.snapshotId!=='string'||!/^[a-f0-9]{64}$/.test(native.snapshotId)||!Number.isSafeInteger(native.summary?.bytes)||native.summary.bytes<0||native.summary.bytes>64*1024*1024||native.historyRevision!==args.expectedHistoryRevision||typeof native.contentHash!=='string')throw new Error('Invalid native immutable export confirmation');
       const uri='amplifier-export:/'+createHash('sha256').update(record.uri+'\0'+native.snapshotId).digest('hex');
@@ -1065,13 +1069,14 @@ export class AmplifierHost {
       const previous=this.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(args.commandId);
       if(previous){if(previous.session!==record.uri||previous.operation!==operation||previous.payload!==JSON.stringify(args))throw new RpcFault(-32011,'Lifecycle command ID conflicts with its original request');if(previous.status==='completed')return JSON.parse(String(previous.result));throw new RpcFault(-32011,'Original lifecycle receipt is not completed; inspect it without replay',{receipt:args.commandId,outcome:previous.status,executed:previous.status==='failed'?false:undefined});}
       this.guardTransfer(record.uri);
-      if(operation!=='restore')this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
+      if(!['restore','legacyCopy.purge'].includes(operation))this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
       if(this.store.unknown(record.chat.resource)&&!(operation==='fork'&&args.mode==='recovery')||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
       if(this.config.catalog&&['delete','restore'].includes(operation)&&!this.config.catalog.setVisibility)throw new RpcFault(-32601,'Catalog cannot project native visibility',{executed:false});
       await this.quiesceLifecycle(record);
       const execute=async(descendants:Json[])=>this.lifecycleAgent(record,async agent=>{
         const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle;
         if(args.mode==='recovery'&&capability?.recoveryCopy?.version!==1||args.bundle!==undefined&&capability?.bundleFork?.version!==1||descendants.length&&capability?.descendantGuard?.version!==1)throw new RpcFault(-32601,'Configured engine does not support this guarded copy operation',{executed:false});
+        if(operation==='legacyCopy.purge'&&(capability?.retiredCopies?.version!==1||capability.retiredCopies.duplicateFilesOnly!==true))throw new RpcFault(-32601,'Configured engine does not support verified retired-copy purge',{executed:false});
         const inspected=await this.nativeLifecycle(agent,record,'inspect');if(inspected.historyRevision!==args.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed; inspect a fresh revision',{executed:false});
         const target=operation==='fork'?'ahp-session:/'+randomUUID():null;
         const entry={command_id:args.commandId,session:record.uri,operation,target,status:'dispatching',payload:JSON.stringify(args)};
@@ -1089,6 +1094,16 @@ export class AmplifierHost {
       });
   }
   async forkSession(session:string,args:{commandId:string;expectedHistoryRevision:string;throughMessageId?:string;title?:string;mode?:'complete'|'recovery';bundle?:string;bundleRevision?:string;resetModel?:boolean}) {return this.mutateLifecycle(session,'fork',args);}
+  /** Selected retired copy operations never accept filesystem paths or start an agent runtime. */
+  async inventoryRetiredCopies(session:string) {return this.readRetiredCopies(session,'legacyCopy.inventory',{});}
+  async previewRetiredCopyPurge(session:string,input:{rootId:string}) {
+    if(!input||Object.keys(input).some(key=>key!=='rootId')||typeof input.rootId!=='string'||!input.rootId||input.rootId.length>200)throw new RpcFault(-32602,'Explicit configured retired root ID required');
+    return this.readRetiredCopies(session,'legacyCopy.preview',input);
+  }
+  private async readRetiredCopies(session:string,operation:string,args:Json){const record=await this.record(session);return this.lifecycleAgent(record,async agent=>{const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle?.retiredCopies;if(capability?.version!==1||capability.duplicateFilesOnly!==true)throw new RpcFault(-32601,'Configured engine has no retired-copy authority',{executed:false});const result=await this.nativeLifecycle(agent,record,operation,args);if(operation==='legacyCopy.preview'&&(result.sessionId!==record.nativeSessionId||result.rootId!==args.rootId||result.canonicalFilesDeleted!==0||result.legacyWriterCoverage!=='launcher-attested-retired'))throw new RpcFault(-32000,'Retired-copy preview identity differs');return result;});}
+  async purgeRetiredCopy(session:string,input:{commandId:string;expectedHistoryRevision:string;previewId:string;previewHash:string}) {return this.mutateLifecycle(session,'legacyCopy.purge',input);}
+  /** Passive exact receipt reconciliation; never retries a prior removal. */
+  async retiredCopyPurgeReceipt(session:string,commandId:string){const row=this.store.db.prepare('SELECT operation,session FROM lifecycle_commands WHERE command_id=?').get(commandId);if(!row||row.operation!=='legacyCopy.purge'||row.session!==session)throw new RpcFault(-32008,'No exact selected retired-copy receipt');return this.inspectSessionLifecycleReceipt(session,commandId);}
   async exportSession(session:string,args:{commandId:string;expectedHistoryRevision:string;format:'markdown'|'json';scope?:'all'|'from'|'range';fromMessageId?:string;throughMessageId?:string;minimal?:boolean}) {return this.mutateLifecycle(session,'export',args);}
   async deleteSession(session:string,args:{commandId:string;expectedHistoryRevision:string;confirmationToken:string}) {return this.mutateLifecycle(session,'delete',args);}
   async restoreSession(session:string,args:{commandId:string;expectedHistoryRevision:string}) {return this.mutateLifecycle(session,'restore',args);}
@@ -1117,7 +1132,8 @@ export class AmplifierHost {
   private sessionLifecycleRequest(session:string,operation:string,args:Json) {
     if(typeof session!=='string'||!session.startsWith('ahp-session:/'))throw new RpcFault(-32602,'Selected session channel required');
     if(operation==='history.refresh')return this.refreshSessionHistory(session,args);if(operation==='history.revise')return this.reviseHistory(session,args as any);if(operation==='inspect')return this.inspectSessionHistory(session);if(operation==='delete.preview')return this.previewDeleteSession(session);if(operation==='receipt')return this.inspectSessionLifecycleReceipt(session,args.commandId);
-    if(['fork','export','delete','restore'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
+    if(operation==='legacyCopy.inventory')return this.inventoryRetiredCopies(session);if(operation==='legacyCopy.preview')return this.previewRetiredCopyPurge(session,args as any);if(operation==='legacyCopy.receipt')return this.retiredCopyPurgeReceipt(session,args.commandId);
+    if(['fork','export','delete','restore','legacyCopy.purge'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
   }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
     return this.intake.run(async()=>{
