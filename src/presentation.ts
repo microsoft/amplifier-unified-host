@@ -1,16 +1,15 @@
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
-import type {PresentationActor,PresentationPrepare,PresentationApply,PresentationIdentity,PresentationReadiness,PresentationEffectReceipt,ConversationPresentationProtection,VisibilityProjectionRequest,VisibilityProjectionReceipt,PresentationRebuild,PresentationReceipt,PresentationReviewPage,PresentationProtectionContext,PresentationMappingPage} from './presentation-types.js';
+import type {PresentationActor,PresentationPrepare,PresentationApply,PresentationIdentity,PresentationReadiness,PresentationEffectReceipt,VisibilityProjectionRequest,VisibilityProjectionReceipt,PresentationRebuild,PresentationReceipt,PresentationReviewPage,PresentationMappingPage} from './presentation-types.js';
 
 type Json=Record<string,any>;
 export interface PresentationMetadata {identity:PresentationIdentity;title:string;catalog:Json;hostBeforeImage?:Json;}
 export interface PresentationPorts {
  metadata(session:string):Promise<PresentationMetadata>;
- assertMaintenance(fence:{fenceId:string;commandId:string}):{owners:string[]};
+ withSelection<T>(sessions:string[],work:()=>Promise<T>):Promise<T>;
  validateSelection(sessions:PresentationIdentity[]):Promise<void>;
  reconstructMetadata?:(request:{commandId:string;source:string;readMappings:(cursor?:string)=>PresentationMappingPage})=>Promise<void>;
  mappings(after?:string):Promise<{items:Json[];nextCursor?:string}>;
- protection:ConversationPresentationProtection;
  projectionStatus(source:string):Promise<{source:string;revision:number}>;
  project(request:VisibilityProjectionRequest):Promise<VisibilityProjectionReceipt>;
  projectionReceipt(source:string,commandId:string):Promise<VisibilityProjectionReceipt|null>;
@@ -68,16 +67,16 @@ export class ConversationPresentation {
  private rows(reviewId:string,after=-1,limit=50){return this.db.prepare('SELECT * FROM presentation_review_rows WHERE review_id=? AND ordinal>? ORDER BY ordinal LIMIT ?').all(reviewId,after,limit) as Json[];}
  private async serial<T>(work:()=>Promise<T>){if(this.working)throw new PresentationError('Presentation transaction already in progress');this.working=true;try{return await work();}finally{this.working=false;}}
  async prepare(input:PresentationPrepare,actor:PresentationActor){
-  if(!input||Object.keys(input).some(key=>!['commandId','operation','selection','expectedRevision','resetCommandId'].includes(key))||!['reset','restore'].includes(input.operation))throw new PresentationError('Exact presentation review required');
-  id(input.commandId);revision(input.expectedRevision);const by=actorKey(actor),signature=hash({input,actor:by});
+  if(!input||Object.keys(input).some(key=>!['commandId','operation','selection','resetCommandId'].includes(key))||!['reset','restore'].includes(input.operation))throw new PresentationError('Exact presentation review required');
+  id(input.commandId);const by=actorKey(actor),signature=hash({input,actor:by});
   const existing=this.db.prepare('SELECT signature,payload FROM presentation_reviews WHERE command_id=?').get(input.commandId);
   if(existing){if(existing.signature!==signature)throw new PresentationError('Review identity conflicts with original request');return this.page({reviewId:JSON.parse(String(existing.payload)).reviewId},actor);}
   if(input.selection?.kind!=='explicit'||Object.keys(input.selection).sort().join(',')!=='kind,sessionIds'||!Array.isArray(input.selection.sessionIds)||!input.selection.sessionIds.length||input.selection.sessionIds.length>PRESENTATION_LIMITS.selection)throw new PresentationError('Bounded explicit session selection required');
   const selected=input.selection.sessionIds.map(uri).sort();if(new Set(selected).size!==selected.length)throw new PresentationError('Duplicate selected identity');
-  await this.checkReady();this.assertReadable();const state=this.state()!;if(state.revision!==input.expectedRevision)throw new PresentationError('Presentation revision changed');
+  const state=this.state()!;
   let original:Json|undefined;if(input.operation==='restore'){
    if(!input.resetCommandId)throw new PresentationError('Restore requires the original reset command');original=this.effect(input.resetCommandId)??undefined;
-   if(original?.operation!=='reset'||original.status!=='completed'||original.revision!==input.expectedRevision)throw new PresentationError('Original completed reset and unchanged post-reset revision required');
+   if(original?.operation!=='reset'||original.status!=='completed')throw new PresentationError('Original completed reset required');
   }else if(input.resetCommandId!==undefined)throw new PresentationError('Reset cannot claim an earlier operation');
   this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare("DELETE FROM presentation_review_rows WHERE review_id IN (SELECT id FROM presentation_reviews WHERE json_extract(payload,'$.expiresAt')<=? AND id NOT IN (SELECT review_id FROM presentation_commands))").run(Date.now());this.db.prepare("DELETE FROM presentation_reviews WHERE json_extract(payload,'$.expiresAt')<=? AND id NOT IN (SELECT review_id FROM presentation_commands)").run(Date.now());this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
   const pending=Number(this.db.prepare("SELECT count(*) n FROM presentation_reviews WHERE id NOT IN (SELECT review_id FROM presentation_commands) AND json_extract(payload,'$.expiresAt')>?").get(Date.now())!.n);if(pending>=64)throw new PresentationError('Unapplied presentation review capacity reached');
@@ -90,9 +89,9 @@ export class ConversationPresentation {
    rows.push({session,metadata,payload,metadataHash:hash(metadata),before,target});
   }
   const selectionHash=hash(rows.map(row=>({identity:row.metadata.identity,metadataHash:row.metadataHash,before:row.before,targetHidden:row.target}))),expiresAt=Date.now()+PRESENTATION_LIMITS.reviewMs;
-  const review:Json={reviewId,commandId:input.commandId,operation:input.operation,expectedRevision:state.revision,resetCommandId:input.resetCommandId,actor:by,selectionHash,count:rows.length,bytes,expiresAt,preservesCanonical:true,preservesAuthority:true,eligibility:'requires-held-validation'};review.reviewHash=hash(review);
+  const review:Json={reviewId,commandId:input.commandId,operation:input.operation,observedRevision:state.revision,resetCommandId:input.resetCommandId,actor:by,selectionHash,count:rows.length,bytes,expiresAt,preservesCanonical:true,preservesAuthority:true,eligibility:'requires-selected-validation'};review.reviewHash=hash(review);
   this.db.exec('BEGIN IMMEDIATE');try{
-   if(this.state()!.revision!==state.revision||!this.state()!.ready)throw new PresentationError('Presentation changed while preparing review');
+   for(const row of rows){const current=this.marker(row.session);if(current.revision!==row.before.revision||current.hidden!==row.before.hidden)throw new PresentationError('Selected presentation changed while preparing review');}
    this.db.prepare('INSERT INTO presentation_reviews VALUES(?,?,?,?)').run(reviewId,input.commandId,signature,JSON.stringify(review));
    for(let n=0;n<rows.length;n++){const row=rows[n];this.retainMapping(row.metadata.catalog);this.db.prepare('INSERT INTO presentation_review_rows VALUES(?,?,?,?,?,?,?,?)').run(reviewId,n,row.session,row.payload,row.metadataHash,Number(row.before.hidden),row.before.revision,Number(row.target));}
    this.db.exec('COMMIT');
@@ -106,7 +105,7 @@ export class ConversationPresentation {
   const {actor:privateActor,...publicReview}=review;return {...publicReview,items:rows.map(row=>({session:row.session,title:JSON.parse(row.metadata).title,priorHidden:!!row.before_hidden,targetHidden:!!row.target_hidden})),nextCursor} as PresentationReviewPage;
  }
  effect(commandId:string):PresentationEffectReceipt|null{const row=this.db.prepare('SELECT effect FROM presentation_commands WHERE command_id=?').get(id(commandId));return row?JSON.parse(String(row.effect)):null;}
- receipt(commandId:string,actor?:PresentationActor):PresentationReceipt|null{const row=this.db.prepare('SELECT payload,effect,review_id FROM presentation_commands WHERE command_id=?').get(id(commandId));if(!row)return null;const payload=JSON.parse(String(row.payload));if(actor&&this.review(String(row.review_id)).actor!==actorKey(actor))throw new PresentationError('Receipt belongs to another actor');return {commandId,effect:JSON.parse(String(row.effect)),protection:payload.protection,...(payload.leaseId?{leaseId:payload.leaseId}:{})};}
+ receipt(commandId:string,actor?:PresentationActor):PresentationReceipt|null{const row=this.db.prepare('SELECT payload,effect,review_id FROM presentation_commands WHERE command_id=?').get(id(commandId));if(!row)return null;const payload=JSON.parse(String(row.payload));if(actor&&this.review(String(row.review_id)).actor!==actorKey(actor))throw new PresentationError('Receipt belongs to another actor');const effect=JSON.parse(String(row.effect)),state=this.state()!,projection=payload.mutationCommitted&&state.ready&&effect.revision<=state.revision?{status:'ready' as const,source:state.source!,revision:state.projectionRevision}:payload.projection??{status:'unknown',source:state.source!};return {commandId,effect,projection};}
  private setEffect(commandId:string,effect:PresentationEffectReceipt){this.db.prepare('UPDATE presentation_commands SET effect=? WHERE command_id=?').run(JSON.stringify(effect),commandId);}
  private payload(commandId:string):Json{return JSON.parse(String(this.db.prepare('SELECT payload FROM presentation_commands WHERE command_id=?').get(commandId)!.payload));}
  private setPayload(commandId:string,payload:Json){this.db.prepare('UPDATE presentation_commands SET payload=? WHERE command_id=?').run(JSON.stringify(payload),commandId);}
@@ -143,66 +142,56 @@ export class ConversationPresentation {
   }if(checkpoint===undefined)throw Error('Projection was not admitted');return checkpoint;
  }
  private complete(commandId:string,rows:Json[],checkpoint:number){
-  const prior=this.effect(commandId)!,state=this.state()!;
-  const effect:PresentationEffectReceipt={...prior,status:'completed',revision:state.revision,catalog:{source:state.source!,revision:checkpoint,ready:true}};
-  delete effect.reason;delete effect.executed;
-  this.db.exec('BEGIN IMMEDIATE');try{this.setEffect(commandId,effect);this.save({...state,projectionRevision:checkpoint,phase:'ready',ready:true,reason:undefined});this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+  const state=this.state()!;
+  this.db.exec('BEGIN IMMEDIATE');try{this.setPayload(commandId,{...this.payload(commandId),projection:{status:'ready',source:state.source!,revision:checkpoint}});this.save({...state,projectionRevision:checkpoint,phase:'ready',ready:true,reason:undefined});this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
   try{this.ports.changed(rows.map(row=>({session:row.session,hidden:!!row.target_hidden})));}catch{/* Notification loss cannot erase the committed receipt. */}
  }
- private async release(commandId:string,lease?:{release():Promise<void>}){
-  const payload=this.payload(commandId);if(payload.protection==='released')return;
-  try{if(lease)await lease.release();else {if(!payload.leaseId)throw Error('Selected protection lease is unconfirmed');await this.ports.protection.reconcile({...payload.context,leaseId:payload.leaseId});}this.setPayload(commandId,{...payload,protection:'released'});}
-  catch{this.setPayload(commandId,{...payload,protection:'unknown'});}
- }
  async apply(input:PresentationApply,actor:PresentationActor):Promise<PresentationReceipt>{return this.serial(async()=>{
-  if(!input||Object.keys(input).sort().join(',')!=='commandId,maintenance,reviewHash,reviewId')throw new PresentationError('Exact apply request required');id(input.commandId);id(input.reviewHash,'review hash',64);
+  if(!input||Object.keys(input).sort().join(',')!=='commandId,reviewHash,reviewId')throw new PresentationError('Exact apply request required');id(input.commandId);id(input.reviewHash,'review hash',64);
   const review=this.review(input.reviewId);if(review.reviewHash!==input.reviewHash||review.actor!==actorKey(actor))throw new PresentationError('Review hash or actor differs');
   if(this.db.prepare('SELECT 1 FROM presentation_rebuilds WHERE command_id=?').get(input.commandId))throw new PresentationError('Command already belongs to reconstruction');
   const signature=hash(input),old=this.db.prepare('SELECT signature FROM presentation_commands WHERE command_id=?').get(input.commandId);
   if(old){if(old.signature!==signature)throw new PresentationError('Apply identity conflicts with original request');return this.receipt(input.commandId,actor)!;}
-  const fence=this.ports.assertMaintenance(input.maintenance);await this.checkReady();this.assertReadable();const state=this.state()!;
-  if(review.expiresAt<Date.now()||state.revision!==review.expectedRevision)throw new PresentationError('Review expired or presentation changed');
+  await this.checkReady();if(review.expiresAt<Date.now())throw new PresentationError('Review expired');
   const rows=this.rows(review.reviewId,-1,501);if(rows.length!==review.count)throw new PresentationError('Retained selection is incomplete');
   const sessions:PresentationIdentity[]=rows.map(row=>JSON.parse(row.metadata).identity);
-  for(const row of rows){const current=this.marker(row.session);if(current.revision!==row.before_revision||current.hidden!==!!row.before_hidden)throw new PresentationError('Selected visibility revision changed');const metadata=await this.ports.metadata(row.session);if(hash(metadata)!==row.metadata_hash)throw new PresentationError('Selected metadata changed since review');}
-  await this.ports.validateSelection(sessions);this.ports.assertMaintenance(input.maintenance);
-  const context:PresentationProtectionContext={commandId:input.commandId,reviewId:review.reviewId,reviewHash:review.reviewHash,operation:review.operation,selectionHash:review.selectionHash,expectedRevision:state.revision,maintenance:input.maintenance,ownerIds:[...fence.owners].sort(),sessions};
-  const effect:PresentationEffectReceipt={commandId:input.commandId,operation:review.operation,part:'conversation-presentation',reviewId:review.reviewId,reviewHash:review.reviewHash,selectionHash:review.selectionHash,count:rows.length,previousRevision:state.revision,status:'unknown',preservesCanonical:true,preservesAuthority:true};
-  this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO presentation_commands VALUES(?,?,?,?,?)').run(input.commandId,signature,review.reviewId,JSON.stringify({context,protection:'unknown'}),JSON.stringify(effect));this.save({...state,ready:false,phase:'applying'});this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
-  let lease:Awaited<ReturnType<ConversationPresentationProtection['acquire']>>|undefined,mutated=false;
-  try{
-   lease=await this.ports.protection.acquire(structuredClone(context));
-   if(!lease||lease.coverage!=='complete'||lease.hostFenceId!==input.maintenance.fenceId||lease.selectionHash!==review.selectionHash||!Array.isArray(lease.ownerIds)||canonical([...lease.ownerIds].sort())!==canonical(context.ownerIds)||!Array.isArray(lease.protected)||lease.protected.length>500||typeof lease.release!=='function')throw Error('Selected reference coverage is incomplete');id(lease.leaseId,'protection lease');
-   this.setPayload(input.commandId,{context,leaseId:lease.leaseId,protection:'held'});
-   if(lease.protected.length){this.setEffect(input.commandId,{...effect,status:'refused',executed:false,reason:'selected-required-reference',catalog:{source:state.source!,revision:state.projectionRevision!,ready:true}});this.save(state);await this.release(input.commandId,lease);return this.receipt(input.commandId,actor)!;}
-   try{await this.ports.validateSelection(sessions);this.ports.assertMaintenance(input.maintenance);}catch(error){if((error as {data?:Json}).data?.executed!==false)throw error;this.setEffect(input.commandId,{...effect,status:'refused',executed:false,reason:'selected-eligibility-changed',catalog:{source:state.source!,revision:state.projectionRevision!,ready:true}});this.save(state);await this.release(input.commandId,lease);return this.receipt(input.commandId,actor)!;}
-   const requests=this.makeBatches(input.commandId,rows,state.projectionRevision!);
+  // Session admission locks cover validation and the one local authority transaction, not catalog I/O.
+  try{await this.ports.withSelection(sessions.map(row=>row.session),async()=>{
+   for(const row of rows){const current=this.marker(row.session);if(current.revision!==row.before_revision||current.hidden!==!!row.before_hidden)throw new PresentationError('Selected visibility revision changed');const metadata=await this.ports.metadata(row.session);if(canonical(metadata.identity)!==canonical(JSON.parse(row.metadata).identity))throw new PresentationError('Selected native identity changed since review');}
+   // Restoring discoverability never needs to stop ongoing exact-ID work.
+   if(rows.some(row=>!!row.target_hidden))await this.ports.validateSelection(sessions.filter((_item,index)=>!!rows[index].target_hidden));
+   const state=this.state()!,projection={status:'pending' as const,source:state.source!};
+   const effect:PresentationEffectReceipt={commandId:input.commandId,operation:review.operation,part:'conversation-presentation',reviewId:review.reviewId,reviewHash:review.reviewHash,selectionHash:review.selectionHash,count:rows.length,previousRevision:state.revision,revision:state.revision+1,status:'completed',preservesCanonical:true,preservesAuthority:true};
    this.db.exec('BEGIN IMMEDIATE');try{
-    for(const row of rows){const metadata=JSON.parse(row.metadata);this.db.prepare('INSERT INTO presentation_markers VALUES(?,?,?,?,?,?) ON CONFLICT(session) DO UPDATE SET hidden=excluded.hidden,revision=excluded.revision,identity=excluded.identity,metadata=excluded.metadata,command_id=excluded.command_id').run(row.session,row.target_hidden,state.revision+1,canonical(metadata.identity),row.metadata,input.commandId);}
-    this.setPayload(input.commandId,{...this.payload(input.commandId),mutationCommitted:true});this.save({...state,revision:state.revision+1,ready:false,phase:'applying'});this.saveBatches(input.commandId,requests);this.db.exec('COMMIT');mutated=true;
+    for(const row of rows){const current=this.marker(row.session);if(current.revision!==row.before_revision||current.hidden!==!!row.before_hidden)throw new PresentationError('Selected visibility revision changed');const metadata=JSON.parse(row.metadata);this.db.prepare('INSERT INTO presentation_markers VALUES(?,?,?,?,?,?) ON CONFLICT(session) DO UPDATE SET hidden=excluded.hidden,revision=excluded.revision,identity=excluded.identity,metadata=excluded.metadata,command_id=excluded.command_id').run(row.session,row.target_hidden,state.revision+1,canonical(metadata.identity),row.metadata,input.commandId);}
+    this.db.prepare('INSERT INTO presentation_commands VALUES(?,?,?,?,?)').run(input.commandId,signature,review.reviewId,JSON.stringify({mutationCommitted:true,projection}),JSON.stringify(effect));
+    // Do not attach new outbox pages to an unconfirmed checkpoint. Explicit derived repair includes all markers.
+    if(state.ready)this.saveBatches(input.commandId,this.makeBatches(input.commandId,rows,state.projectionRevision!));
+    this.save({...state,revision:state.revision+1,ready:false,phase:'applying'});this.db.exec('COMMIT');
    }catch(error){this.db.exec('ROLLBACK');throw error;}
-   await this.dispatchBatches(input.commandId);await this.verifyRows(rows,requests.at(-1)!.throughRevision);this.complete(input.commandId,rows,requests.at(-1)!.throughRevision);await this.release(input.commandId,lease);
-  }catch(error){
-   // Selected protection may be uncertain even when the local visibility transaction never began.
-   const committed=mutated||this.payload(input.commandId).mutationCommitted===true;
-   if(!committed){this.setEffect(input.commandId,{...effect,status:'refused',executed:false,reason:'selected-protection-unavailable',catalog:{source:state.source!,revision:state.projectionRevision!,ready:true}});this.save(state);}
-   else {this.setEffect(input.commandId,{...effect,revision:state.revision+1,reason:'effect-or-projection-unconfirmed'});this.save({...this.state()!,ready:false,phase:'unknown',reason:'inspect-original-receipt'});}
+  });}catch(error){
+   // Every pre-commit operation above is read-only. The SQLite transaction is atomic.
+   if(this.effect(input.commandId))throw error;
+   const state=this.state()!,effect:PresentationEffectReceipt={commandId:input.commandId,operation:review.operation,part:'conversation-presentation',reviewId:review.reviewId,reviewHash:review.reviewHash,selectionHash:review.selectionHash,count:rows.length,previousRevision:state.revision,status:'refused',executed:false,preservesCanonical:true,preservesAuthority:true,reason:String((error as Error).message).slice(0,512)};
+   this.db.prepare('INSERT INTO presentation_commands VALUES(?,?,?,?,?)').run(input.commandId,signature,review.reviewId,JSON.stringify({mutationCommitted:false,projection:{status:state.ready?'ready':'unknown',source:state.source!,revision:state.projectionRevision}}),JSON.stringify(effect));return this.receipt(input.commandId,actor)!;
   }
+  try{this.ports.changed(rows.map(row=>({session:row.session,hidden:!!row.target_hidden})));}catch{/* Marker authority is already durable. */}
+  try{
+   const batches=this.db.prepare('SELECT request FROM presentation_projection_batches WHERE command_id=? ORDER BY ordinal').all(input.commandId);if(!batches.length)throw Error('Prior catalog projection requires derived reconstruction');
+   await this.dispatchBatches(input.commandId);const checkpoint=JSON.parse(String(batches.at(-1)!.request)).throughRevision;await this.verifyRows(rows,checkpoint);this.complete(input.commandId,rows,checkpoint);
+  }catch{this.setPayload(input.commandId,{...this.payload(input.commandId),projection:{status:'unknown',source:this.state()!.source!}});this.save({...this.state()!,ready:false,phase:'unknown',reason:'derived-projection-unconfirmed'});}
   return this.receipt(input.commandId,actor)!;
  });}
  async reconcile(commandId:string,actor:PresentationActor){return this.serial(async()=>{
-  const receipt=this.receipt(commandId,actor);if(!receipt)return null;
-  if(receipt.effect.status==='unknown')try{
-   const rows=this.rows(receipt.effect.reviewId,-1,501);if(rows.length!==receipt.effect.count)throw Error('Selection incomplete');let checkpoint:number;
-   try{checkpoint=await this.observeBatches(commandId);}catch(error){
-    const repair=this.db.prepare("SELECT command_id,payload FROM presentation_rebuilds WHERE json_extract(payload,'$.status')='completed' AND json_extract(payload,'$.revision')=? ORDER BY rowid DESC LIMIT 1").get(receipt.effect.revision??-1);
-    if(!repair||!this.payload(commandId).mutationCommitted||this.state()!.revision!==receipt.effect.revision)throw error;
-    for(const row of rows){const marker=this.db.prepare('SELECT command_id,hidden,revision FROM presentation_markers WHERE session=?').get(row.session);if(marker?.command_id!==commandId||marker.revision!==receipt.effect.revision||!!marker.hidden!==!!row.target_hidden)throw error;}
-    checkpoint=JSON.parse(String(repair.payload)).targetCheckpoint;
-   }
+  const receipt=this.receipt(commandId,actor);if(!receipt||receipt.effect.status==='refused'||receipt.projection.status==='ready')return receipt;
+  try{
+   const rows=this.rows(receipt.effect.reviewId,-1,501);if(rows.length!==receipt.effect.count)throw Error('Selection incomplete');
+   const checkpoint=await this.observeBatches(commandId);
+   // Only open listing if this is the latest marker policy; otherwise an explicit rebuild is required.
+   if(this.state()!.revision!==receipt.effect.revision)throw Error('Later presentation policy requires reconstruction');
    await this.verifyRows(rows,checkpoint);this.complete(commandId,rows,checkpoint);
-  }catch{return this.receipt(commandId,actor);}
-  await this.release(commandId);return this.receipt(commandId,actor);
+  }catch{/* Passive original-receipt observation never redispatches a missing page. */}
+  return this.receipt(commandId,actor);
  });}
  /** Persist only indexed canonical mappings learned through admitted host/catalog boundaries. */
  retainMapping(record:Json){
@@ -212,12 +201,11 @@ export class ConversationPresentation {
   this.db.prepare('INSERT INTO presentation_mappings VALUES(?,?) ON CONFLICT(session) DO UPDATE SET metadata=excluded.metadata').run(record.uri,canonical(record));
  }
  mapping(session:string):Json|undefined{const row=this.db.prepare('SELECT metadata FROM presentation_mappings WHERE session=?').get(session);return row?JSON.parse(String(row.metadata)):undefined;}
- changing(session:string){return !!this.db.prepare("SELECT 1 FROM presentation_review_rows r JOIN presentation_commands c ON c.review_id=r.review_id WHERE r.session=? AND json_extract(c.effect,'$.status')='unknown' LIMIT 1").get(session);}
  async rebuild(input:PresentationRebuild,actor:PresentationActor){return this.serial(async()=>{
-  if(!input||Object.keys(input).sort().join(',')!=='commandId,expectedRevision,maintenance')throw new PresentationError('Exact reconstruction request required');id(input.commandId);revision(input.expectedRevision);const by=actorKey(actor),signature=hash({input,actor:by});
+  if(!input||Object.keys(input).sort().join(',')!=='commandId,expectedRevision')throw new PresentationError('Exact reconstruction request required');id(input.commandId);revision(input.expectedRevision);const by=actorKey(actor),signature=hash({input,actor:by});
   if(this.db.prepare('SELECT 1 FROM presentation_commands WHERE command_id=?').get(input.commandId))throw new PresentationError('Command already belongs to reset or restore');
   const old=this.db.prepare('SELECT signature,payload FROM presentation_rebuilds WHERE command_id=?').get(input.commandId);if(old){if(old.signature!==signature)throw new PresentationError('Reconstruction identity conflicts');return this.publicRebuild(JSON.parse(String(old.payload)));}
-  this.ports.assertMaintenance(input.maintenance);if(!this.ports.reconstructMetadata)throw new PresentationError('Metadata reconstruction scheduling authority is unavailable');const state=this.state()!;if(state.revision!==input.expectedRevision)throw new PresentationError('Presentation revision changed');
+  const state=this.state()!;if(state.revision!==input.expectedRevision)throw new PresentationError('Presentation revision changed');
   let payload:Json={commandId:input.commandId,actor:by,status:'unknown',revision:state.revision,source:state.source,count:0,bytes:0,markerCount:0,manifestHash:'',phase:'capturing'};
   this.db.prepare('INSERT INTO presentation_rebuilds VALUES(?,?,?)').run(input.commandId,signature,JSON.stringify(payload));this.save({...state,ready:false,phase:'rebuilding',reason:'exact-metadata-reconstruction'});
   const save=()=>this.db.prepare('UPDATE presentation_rebuilds SET payload=? WHERE command_id=?').run(JSON.stringify(payload),input.commandId);
@@ -230,7 +218,7 @@ export class ConversationPresentation {
    do{const page=await this.ports.mappings(cursor);if(page.items.length>100)throw Error('Mapping page exceeded100');for(const item of page.items)add(item);if(page.nextCursor&&seenCursors.has(page.nextCursor))throw Error('Repeated mapping cursor');if(page.nextCursor)seenCursors.add(page.nextCursor);cursor=page.nextCursor;}while(cursor);
    let after='';for(;;){const rows=this.db.prepare('SELECT session,metadata FROM presentation_markers WHERE session>? ORDER BY session LIMIT 100').all(after);if(!rows.length)break;for(const row of rows)add(JSON.parse(String(row.metadata)).catalog);after=String(rows.at(-1)!.session);}
    payload.manifestHash=digest.digest('hex');payload.phase='metadata';save();
-   await this.ports.reconstructMetadata({commandId:input.commandId,source:state.source!,readMappings:cursor=>this.mappingPage(input.commandId,cursor)});this.ports.assertMaintenance(input.maintenance);
+   await this.ports.reconstructMetadata?.({commandId:input.commandId,source:state.source!,readMappings:cursor=>this.mappingPage(input.commandId,cursor)});
    const fresh=await this.ports.catalogFreshness();if(fresh.phase!=='complete'||fresh.issues!==0)throw Error('Metadata discovery is incomplete');
    for(let after=-1;;){const rows=this.db.prepare('SELECT * FROM presentation_rebuild_rows WHERE command_id=? AND ordinal>? ORDER BY ordinal LIMIT 100').all(input.commandId,after);if(!rows.length)break;for(const row of rows){const expected=JSON.parse(String(row.metadata)),current=await this.ports.catalogGet(String(row.session));for(const key of ['uri','engineId','nativeSessionId','workingDirectory'])if(!current||current[key]!==expected[key])throw Error('Metadata reconstruction identity differs');if(expected.storagePath&&current!.storagePath!==expected.storagePath)throw Error('Native home mapping differs');}after=Number(rows.at(-1)!.ordinal);}
    const checkpoint=await this.ports.projectionStatus(state.source!);if(checkpoint.source!==state.source||!Number.isSafeInteger(checkpoint.revision)||checkpoint.revision<0)throw Error('Invalid projection checkpoint');

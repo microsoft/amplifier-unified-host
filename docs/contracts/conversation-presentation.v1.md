@@ -1,172 +1,143 @@
 # Conversation presentation boundary, version 1 (candidate)
 
-This is a host integration candidate for the approved WS1/WS4 and MA11 direction.
-It does not change AHP or ACP schemas and is not a whole application or native
-history reset. Implementation and complete owner qualification remain separate.
+This host boundary implements the approved WS1/WS4 and MA11 direction for a
+reviewed, reversible discovery reset. It changes product visibility only. It
+neither revokes execution authority nor changes canonical history, workspace
+files, native visibility, execution receipts, provenance, queues, ownership
+fences, settings or independently owned artifacts.
 
-## Public ports
+The independent F17 boundary review superseded the initial candidate's global
+recovery coupling. The preserved d8508cfe packet is earlier evidence; this
+contract requires no global maintenance hold, participant census, cross-owner
+reference query, or post-restart revalidation API. Product recovery must call
+this distinct presentation branch directly instead of wrapping it in a whole
+application reset. Normal pre-existing host maintenance fences still apply to
+new mutations; visibility cannot bypass them.
 
-- `prepareConversationPresentation({commandId, operation:'reset'|'restore', selection:{kind:'explicit',sessionIds}, expectedRevision, resetCommandId?}, actor)` retains an immutable review. The explicit selection contains at most 500 unique AHP IDs; all identifiers and aggregate metadata are bounded before retained payload I/O. Restore refers to one exact original reset and its retained flags/identities.
-- `readConversationPresentationReview({reviewId,cursor?,limit?}, actor)` returns at most 50 reviewed metadata rows, exact total count, ordered selection hash, expiry and preserved-part explanation. It reads no native history bodies and starts no agent.
-- `applyConversationPresentation({commandId,reviewId,reviewHash,maintenance:{fenceId,commandId}}, actor)` requires an actual held recovery fence, exact trusted actor binding, fresh policy and per-row CAS, and complete declared presentation-reference protection. It changes only product presentation visibility. It never repeats an admitted command.
-- `conversationPresentationReceipt(commandId, actor)` returns the original host receipt. `reconcileConversationPresentation(commandId, actor)` observes original catalog child receipts only, without redispatching a reset/restore.
-- `rebuildConversationPresentation({commandId,expectedRevision,maintenance:{fenceId,commandId}}, actor)` is a separately admitted derived-index reconstruction from retained authoritative identities and visibility markers. It never replays a reset, restore, native command or agent input.
-- `inspectConversationPresentation()` reports availability, host policy revision and catalog projection/reconstruction readiness.
-- `withConversationCatalogRead(callback)` checks readiness before and after the bounded read. Every product catalog listing/adoption consumer must use this guard; there is no unfenced fallback.
+## Public ports and authority
 
-The host exports concrete TypeScript DTOs from its public package. The wire
-product adapter is independently owned and must not invent a client-supplied
-actor, fence, native identity, global catalog revision or completion proof.
+The public TypeScript definitions are in
+[`src/presentation-types.ts`](../../src/presentation-types.ts). The trusted
+embedding supplies `PresentationActor`; wire arguments never establish actor,
+native identity, originating agent session or filesystem authority.
 
-## Retained authority
+- `prepareConversationPresentation({commandId,operation:'reset'|'restore',selection:{kind:'explicit',sessionIds},resetCommandId?}, actor)` retains an immutable selected review. Restore refers to the original exact completed local reset.
+- `readConversationPresentationReview({reviewId,cursor?,limit?}, actor)` returns bounded metadata pages and an ordered selection hash. `observedRevision` is diagnostic, not a global reset/undo CAS.
+- `applyConversationPresentation({commandId,reviewId,reviewHash}, actor)` atomically validates selected native identities and each selected visibility revision, then persists the original before-images, markers, local receipt and projection outbox.
+- `conversationPresentationReceipt(commandId, actor)` returns the original local effect plus separate derived projection progress. `readConversationPresentationEffectReceipt(commandId)` is a trusted metadata-only exact effect read.
+- `reconcileConversationPresentation(commandId, actor)` reads original child receipts only. It does not dispatch any missing original page or replay the original reset.
+- `rebuildConversationPresentation({commandId,expectedRevision}, actor)` explicitly reconstructs the derived projection from retained identity/marker authority. It can repair an interrupted reset after host death. This new repair command does not resubmit the original user operation or any native input.
+- `reconcileConversationPresentationRebuild(commandId, actor)` observes an original repair's exact child receipts. Missing pages remain unconfirmed; another explicit derived repair may reconstruct from authority.
+- `inspectConversationPresentation()` reports discovery readiness and policy/checkpoint revisions.
+- `withConversationCatalogRead(callback)` guards discovery reads before and after projection changes. It is not an execution-admission or exact-ID authorization boundary.
 
-The host persists one opaque projection source UUID across process restarts and
-catalog loss. It retains immutable exact identity/before-image metadata, original
-selection and batch hashes, host policy/per-row revisions, command receipts and
-projection checkpoints. Reset hides the selected product rows; restore uses the
-exact prior visibility flag after a fresh review and CAS. Neither operation
-changes nativeDeleted, native archive/workspace state or managed file authority.
+`HostConfig.conversationPresentation` enables this owner when the configured
+catalog supports the visibility projection protocol. Its only optional port is
+`reconstructMetadata({commandId,source,readMappings})`, a trusted scheduler for
+repairing lost metadata. Existing complete metadata can be reprojected without
+that callback. Missing metadata without a reconstruction owner remains explicitly
+unavailable; identities cannot be guessed.
 
-Canonical native metadata/transcripts/events, workspace/managed files, input and
-provenance indexes, admitted/unknown receipts, queue-consumption tombstones,
-transfer/relocation/disposal fences and independently owned records remain intact.
-Retained records do not become consent or permission to replay work.
+## Selected transaction and undo
 
-Protection is distinct from `retentionHide` and `managedFiles`. Configured owners
-must provide genuine held coverage for active/queued/unknown work, required future
-work and dependent records that cannot remain recoverably reachable. Merely
-reporting idle, having zero viewers or returning a no-op lease is insufficient.
-Absent or partial coverage leaves this capability unavailable. A selected client
-is protected without synchronizing its private draft or editor state.
+The host synchronously reserves all idle selected admission mutexes. If any
+selected admission is already in progress, it refuses before effect rather than
+holding a partial family lock. Existing selected viewers, active or unknown
+inputs, pending queue/steering and unresolved ownership transitions prevent
+hiding. Relevant subscriptions and new admissions use the same mutexes. A new
+selected action waits until the marker transaction releases; unrelated sessions
+continue. Locks are released before catalog projection I/O.
 
-## Catalog projection and reconstruction
+Restore does not stop ongoing exact-ID work when its target visibility is visible.
+A restore that reinstates a previously hidden flag follows the hiding guard.
+There is no query to immutable artifacts, completed receipts, exports or undo
+records. They remain reachable by their authorized exact identifiers. Future
+scheduled work retains its original admission and permission checks.
 
-The catalog remains derived. Its qualified `projectSessionVisibility` protocol
-supports at most 100 unique indexed identities per batch, stable source ownership,
-monotonic checkpoints and exact child receipts. The host records every original
-request before dispatch. An old successful retry cannot overwrite newer state.
-Its checkpoint is not a global catalog snapshot revision; initial selection is
-explicit only.
+Each selected row's identity and visibility revision must still match its review.
+A mutable title does not establish or revoke native identity. Undo checks the
+selected rows against the original reset revision, not the current global policy
+revision. Disjoint reviewed resets and disjoint undos therefore coexist. Changes
+to the same selected row require a new review; a changed native identity refuses.
 
-Before incomplete projection/reconstruction can be served, the host durably
-fences listing and ordinary adoption. Root/session resource paths and every
-optional product catalog consumer observe that fence. Passive original receipts
-and metadata writer hints remain available. An unknown child receipt never
-implicitly opens listing.
+The review's before-images and local effect are immutable. `effect.status` is
+`completed` once the SQLite marker transaction commits, or `refused` with
+`executed:false` on a known local pre-commit refusal. Derived failure does not
+change completed into unknown. Receipt `projection.status` independently reports
+`pending`, `unknown` or `ready`. Product UI must distinguish a saved visibility
+change from list reconstruction readiness. An exact command repeat returns the
+receipt, never reexecutes the marker transaction.
 
-Reconstruction captures a stable-URI manifest of every host-owned marker,
-including explicit false flags, exact unique count, bounded page digests, rebuild
-epoch and final checkpoint. It first verifies complete metadata discovery and
-exact mappings, then reconstructs markers in bounded pages, verifies each identity
-and flag and the aggregate count/checkpoint, and finally CAS-opens readiness.
-Empty reconstruction requires an explicit completion batch. Missing rows,
-conflicting source/identity, incomplete discovery or changed checkpoints keep the
-fence. Native external-writer coverage is not inferred from the catalog.
+## Discovery versus exact identifiers
 
-## Required falsifiers
+Product-hidden rows are excluded by indexed catalog filtering before pagination.
+Host coordination discovery and ordinary Recall inventories use the same list
+readiness boundary. Root summary notifications cannot reinsert a hidden row.
 
-Reset/undo and rebuild must preserve byte hashes of all canonical and retained
-authority; cold reads must not start an agent or read native event/transcript bodies.
-Test duplicate/changed commands, changed review/identity/row revisions, prior true
-flags, native/workspace exclusion, retained active/future/unknown owner work,
-selected viewers and missing coverage. Kill/reopen before dispatch, between two
-pages, after catalog commit before acknowledgement and before readiness CAS.
-A 105+ row snapshot, empty snapshot, absent second page, unexpected checkpoint and
-catalog loss must all retain correct list/adoption fencing and exact restoration.
+Authorized exact-ID status, subscriptions, history, original command/undo
+receipts, resources/artifacts, Recall source reads and deferred commands remain
+available despite hidden discovery or an incomplete derived projection. The host
+uses its retained canonical mapping when a derived catalog row is temporarily
+missing; conflicting identities still refuse. Existing native deletion, missing
+workspace, managed allocation, transfer, relocation and unknown execution guards
+remain unchanged. Hiding does not make unknown work complete or runnable and
+never triggers replay. Visibility itself does not disable execution.
 
-Candidate limits and API names above are proposed integration details; they are
-not a claim of shipped/runtime/browser acceptance. The preserved Linux service
-qualification is a separate completed gate and does not prove this feature.
+Every composition consumer must distinguish these two uses. Workspace/Recall
+lists, migration discovery and complete inventory claims need the list guard.
+Authorized exact-ID reads and original receipt lookup must not be wrapped in it.
+New mapping claims still require their own verified native creation/adoption
+proof. The listing guard is not that proof.
 
-## Frozen embedding contract and acceptance boundary
+## Bounds
 
-The source of truth for method arguments and results is
-[`src/presentation-types.ts`](../../src/presentation-types.ts). `PresentationActor`
-is a trusted embedding value, never wire data; its identity/origin/optional agent
-session must match at preview, apply, page read and original receipt lookup.
-Agent origin retains its originating session; application authorization determines
-which explicit shared selection it may administer. Host-only resource scope does
-not erase that origin. No native ID supplied by a browser proves ownership.
+Selection contains 1–500 explicit unique AHP IDs; no live cursor is an immutable
+all-conversations selection. Reviews expire after ten minutes (`expiresAt` is
+Unix milliseconds). Pages contain at most 50 rows and 256 KiB of row metadata;
+a smaller page has an exact next cursor. Each retained metadata row is at most
+16 KiB, the review at most 8 MiB, and at most 64 live unapplied reviews are kept.
+Oversized input refuses without truncation. Expired unapplied reviews may be
+removed; reviews attached to effects remain.
 
-`expiresAt` is Unix **milliseconds**. A preview is valid for ten minutes. Pages
-contain at most 50 rows and 256 KiB of row metadata (a smaller page has an exact
-next cursor). Individual retained metadata is limited to 16 KiB, the complete
-explicit review to 8 MiB, and there are at most 64 live unapplied reviews. Expired
-unapplied reviews may be removed; any review attached to an effect remains.
-Oversized metadata is refused without truncation. The product adapter stores
-review/selection hashes and command references, not the private before-images.
+Private metadata reconstruction pages contain at most 100 rows, with a manifest
+ceiling of 100,000 rows/64 MiB. Public product journals retain hashes, counts and
+command references rather than canonical paths or private before-images.
 
-Apply must execute **inside** the existing `withQuiescenceMaintenance` callback
-for the exact recovery fence. Matching two strings outside that live callback is
-insufficient. Detached continuations lose authority when the callback ends.
-Service-stop and distribution-update contexts cannot grant presentation rights.
-Preview may run inside that same callback or through ordinary host admission.
+## Catalog reconstruction and restart
 
-The selected protection coordinator receives the already-held recovery owner
-census. It must derive its distinct `presentationReset` inspection from those
-actual leases, not acquire them a second time. Its `leaseId`, owner set, selected
-hash and host fence must match. Selected current viewers, unknown/pending input,
-ownership transitions and required future work protect the selected rows.
-Immutable artifacts, exports, completed receipts and undo links are not by
-themselves blockers: exact-ID retained reads and recovery remain available and
-those records are untouched. A reference owner must report any dependency whose
-only recoverable access path would be lost. Root composition owns this complete
-configured-owner audit; the host fixture does not qualify those owners.
+The host's projection source UUID survives process restart and catalog loss.
+Each original bounded catalog page is recorded before dispatch. Listing is closed
+before incomplete projection can escape. No uncertain page is automatically
+redispatched. Passive acknowledgement recovery may finish a proven original
+projection. Otherwise an explicit repair reads retained markers, including false
+flags, and creates new derived pages against the catalog's actual checkpoint.
+It leaves all original marker effects, receipts and native inputs unchanged.
 
-`PresentationReceipt` separates `effect.status` from `protection`. A conclusive
-local refusal has `executed:false`, even when reference acquisition is uncertain.
-A completed effect remains completed if releasing its selected hold loses an
-acknowledgement. In both cases `protection:'unknown'` prevents a product adapter
-from claiming global recovery settlement. Passive reconciliation checks exact
-original catalog receipts and calls only the selected coordinator's reconcile
-port. It never dispatches a missing original page.
+For metadata loss, the trusted reconstruction owner launches the catalog without
+`--scan-on-start` or `--hint-directory`, with `--scan-interval 0` and preferably
+`--workspace-check-interval 0`. Seed exact canonical parent/child URI mappings and
+retained storage paths before requesting a new scan. Await the new scan's runId
+completing with zero issues, not a previous scan's complete status. Automatic
+scans/hints must not race seeding; later maintenance needs its own ordered owner.
 
-## Reconstruction scheduling obligations
+The host independently verifies every exact mapping, native storage path,
+visibility flag, manifest count and final projection checkpoint before opening
+discovery. Even an empty manifest requires an explicit checkpoint. Missing,
+aliased, conflicting or unverified legacy mappings remain unavailable rather
+than being silently rekeyed. A failed reconstruction limits discovery completeness;
+it does not fence unrelated execution or retained exact-ID recovery.
 
-The trusted `reconstructMetadata` callback receives bounded private mapping
-manifest pages (100 rows, 16 KiB per row; at most 100,000 rows/64 MiB in the retained
-manifest). Root must launch a replacement catalog without `--scan-on-start` or
-`--hint-directory`, with `--scan-interval 0` and preferably
-`--workspace-check-interval 0`. Seed exact canonical parent/child URI mappings,
-including native storage paths where retained, before explicit `scan`. Poll its
-status to complete with zero issues, then return. No automatic 300-second scan
-may race seeding. Existing metadata hints and migrations must share that schedule.
+## Acceptance and limits
 
-The host independently checks every mapping, native source path, visibility flag,
-manifest count and final checkpoint. An empty manifest still needs an explicit
-empty projection completion. A separate explicit reconstruction may repair a
-partially projected local policy; the original reset then reconciles against that
-complete repair at the exact unchanged policy revision. It does not rerun the
-original visibility transaction or native work.
+Journal tests cover bounds, actor binding, per-row CAS, mixed before-images,
+disjoint undo, local authority preservation, every projection interruption stage,
+explicit reconstruction, empty/missing pages and in-flight list races. Public
+host tests use an independently installed catalog and ACP fixture: selected
+viewer/active/queue refusal, hidden exact-ID history/resources/input provenance,
+deferred scheduled input, unrelated work during a selected transaction and
+catalog loss. Actual SIGKILL cases test post-marker/pre-page, between-page and
+post-catalog-commit/pre-reply recovery with preserved canonical bytes.
 
-Legacy host rows without retained canonical catalog mappings cannot be guessed
-after index loss. They remain fenced until their original mapping is restored.
-Do not silently rekey, accept a caller identity, or claim that a live catalog
-cursor is an immutable all-conversations snapshot. The supported initial
-selection is explicit only.
-
-**Current recovery limit:** passive final-ack recovery works across host restart.
-An interrupted multi-page projection can be explicitly reconstructed while the
-original genuine recovery hold remains live. After host death the global gate is
-intentionally unknown; re-entering mutation maintenance requires independently
-verified owner-hold revalidation. This candidate supplies no boolean bypass or
-implicit release for that case. That composition mechanism is still required
-before claiming automatic post-crash reconstruction.
-
-Source acceptance covers immutable selection, actor/CAS/expiry/byte bounds,
-actual host maintenance scope, no-op mutation replay refusal, selected-reference
-refusal, lost catalog/release acknowledgements, mixed prior flags, 105-row and
-empty reconstruction, readiness races, and an installed catalog over public
-stdio. The installed fixture uses a failing agent executable and rejects catalog
-transcript/event opens; all canonical fixture bytes remain identical. Full
-product-owner, browser and live-deployment acceptance are separate gates.
-
-## Pending design review
-
-The current candidate uses the existing recovery hold. An independent boundary
-review is evaluating whether presentation-only visibility requires this global
-maintenance dependency or can use a smaller selected admission/reference lease.
-No new all-owner hold-revalidation API is implemented or implied by this packet.
-Any replacement must preserve the concrete viewed/active/queued/required-future
-and unreachable-reference protections above without treating immutable retained
-records as blockers. The current package is not a shipped product feature.
+These are owned offline fixtures. They do not establish the product adapter,
+browser UI or live deployment. No production native model or account call is
+part of this qualification. The earlier Linux service qualification is separate.

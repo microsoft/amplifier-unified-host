@@ -110,6 +110,7 @@ export class AmplifierHost {
   readonly store:Store;
   private intake:QuiescenceGate;
   private presentation?:ConversationPresentation;
+  private presentationSelections=new Set<string>();
   readonly http:Server;
   readonly ws:WebSocketServer;
   private peers=new Set<Peer>();
@@ -151,7 +152,7 @@ export class AmplifierHost {
     if(new Set(config.engines.map(e=>e.id)).size!==config.engines.length)throw new Error('Duplicate engine identifier');
     if(config.transferIdentity!==undefined&&!/^[a-f0-9]{64}$/.test(config.transferIdentity))throw new Error('transferIdentity must be an exact node public-key fingerprint');
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
-    if(config.conversationPresentation){const c=config.catalog,p=config.conversationPresentation.protection;if(!c?.projectSessionVisibility||!c.sessionVisibilityProjectionStatus||!c.sessionVisibilityProjectionReceipt||!c.status||!config.quiescence||p?.presentationReset?.version!==1||p.presentationReset.preservesCanonical!==true||p.presentationReset.preservesAuthority!==true||typeof p.acquire!=='function'||typeof p.reconcile!=='function')throw Error('Conversation presentation requires indexed projection and real held recovery reference coverage');}
+    if(config.conversationPresentation){const c=config.catalog;if(!c?.projectSessionVisibility||!c.sessionVisibilityProjectionStatus||!c.sessionVisibilityProjectionReceipt||!c.status)throw Error('Conversation presentation requires the indexed visibility projection protocol');}
     this.store=new Store(config.stateDirectory,config.replayLimit);
     if(!config.conversationPresentation&&this.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='presentation_state'").get()){this.store.close();throw Error('Retained conversation presentation authority requires its configured owner; it cannot be disabled to bypass a fence');}
     this.managedFiles=new ManagedFilesJournal(this.store.db);
@@ -169,11 +170,10 @@ export class AmplifierHost {
     const requirements=[...new Set(Object.entries(config.capabilities?.manifest.actions??{}).filter(([name])=>!config.capabilities?.quiescenceAccess?.[name]).map(([,action])=>coverage?.capabilities?.[action.topic]??'uncovered-capability:'+action.topic)),...(config.resourceProviders??[]).filter(provider=>provider.write).map(provider=>coverage?.resources?.[provider.scheme]??'uncovered-resource:'+provider.scheme),...(config.nativeHostRequest||config.nativeEvent?(coverage?.nativeHostOwners?.length?coverage.nativeHostOwners:[coverage?.nativeHost??'uncovered-native-host']):[])];
     this.intake=new QuiescenceGate(this.store.db,config.quiescence,requirements,()=>this.quiescenceWork(),()=>this.quiesceAgents());
     if(config.conversationPresentation){
-      const catalog=config.catalog,protection=config.conversationPresentation.protection;
-      if(!catalog?.projectSessionVisibility||!catalog.sessionVisibilityProjectionStatus||!catalog.sessionVisibilityProjectionReceipt||!catalog.status||!config.quiescence||protection.presentationReset?.version!==1||protection.presentationReset.preservesCanonical!==true||protection.presentationReset.preservesAuthority!==true||typeof protection.reconcile!=='function')throw Error('Conversation presentation requires indexed projection and real held recovery reference coverage');
+      const catalog=config.catalog!;
       this.presentation=new ConversationPresentation(this.store.db,{
-        metadata:session=>this.presentationMetadata(session),assertMaintenance:fence=>this.intake.assertRecoveryMaintenance(fence),
-        validateSelection:sessions=>this.validatePresentationSelection(sessions),protection,
+        metadata:session=>this.presentationMetadata(session),
+        withSelection:(sessions,work)=>this.withPresentationSelection(sessions,work),validateSelection:sessions=>this.validatePresentationSelection(sessions),
         projectionStatus:source=>catalog.sessionVisibilityProjectionStatus!({source}),project:request=>catalog.projectSessionVisibility!(request),projectionReceipt:(source,commandId)=>catalog.sessionVisibilityProjectionReceipt!({source,commandId}),
         catalogGet:session=>catalog.get(session),catalogFreshness:()=>catalog.status!(),
         mappings:async after=>{const rows=this.store.db.prepare('SELECT uri FROM sessions WHERE uri>? ORDER BY uri LIMIT 100').all(after??'');const items=[];for(const row of rows){const retained=this.presentation!.mapping(String(row.uri));if(!retained)throw Error('Host mapping lacks retained canonical metadata; reconstruct its original authority first');items.push(retained);}return {items,...(rows.length===100?{nextCursor:String(rows.at(-1)!.uri)}:{})};},
@@ -324,7 +324,7 @@ export class AmplifierHost {
   private async record(uri:string):Promise<SessionRecord> {
     let record=this.getRecord(uri);if(record){await this.selectedWorkspace(record);return this.getRecord(uri)!;}
     const session=uri.startsWith('ahp-chat:/')?`ahp-session:/${uri.slice('ahp-chat:/'.length)}`:uri;
-    const discovered=await this.withConversationCatalogRead(()=>this.config.catalog?.get(session)??Promise.resolve(undefined));
+    const discovered=await this.exactCatalogRecord(session);
     if(!discovered)throw new RpcFault(-32008,'Unknown resource');
     if(discovered.location?.kind==='managed')throw new RpcFault(-32009,'Managed session must be restored from its local allocation receipt before activation');
     await this.workspace(pathToFileURL(discovered.workingDirectory).href);
@@ -334,7 +334,7 @@ export class AmplifierHost {
     const chat:ChatState={resource:chatURI(session),title:summary.title,status:summary.status,modifiedAt:timestamp,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:false,reason:'Native history projection has not been imported'}}};
     record={uri:session,engineId:discovered.engineId,nativeSessionId:discovered.nativeSessionId,workingDirectory:discovered.workingDirectory,summary,
       state:{provider:summary.provider,title:summary.title,status:summary.status,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:{'amplifier.dev/native':{availability:discovered.availability??'available'},...(discovered.nativeDeleted?{'amplifier.dev/lifecycle':{version:1,deleted:true,source:'native-catalog'}}:{})}},chat};
-    this.presentation?.assertReadable();if(this.presentation&&discovered.nativeSessionId)this.presentation.retainMapping(discovered as unknown as Json);this.store.save(record);if(discovered.nativeDeleted){this.store.db.prepare('INSERT OR REPLACE INTO session_visibility VALUES(?,1,?)').run(record.uri,'catalog-native-deleted');this.store.db.prepare('UPDATE sessions SET hidden=1 WHERE uri=?').run(record.uri);}this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);return record;
+    if(this.presentation&&discovered.nativeSessionId)this.presentation.retainMapping(discovered as unknown as Json);this.store.save(record);if(discovered.nativeDeleted){this.store.db.prepare('INSERT OR REPLACE INTO session_visibility VALUES(?,1,?)').run(record.uri,'catalog-native-deleted');this.store.db.prepare('UPDATE sessions SET hidden=1 WHERE uri=?').run(record.uri);}this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);return record;
   }
   private getRecord(uri:string):SessionRecord|undefined {return this.hotRecords.get(uri.startsWith('ahp-chat:/')?'ahp-session:/'+uri.slice('ahp-chat:/'.length):uri)??this.store.get(uri);}
   private catalogSummary(record:CatalogRecord):SessionSummary {
@@ -353,14 +353,13 @@ export class AmplifierHost {
     const value=this.recallCursors.get(token);if(!value||value.scope!==scope)throw new RpcFault(-32602,'Recall cursor expired or belongs to a different source/query/revision');return value;
   }
   private recallMetadata(record:CatalogRecord):RecallSource {
-    if(record.productHidden||this.presentation?.hidden(record.uri))throw new RpcFault(-32008,'Conversation is hidden from product discovery');
     if((record as Json).nativeDeleted)throw new RpcFault(-32008,'Removed native source is not visible');
     if(record.parentUri||record.kind&&record.kind!=='root'&&record.kind!=='session')throw new RpcFault(-32601,'Child/internal Recall sources are not advertised');
     if(record.workspaceAvailability&&record.workspaceAvailability!=='present')throw new RpcFault(-32008,'Recall workspace is not currently visible');
     return {id:record.uri,title:record.title,workspace:record.workingDirectory,kind:record.kind??'root'};
   }
   private async recallSource(id:string):Promise<{source:RecallSource;record:SessionRecord}> {
-    const catalog=await this.withConversationCatalogRead(()=>this.config.catalog?.get(id)??Promise.resolve(undefined));
+    const catalog=await this.exactCatalogRecord(id);
     if(catalog){if(catalog.uri!==id)throw new RpcFault(-32008,'Catalog returned a different source identity');this.recallMetadata(catalog);if((catalog as Json).isArchived)throw new RpcFault(-32008,'Archived source is not visible');}
     const record=await this.record(id);
     if(record.state.status & SessionStatus.IsArchived)throw new RpcFault(-32008,'Archived source is not visible');
@@ -413,7 +412,7 @@ export class AmplifierHost {
     const limit=bounded(input.limit,32,32),after=input.afterSequence??0;if(!Number.isSafeInteger(after)||after<0)throw new RpcFault(-32602,'A nonnegative result sequence is required');
     if(typeof session!=='string'||!session.startsWith('ahp-session:/'))throw new RpcFault(-32602,'An exact session URI is required');
     const row=this.store.db.prepare('SELECT uri,chat_uri,cwd,summary,hidden FROM sessions WHERE uri=?').get(session);
-    if(!row){const discovered=await this.withConversationCatalogRead(()=>this.config.catalog?.get(session)??Promise.resolve(undefined));if(!discovered)throw new RpcFault(-32008,'Unknown coordination target');await this.workspace(pathToFileURL(discovered.workingDirectory).href);return {available:false,reason:'not-indexed',session,results:[],coverage:{source:'host-indexed',nativeHistoriesRead:false},attentionUnknown:true};}
+    if(!row){const discovered=await this.exactCatalogRecord(session);if(!discovered)throw new RpcFault(-32008,'Unknown coordination target');await this.workspace(pathToFileURL(discovered.workingDirectory).href);return {available:false,reason:'not-indexed',session,results:[],coverage:{source:'host-indexed',nativeHistoriesRead:false},attentionUnknown:true};}
     await this.workspace(pathToFileURL(String(row.cwd)).href);
     const rows=this.store.db.prepare('SELECT * FROM coordination_results WHERE chat=? AND sequence>? ORDER BY sequence LIMIT ?').all(String(row.chat_uri),after,limit+1),latest=Number(this.store.db.prepare('SELECT coalesce(max(sequence),0) n FROM coordination_results WHERE chat=?').get(String(row.chat_uri))!.n);
     const cutoff=Number(this.store.db.prepare("SELECT value FROM meta WHERE key='coordination_start_ordinal'").get()!.value),legacy=!!this.store.db.prepare('SELECT 1 FROM turns WHERE chat=? AND ordinal<=? LIMIT 1').get(String(row.chat_uri),cutoff);
@@ -558,7 +557,7 @@ export class AmplifierHost {
   private async subscribe(peer:Peer,uri:string,turns?:number) {
     if(peer.subscriptions.size>=(this.config.maxSubscriptions??64)&&!peer.subscriptions.has(uri))throw new RpcFault(-32000,'Subscription capacity reached');
     if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');
-    const snapshot=await this.snapshot(uri,turns);if(this.retentionChanging.has(uri)||this.presentation?.changing(uri.replace('ahp-chat:','ahp-session:')))throw new RpcFault(-32011,'Selected session has an admitted presentation or retention operation');peer.subscriptions.add(uri);return snapshot;
+    const snapshot=await this.snapshot(uri,turns);const attach=async()=>{if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');peer.subscriptions.add(uri);return snapshot;};const session=uri.replace('ahp-chat:','ahp-session:');return this.presentationSelections.has(session)?this.withLock(session,attach):attach();
   }
   private async route(peer:Peer,method:string,p:Json):Promise<unknown> {
     if(method==='ping')return null;
@@ -948,7 +947,7 @@ export class AmplifierHost {
         if(this.config.catalog&&!this.config.catalog.claimNative)throw new RpcFault(-32601,'Catalog lacks atomic native import registration',{executed:false});
         const proof=await this.verifiedImport(input);
         return this.withLock(input.session,async()=>{
-          const existing=this.getRecord(input.session)??await this.withConversationCatalogRead(()=>this.config.catalog?.get(input.session)??Promise.resolve(undefined));
+          const existing=this.getRecord(input.session)??await this.exactCatalogRecord(input.session);
           if(existing&&(existing.engineId!==input.engineId||existing.nativeSessionId!==proof.nativeSessionId||existing.workingDirectory!==input.workingDirectory))throw new RpcFault(-32011,'Requested AHP identity belongs to another native session',{executed:false});
           const duplicate=this.store.db.prepare('SELECT uri FROM sessions WHERE engine_id=? AND native_id=? AND cwd=? LIMIT 1').get(input.engineId,proof.nativeSessionId,input.workingDirectory);
           if(duplicate&&duplicate.uri!==input.session)throw new RpcFault(-32011,'Imported native identity already has a host mapping',{executed:false});
@@ -983,7 +982,7 @@ export class AmplifierHost {
       if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
       const payload=JSON.stringify(input),prior=this.store.db.prepare('SELECT * FROM transfer_commands WHERE command_id=?').get(input.commandId);
       if(prior){if(prior.operation!=='destination.adopt'||prior.payload!==payload)throw new RpcFault(-32011,'Transfer adoption ID was reused',{executed:false});if(prior.status==='completed')return JSON.parse(String(prior.result));throw new RpcFault(-32011,'Adoption already attempted; inspect the original receipt without replay',{receipt:input.commandId,outcome:prior.status});}
-      const existing=this.getRecord(input.session)??(this.config.catalog?await this.withConversationCatalogRead(()=>this.config.catalog!.get(input.session)):undefined);
+      const existing=this.getRecord(input.session)??await this.exactCatalogRecord(input.session);
       if(existing&&(existing.nativeSessionId!==input.nativeSessionId||existing.engineId!==input.engineId||existing.workingDirectory!==historyHome))throw new RpcFault(-32011,'Existing AHP identity belongs to a different native session',{executed:false});
       if(this.active.has(input.session)||this.starting.has(input.session)||this.transferFence(input.session))throw new RpcFault(-32011,'Destination session already has an owner or unresolved transition',{executed:false});
       const timestamp=now(),title=input.title??(existing&&'summary' in existing?existing.summary.title:existing?.title)??'Transferred conversation';
@@ -1062,8 +1061,7 @@ export class AmplifierHost {
       }finally{for(const uri of fenced)this.retentionChanging.delete(uri);}
     });
   }
-  private guardSessionLifecycle(session:string,allowPresentationRead=false) {
-    if(!allowPresentationRead&&(this.presentation?.hidden(session)||this.presentation?.changing(session)))throw new RpcFault(-32011,'Restore the retained conversation presentation before new execution',{executed:false});
+  private guardSessionLifecycle(session:string) {
     this.guardTransfer(session);
     if(this.managedFiles.fence(session))throw new RpcFault(-32011,'Managed files disposal is fenced; inspect its receipt or create an independent recovery copy');
     const allocation=this.managed?.bySession(session);if(allocation&&allocation.state!=='completed')throw new RpcFault(-32011,'Managed creation is unresolved; inspect its original receipt without replay');
@@ -1215,7 +1213,7 @@ export class AmplifierHost {
       const previous=this.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(args.commandId);
       if(previous){if(previous.session!==record.uri||previous.operation!==operation||previous.payload!==JSON.stringify(args))throw new RpcFault(-32011,'Lifecycle command ID conflicts with its original request');if(previous.status==='completed')return JSON.parse(String(previous.result));throw new RpcFault(-32011,'Original lifecycle receipt is not completed; inspect it without replay',{receipt:args.commandId,outcome:previous.status,executed:previous.status==='failed'?false:undefined});}
       this.guardTransfer(record.uri);
-      if(!['restore','legacyCopy.purge'].includes(operation)&&!((operation==='export'||operation==='fork'&&args.mode==='recovery')&&this.managedFiles.fence(record.uri)?.status==='completed'))this.guardSessionLifecycle(record.uri,operation==='export');else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
+      if(!['restore','legacyCopy.purge'].includes(operation)&&!((operation==='export'||operation==='fork'&&args.mode==='recovery')&&this.managedFiles.fence(record.uri)?.status==='completed'))this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
       if(this.store.unknown(record.chat.resource)&&!(operation==='fork'&&args.mode==='recovery')||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
       if(this.config.catalog&&['delete','restore'].includes(operation)&&!this.config.catalog.setVisibility)throw new RpcFault(-32601,'Catalog cannot project native visibility',{executed:false});
       await this.quiesceLifecycle(record);
@@ -1908,7 +1906,7 @@ export class AmplifierHost {
   /** One bounded observer per active capability consumer, with an explicit release callback. */
   async observeSession(session:string,listener:(event:ActionEnvelope)=>void|Promise<void>,onError?:(error:Error)=>void) {
     if(this.observers.size>=64)throw new RpcFault(-32000,'Scoped observer capacity reached');const record=await this.record(session);
-    const observer={session:record.uri,chat:record.chat.resource,queue:[] as ActionEnvelope[],bytes:0,running:false,closed:false,listener,onError};this.observers.add(observer);
+    const observer={session:record.uri,chat:record.chat.resource,queue:[] as ActionEnvelope[],bytes:0,running:false,closed:false,listener,onError};if(this.presentationSelections.has(record.uri))await this.withLock(record.uri,async()=>{this.observers.add(observer);});else this.observers.add(observer);
     return ()=>{observer.closed=true;observer.queue=[];this.observers.delete(observer);};
   }
   private async prompt(message:Message,record:SessionRecord,resolveReferences=true):Promise<ContentBlock[]> {
@@ -2143,17 +2141,31 @@ export class AmplifierHost {
   private requirePresentation(){if(!this.presentation)throw new RpcFault(-32601,'Conversation presentation reset is unavailable',{executed:false});return this.presentation;}
   inspectConversationPresentation(){return this.presentation?.inspect()??{enabled:false,ready:true,revision:0,phase:'disabled'};}
   withConversationCatalogRead<T>(work:()=>Promise<T>):Promise<T>{return this.presentation?this.presentation.read(work):work();}
-  prepareConversationPresentation(input:PresentationPrepare,actor:PresentationActor){const fence=this.intake.inspect().fence;if(fence){this.intake.assertRecoveryMaintenance(fence);return this.requirePresentation().prepare(input,actor);}return this.intake.run(()=>this.requirePresentation().prepare(input,actor));}
+  prepareConversationPresentation(input:PresentationPrepare,actor:PresentationActor){return this.intake.run(()=>this.requirePresentation().prepare(input,actor));}
   readConversationPresentationReview(input:{reviewId:string;cursor?:string;limit?:number},actor:PresentationActor){return this.requirePresentation().page(input,actor);}
-  applyConversationPresentation(input:PresentationApply,actor:PresentationActor){return this.requirePresentation().apply(input,actor);}
+  applyConversationPresentation(input:PresentationApply,actor:PresentationActor){return this.intake.run(()=>this.requirePresentation().apply(input,actor));}
   conversationPresentationReceipt(commandId:string,actor:PresentationActor){return this.requirePresentation().receipt(commandId,actor);}
   /** Trusted release verifier only; never exposes the retained private before-images. */
   readConversationPresentationEffectReceipt(commandId:string){return this.requirePresentation().effect(commandId);}
   reconcileConversationPresentation(commandId:string,actor:PresentationActor){return this.requirePresentation().reconcile(commandId,actor);}
-  rebuildConversationPresentation(input:PresentationRebuild,actor:PresentationActor){return this.requirePresentation().rebuild(input,actor);}
+  rebuildConversationPresentation(input:PresentationRebuild,actor:PresentationActor){return this.intake.run(()=>this.requirePresentation().rebuild(input,actor));}
   reconcileConversationPresentationRebuild(commandId:string,actor:PresentationActor){return this.requirePresentation().reconcileRebuild(commandId,actor);}
+  /** Exact-ID access is authorized independently of discovery visibility/reconstruction. */
+  private async exactCatalogRecord(session:string):Promise<CatalogRecord|undefined>{
+    const retained=this.presentation?.mapping(session) as CatalogRecord|undefined;
+    const indexed=await this.config.catalog?.get(session).catch(error=>{if(retained)return undefined;throw error;});
+    if(retained&&indexed){for(const key of ['uri','engineId','nativeSessionId','workingDirectory'] as const)if(indexed[key]!==retained[key])throw new RpcFault(-32011,'Indexed identity differs from retained canonical mapping');if(retained.storagePath&&indexed.storagePath&&retained.storagePath!==indexed.storagePath)throw new RpcFault(-32011,'Indexed native storage differs from retained mapping');}
+    return indexed?{...indexed,...(retained?.storagePath?{storagePath:retained.storagePath}:{})}:retained;
+  }
+  private withPresentationSelection<T>(sessions:string[],work:()=>Promise<T>):Promise<T>{
+    const ordered=[...new Set(sessions)].sort();
+    // Reserve all idle selected mutexes synchronously. Never hold a subset while waiting on a family lock.
+    if(ordered.some(session=>this.resourceLocks.has(session)))return Promise.reject(new RpcFault(-32011,'Selected session admission is in progress',{executed:false}));
+    let release!:()=>void;const barrier=new Promise<void>(resolve=>{release=resolve;});for(const session of ordered){this.resourceLocks.set(session,barrier);this.presentationSelections.add(session);}
+    return (async()=>{try{return await work();}finally{for(const session of ordered)this.presentationSelections.delete(session);release();for(const session of ordered)if(this.resourceLocks.get(session)===barrier)this.resourceLocks.delete(session);}})();
+  }
   private async presentationMetadata(session:string):Promise<PresentationMetadata>{
-    const indexed=await this.config.catalog!.get(session),record=this.getRecord(session);if(!indexed?.nativeSessionId||indexed.uri!==session||!this.config.engines.some(engine=>engine.id===indexed.engineId))throw new RpcFault(-32008,'Selected indexed native mapping is unavailable',{executed:false});
+    const indexed=await this.exactCatalogRecord(session),record=this.getRecord(session);if(!indexed?.nativeSessionId||indexed.uri!==session||!this.config.engines.some(engine=>engine.id===indexed.engineId))throw new RpcFault(-32008,'Selected indexed native mapping is unavailable',{executed:false});
     if(record&&(record.nativeSessionId!==indexed.nativeSessionId||record.engineId!==indexed.engineId||record.workingDirectory!==indexed.workingDirectory))throw new RpcFault(-32011,'Catalog and retained host identity conflict',{executed:false});
     if(record)await this.selectedWorkspace(record);else if(indexed.location?.kind==='managed')throw new RpcFault(-32011,'Managed mapping requires its original local allocation receipt',{executed:false});else if(await this.workspace(pathToFileURL(indexed.workingDirectory).href)!==indexed.workingDirectory)throw new RpcFault(-32011,'Canonical workspace identity differs',{executed:false});
     return {identity:{session,engineId:indexed.engineId,nativeSessionId:indexed.nativeSessionId,workingDirectory:indexed.workingDirectory},title:record?.summary.title??indexed.title,catalog:indexed,...(record?{hostBeforeImage:{summary:record.summary}}:{})};
