@@ -757,7 +757,9 @@ export class AmplifierHost {
       if(capability?.version!==1||capability.staged!==true)throw new RpcFault(-32601,'Configured agent does not advertise staged native history import',{executed:false});
       const receipt=await agent.client.extMethod('_amplifier/admin',{cwd,operation:'history.import.receipt',args:{commandId:input.importCommandId}}),proof=receipt?.result as Json|undefined;
       if(!receipt||Buffer.byteLength(JSON.stringify(receipt))>32768||receipt.commandId!==input.importCommandId||receipt.operation!=='history.import.commit'||receipt.status!=='succeeded'||receipt.replayed!==false||!proof||proof.importCommandId!==input.importCommandId||proof.creationConfirmed!==true||proof.workReplayed!==false||proof.sourceSha256!==input.sourceSha256||proof.previewHash!==input.previewHash||proof.historyCwd!==cwd||proof.executionDirectory!==cwd||typeof proof.nativeSessionId!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(proof.nativeSessionId)||typeof proof.historyRevision!=='string'||!proof.historyRevision||proof.historyRevision.length>512||typeof proof.title!=='string'||proof.title.length>1000)throw new RpcFault(-32011,'Exact successful native import creation receipt is unavailable',{executed:false});
-      return proof;
+      // Persist only the verified creation tuple; an extension may gain other
+      // fields later, but transcript/source payloads never belong in this journal.
+      return {nativeSessionId:proof.nativeSessionId,historyCwd:proof.historyCwd,executionDirectory:proof.executionDirectory,historyRevision:proof.historyRevision,title:proof.title,creationConfirmed:true,workReplayed:false,sourceSha256:proof.sourceSha256,previewHash:proof.previewHash,importCommandId:proof.importCommandId};
     }finally{this.passiveReads--;await agent.retire();}
   }
   private async finishImportAdoption(entry:Json,proof:Json) {
