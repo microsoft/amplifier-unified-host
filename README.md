@@ -694,3 +694,12 @@ metadata plus its verified selected `session`, without reading any native body. 
 requires recorded `summary.format`, `scope`, and `minimal`; older incomplete export
 metadata is explicitly unavailable. Byte reads remain separately bounded through
 `readExportResource` and verified against `contentHash`.
+# Request concurrency
+
+The connection handshake is a barrier. Standard resource actions and subscription
+changes retain their per-resource order. Advertised capability RPCs and independent
+receipt/catalog/resource reads run concurrently after that barrier; a long wait
+cannot block the same client's control or receipt request. Capability owners retain
+their durable command admission and compare-and-set responsibilities. Clients must
+await a result when a later request depends on its effect; wire response order is
+not an effect-ordering guarantee. The per-peer in-flight request limit still applies.

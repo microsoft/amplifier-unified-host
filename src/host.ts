@@ -67,13 +67,17 @@ export interface HostConfig {
   turnSettled?:(event:Readonly<TurnSettled>)=>Promise<void>;
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
-interface Peer {socket:WebSocket;clientId?:string;connectionId:string;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
+interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
 interface Active {historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
 const chatURI=(session:string)=>`ahp-chat:/${session.slice('ahp-session:/'.length)}`;
+// Request completion order is independent of the server-sequenced action stream.
+// Capability owners supply their own admission/CAS; a long wait must not hold
+// the resource action queue or prevent the same client from checking its receipt.
+const independentRequests=new Set(['x-amplifier/capabilityAction','x-commandReceipt','listSessions','resourceRead','resourceResolve','resourceList','ping']);
 const bounded=(value:unknown,def:number,max:number)=>{if(value===undefined)return def;if(!Number.isSafeInteger(value)||Number(value)<1||Number(value)>max)throw new RpcFault(-32602,`Expected integer between 1 and ${max}`);return Number(value);};
 
 export class AmplifierHost {
@@ -153,7 +157,7 @@ export class AmplifierHost {
     }
   }
   private accept(socket:WebSocket) {
-    const peer:Peer={socket,connectionId:randomUUID(),initialized:false,ready:false,buffer:[],bufferBytes:0,cuts:new Map(),lastClientSeq:-1,seenClientSeq:new Set(),subscriptions:new Set(),pending:0,queue:Promise.resolve(),channels:new Map(),cursors:new Map()};this.peers.add(peer);
+    const peer:Peer={socket,connectionId:randomUUID(),handshakeQueued:false,initialized:false,ready:false,buffer:[],bufferBytes:0,cuts:new Map(),lastClientSeq:-1,seenClientSeq:new Set(),subscriptions:new Set(),pending:0,queue:Promise.resolve(),channels:new Map(),cursors:new Map()};this.peers.add(peer);
     socket.on('error',()=>{});
     socket.on('close',()=>{this.peers.delete(peer);const subscriptions=[...peer.subscriptions];peer.subscriptions.clear();peer.cursors.clear();for(const uri of subscriptions){this.removeActiveClient(uri,peer.clientId);if(!this.hasSubscribers(uri)){this.loadedFloors.delete(uri);this.nativeWindows.delete(uri);}}for(const [uri,watch] of this.watches)if(watch.owner===peer&&!this.hasSubscribers(uri))this.watches.delete(uri);});
     socket.on('message',data=>{
@@ -164,8 +168,11 @@ export class AmplifierHost {
         catch(error) {const fault=error as RpcFault;if(message.id!==undefined)this.send(peer,{jsonrpc:'2.0',id:message.id,error:{code:Number.isSafeInteger(fault.code)?fault.code:-32603,message:fault.message,data:fault.data}});}
         finally {peer.pending--;}
       };
-      // Handshake order is connection-wide. Later work is ordered only within its resource.
-      if(!peer.initialized||message.method==='initialize'||message.method==='reconnect')peer.queue=peer.queue.catch(()=>{}).then(handle);
+      // Only the handshake owns the connection barrier. Requests already queued
+      // behind a pending handshake must not accidentally extend that barrier.
+      if(message.method==='initialize'||message.method==='reconnect'){peer.handshakeQueued=true;peer.queue=peer.queue.catch(()=>{}).then(handle);}
+      else if(!peer.handshakeQueued)void handle(); // route rejects use before initialize
+      else if(independentRequests.has(message.method))void peer.queue.catch(()=>{}).then(handle);
       else {
         const key=String(message.params?.channel??ROOT),previous=peer.channels.get(key)??peer.queue;
         const next=previous.catch(()=>{}).then(handle);peer.channels.set(key,next);
