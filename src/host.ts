@@ -876,8 +876,13 @@ export class AmplifierHost {
   /** Cold bounded candidate reviews; no ACP process or selected history startup. */
   previewRetention(input:RetentionPreviewRequest){return this.retention.preview(input);}
   applyRetention(input:RetentionApplyRequest){return this.intake.run(()=>this.retention.apply(input));}
-  retentionReceipt(commandId:string){return this.retention.receipt(commandId);}
-  retentionItemReceipt(commandId:string){return this.retention.itemReceipt(commandId);}
+  retentionReceipt(commandId:string){const batch=this.retention.receipt(commandId);if(batch)for(const item of batch.items)this.retentionItemReceipt(item.commandId);return this.retention.receipt(commandId);}
+  retentionItemReceipt(commandId:string){
+    const item=this.retention.itemReceipt(commandId);if(!item||item.status==='hidden')return item;
+    const proof=this.store.db.prepare("SELECT result FROM lifecycle_commands WHERE command_id=? AND session=? AND operation='retention.hide' AND status='completed'").get(commandId,item.session);
+    if(proof){const result=JSON.parse(String(proof.result));this.retention.settleItem(commandId,{status:'hidden',executed:true,result,protectionRelease:'unconfirmed'});return this.retention.itemReceipt(commandId);}
+    return item;
+  }
   private retentionProtected(row:CatalogRecord,protect:string[]):string|undefined {
     const uri=row.uri,chat=uri.replace('ahp-session:','ahp-chat:');
     if(protect.includes(uri)||this.hasSubscribers(uri)||this.hasSubscribers(chat))return 'selected-or-subscribed';

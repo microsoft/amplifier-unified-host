@@ -1016,3 +1016,11 @@ retention release. The product must provide real supported owner coverage.
 Canonical transcripts/events, workspace files and all owner records remain.
 Retired legacy-copy purge and permanent managed-chat deletion are separate
 authorities; this API performs neither.
+
+If native hiding is confirmed but derived catalog acknowledgement is lost, explicit
+`inspectSessionLifecycleReceipt(session, childCommandId)` may inspect the original
+native receipt and repair metadata without repeating the mutation. It must run
+outside the held session-lock callback. Thereafter passive retention item/batch
+reads recognize that completed host lifecycle proof as `hidden`, with
+`protectionRelease:'unconfirmed'`; an unknown batch remains non-replayable until
+its dependent owner release has been separately reconciled.
