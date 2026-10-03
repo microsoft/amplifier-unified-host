@@ -1123,3 +1123,13 @@ Any failure after host reservation reports `{receipt,outcome:'unknown',allocatio
 for ordinary managed creation, even when native reports its own pre-effect refusal.
 Allocated folders remain evidence. Never retry mkdir/native creation; only inspect
 the exact original receipt. Live/restarted receipt repair never replays inputs.
+
+`managedSessionModels({provider?,bundle?,bundleRevision?,instance,limit?,cursor?})`
+and the negotiated root `x-amplifier/managedSession` operation `models` query the
+selected bundle's provider rather than the global registry. Pages are at most
+100 rows, with catalog-revision-bound cursors and a complete discovery ceiling
+of 1,000 rows/512 KiB; unavailable/changed/oversized catalogs are explicit.
+Only the selected provider's public metadata API runs (which may use network or
+prepare dependencies). No Core runtime, session allocation, or prompt occurs.
+Responses preserve exact bundle selection, `modelsSupported`, and
+`runtimeStarted:false`. A discovered model is not a readiness assertion.
