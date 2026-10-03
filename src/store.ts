@@ -40,6 +40,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS sessions_order ON sessions(modified DESC,uri DESC);
       CREATE TABLE IF NOT EXISTS turns(chat TEXT NOT NULL,ordinal INTEGER PRIMARY KEY AUTOINCREMENT,turn_id TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(chat,turn_id));
       CREATE INDEX IF NOT EXISTS turns_page ON turns(chat,ordinal);
+      CREATE TABLE IF NOT EXISTS coordination_results(chat TEXT NOT NULL,turn_id TEXT NOT NULL,sequence INTEGER NOT NULL,text TEXT NOT NULL,truncated INTEGER NOT NULL,state TEXT NOT NULL,PRIMARY KEY(chat,turn_id));
+      CREATE INDEX IF NOT EXISTS coordination_results_sequence ON coordination_results(chat,sequence);
+      INSERT OR IGNORE INTO meta SELECT 'coordination_start_ordinal',coalesce(max(ordinal),0) FROM turns;
       CREATE TABLE IF NOT EXISTS actions(seq INTEGER PRIMARY KEY,channel TEXT NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS receipts(command_id TEXT PRIMARY KEY,channel TEXT NOT NULL,client_id TEXT NOT NULL,client_seq INTEGER NOT NULL,payload TEXT NOT NULL);
       DROP INDEX IF EXISTS receipt_origin;
@@ -126,9 +129,13 @@ export class Store {
       : this.db.prepare('SELECT summary FROM sessions WHERE hidden=0 ORDER BY modified DESC,uri DESC LIMIT ?').all(limit);
     return rows.map(row => JSON.parse(row.summary as string));
   }
-  saveTurn(chat: string, turn: Turn) {
+  saveTurn(chat: string, turn: Turn):number {
+    if(!this.transactionOpen)return this.transaction(()=>this.saveTurn(chat,turn));
     this.db.prepare('INSERT INTO turns(chat,turn_id,payload) VALUES(?,?,?) ON CONFLICT(chat,turn_id) DO UPDATE SET payload=excluded.payload').run(chat, turn.id, JSON.stringify(turn));
-    return Number(this.db.prepare('SELECT ordinal FROM turns WHERE chat=? AND turn_id=?').get(chat,turn.id)!.ordinal);
+    const ordinal=Number(this.db.prepare('SELECT ordinal FROM turns WHERE chat=? AND turn_id=?').get(chat,turn.id)!.ordinal);
+    const text=turn.responseParts.filter(part=>part.kind==='markdown').map(part=>(part as {content:string}).content).join('\n'),bytes=Buffer.from(text),preview=bytes.subarray(0,20000).toString('utf8');
+    this.db.prepare('INSERT INTO coordination_results VALUES(?,?,?,?,?,?) ON CONFLICT(chat,turn_id) DO UPDATE SET text=excluded.text,truncated=excluded.truncated,state=excluded.state').run(chat,turn.id,ordinal,preview,bytes.length>20000?1:0,turn.state);
+    return ordinal;
   }
   turns(chat: string, limit?: number, before?: number): {turns: Turn[]; before?: number; first?:number} {
     const rows = this.db.prepare('SELECT ordinal,payload FROM turns WHERE chat=? AND ordinal<? ORDER BY ordinal DESC LIMIT ?')
@@ -194,6 +201,7 @@ export class Store {
     const attempt=Number(this.db.prepare('SELECT coalesce(max(attempt),0)+1 n FROM receipt_attempts WHERE command_id=?').get(commandId)!.n);
     this.db.prepare('INSERT INTO receipt_attempts VALUES(?,?,?,?)').run(commandId,attempt,JSON.stringify(receipt),turn?.payload??null);
     this.db.prepare('DELETE FROM turns WHERE chat=? AND turn_id=?').run(channel,commandId);
+    this.db.prepare('DELETE FROM coordination_results WHERE chat=? AND turn_id=?').run(channel,commandId);
     this.db.prepare('DELETE FROM receipts WHERE command_id=?').run(commandId);
   }
   unknown(channel: string): boolean {

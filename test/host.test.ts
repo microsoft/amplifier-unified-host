@@ -823,3 +823,57 @@ test('native views above one owner page preserve the full requested window and r
     const fresh=(await client.subscribe(chat,{view:{turns:250}})).result.snapshot!.state as ChatState;await client.request('fetchTurns',{channel:chat,cursor:fresh.turnsNextCursor});assert.equal(((await client.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as ChatState).turns.length,300);
   }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
 });
+
+test('coordination uses bounded indexed results and preserves agent follow-up provenance',async()=>{
+ const settled:any[]=[];const f=await setup({turnSettled:async(event:any)=>{settled.push(event);}});try{
+  const client=await f.connect(),{session,chat}=await f.create(client),id=randomUUID();await f.host.submitTurn(session,{commandId:id,text:'Agent coordination follow-up',clientId:'coordinator',origin:'agent'});assert.equal((await f.host.waitForTurn(session,id)).completed,true);
+  await waitFor(()=>settled.length===1);assert.equal(settled[0].inputOrigin,'coordination');await assert.rejects(f.host.readUserMessage(session,id),(error:any)=>error.reason==='not-user');assert.equal(f.host.store.turns(chat).turns[0].message.origin?.kind,'agent');
+  const prompt=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(prompt._meta['amplifier.dev/input'].inputOrigin,'coordination');
+  const now=new Date().toISOString();for(let i=0;i<80;i++)f.host.store.saveTurn(chat,{id:'indexed-'+i,startedAt:now,state:'complete',message:{text:'request '+i,origin:{kind:'user'}},responseParts:[{kind:'markdown',id:'response-'+i,content:i===0?'😀'.repeat(10000):'answer '+i}]} as any);
+  (f.host.store as any).turns=()=>{throw new Error('Result reads must not reconstruct turns');};
+  const one=await f.host.readCoordinationSession(session,{limit:32});assert.equal(one.results.length,32);assert.equal(one.hasMore,true);assert.equal(one.results[1].sourceTruncated,true);assert.ok(Buffer.byteLength(one.results[1].text)<=20003);assert.equal(one.coverage.nativeHistoriesRead,false);assert.equal(one.attentionUnknown,true);assert.equal(one.attentionCoverage.questions,false);
+  const two=await f.host.readCoordinationSession(session,{afterSequence:one.results.at(-1)!.sequence,limit:32});assert.equal(two.results.length,32);assert.ok(two.results[0].sequence>one.results.at(-1)!.sequence);assert.equal(new Set([...one.results,...two.results].map(result=>result.id)).size,64);assert.deepEqual((await f.host.readCoordinationSession(session,{afterSequence:two.latestSequence})).results,[]);
+  const record=f.host.store.get(session)!;for(let i=0;i<5;i++)f.host.store.save({...record,uri:'ahp-session:/listed-'+i,chat:{...record.chat,resource:'ahp-chat:/listed-'+i},summary:{...record.summary,resource:'ahp-session:/listed-'+i,title:'Listed '+i}});
+  const page=await f.host.listCoordinationSessions({limit:2});assert.equal(page.items.length,2);assert.ok(page.nextCursor);assert.equal(page.coverage.unselectedCatalogSessions,false);assert.equal((await f.host.listCoordinationSessions({cursor:page.nextCursor,limit:2})).items.length,2);
+  await assert.rejects(f.host.readCoordinationSession(session,{limit:33}));
+ }finally{await f.cleanup();}
+});
+
+test('coordination imported absence is explicit and worker inspection never starts a dormant runtime',async()=>{
+ const f=await setup();let replacement:any;try{
+  const client=await f.connect(),{session}=await f.create(client);const live=await f.host.readCoordinationWorkers(session);assert.equal(live.resident,true);assert.equal(f.host.diagnostics().activeAgents,1);await client.shutdown();await f.host.close();replacement=await createHost(f.config);
+  const passive=await replacement.readCoordinationWorkers(session,{limit:1});assert.equal(passive.resident,false);assert.equal(passive.available,false);assert.equal(replacement.diagnostics().activeAgents,0);assert.equal((await readFile(f.log+'.passive','utf8')).trim(),'workers\nworkers');await assert.rejects(readFile(f.log,'utf8'));
+  const timestamp=new Date().toISOString();replacement.config.catalog={get:async()=>({uri:'ahp-session:/unindexed',engineId:'fixture',nativeSessionId:'native-old',workingDirectory:f.dir,title:'Old',createdAt:timestamp,modifiedAt:timestamp}),list:async()=>({items:[]}),upsert:async()=>{}};
+  const unknown=await replacement.readCoordinationSession('ahp-session:/unindexed');assert.equal(unknown.available,false);assert.equal(unknown.reason,'not-indexed');assert.equal(replacement.diagnostics().activeAgents,0);
+ }finally{if(replacement)await replacement.close();else await f.host.close();await rm(f.dir,{recursive:true,force:true});}
+});
+
+test('durable conversation interruption targets only the admitted turn and duplicates never cancel again',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),turnId=randomUUID(),commandId=randomUUID();await f.host.submitTurn(session,{commandId:turnId,text:'slow',clientId:'ui'});
+  assert.equal((await f.host.interruptSession(session,{commandId:'wrong',turnId:'another-turn',clientId:'agent',origin:'agent'})).accepted,false);assert.equal(f.host.store.receipt('wrong'),undefined);
+  const accepted=await f.host.interruptSession(session,{commandId,turnId,clientId:'agent',origin:'agent'});assert.equal(accepted.delivery,'requested');assert.equal((await f.host.waitForTurn(session,turnId)).status,'cancelled');
+  const revision=(await f.host.inspectSession(session)).interruptionRevision,duplicate=await f.host.interruptSession(session,{commandId,turnId,clientId:'agent',origin:'agent'});assert.equal(duplicate.replayed,false);assert.equal((await f.host.inspectSession(session)).interruptionRevision,revision);
+  await assert.rejects(f.host.interruptSession(session,{commandId,turnId:'changed',clientId:'agent',origin:'agent'}),/identity changed/);
+ }finally{await f.cleanup();}
+});
+
+test('immutable export inspection proves exact selected ownership without hydrating native history',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),two=await f.create(client),uri='amplifier-export:/'+('a'.repeat(64));
+  const metadata={resource:uri,summary:{format:'markdown',scope:'all',minimal:true,bytes:10},mimeType:'text/markdown',contentHash:'b'.repeat(64)};f.host.store.db.prepare('INSERT INTO export_resources VALUES(?,?,?,?)').run(uri,one.session,'snapshot',JSON.stringify(metadata));
+  (f.host as any).lifecycleAgent=()=>{throw new Error('Metadata inspection must not hydrate');};const found=await f.host.inspectExportResource(uri,one.session);assert.equal(found.session,one.session);assert.equal(found.summary.minimal,true);
+  await assert.rejects(f.host.inspectExportResource(uri,two.session),/selected session/);await assert.rejects(f.host.inspectExportResource(uri+'?offset=0',one.session),/exact immutable/);
+  f.host.store.db.prepare('UPDATE export_resources SET metadata=? WHERE uri=?').run(JSON.stringify({...metadata,summary:{bytes:10}}),uri);await assert.rejects(f.host.inspectExportResource(uri,one.session),/metadata is unavailable/);
+ }finally{await f.cleanup();}
+});
+
+test('coordination interrupt transport uncertainty is durable and cannot be replayed',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),turnId=randomUUID(),commandId=randomUUID();await f.host.submitTurn(session,{commandId:turnId,text:'slow',clientId:'ui'});
+  const active=(f.host as any).active.get(session);let calls=0;active.agent.client.cancel=async()=>{calls++;throw new Error('Notification delivery lost');};
+  await assert.rejects(f.host.interruptSession(session,{commandId,turnId,clientId:'coordinator',origin:'agent'}),/unknown/);assert.equal(f.host.store.receipt(commandId)?.status,'unknown');
+  const duplicate=await f.host.interruptSession(session,{commandId,turnId,clientId:'coordinator',origin:'agent'});assert.equal(duplicate.delivery,'unknown');assert.equal(duplicate.replayed,false);assert.equal(calls,1);
+  await f.host.waitForTurn(session,turnId);assert.equal((await f.host.readCoordinationSession(session)).status,'unknown');
+ }finally{await f.cleanup();}
+});

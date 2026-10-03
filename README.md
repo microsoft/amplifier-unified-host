@@ -648,3 +648,49 @@ and host-only receipt in the same unindexed interval, returns an explicit
 are substituted for a bounded request. Widening the explicit view may establish an
 anchor; genuinely unmatched failed/unknown receipts require native-owner ordering
 provenance. Both sources and admission receipts remain preserved.
+
+## Indexed coordination callbacks
+
+Trusted coordination owners use these public interfaces; they do not inspect the
+host database or load global/native transcripts:
+
+- `listCoordinationSessions({cursor?, limit?:1..100})` returns `{items,nextCursor,
+  coverage}`. Items contain `uri,title,status,activeTurnId?` and execution,
+  interruption/configuration revisions. Coverage is **host-indexed**, excluding
+  unselected catalog history. Workspace authorization is filtered before paging;
+  existence is last-admission evidence, not a fresh filesystem scan of every row.
+- `readCoordinationSession(uri,{afterSequence?:0,limit?:1..32})` returns
+  `{available,reason?,session,status,activeTurnId?,revision,latestSequence,results,
+  hasMore,approvalIds,attentionUnknown,attentionCoverage,coverage,...revisions}`.
+  Each indexed result has `{id,inputId,sequence,text,sourceTruncated,window:'head',
+  source:'host-indexed-result',state}`. Text previews are at most 20,000 UTF-8 bytes
+  plus a possible replacement character at the byte boundary. Stable sequences are
+  scoped to the session. They describe host assistant results, not canonical native
+  message IDs. Existing pre-index rows are an explicit `legacyGap`; imported native
+  history is explicitly omitted. No read-time transcript reconstruction/backfill
+  hides that gap. Questions belong to the separate question owner, so attention is
+  conservatively unknown even if no standard host approval is pending.
+- `readCoordinationWorkers(uri,{workerId?,cursor?,limit?:1..100,afterSequence?,
+  resultLimit?:1..32,commandId?})` requires the native `workers` v1 capability and
+  reads `_amplifier/workers` using the bound ACP connection when available, or a
+  passive process otherwise. Native `resident` evidence is distinct from ACP
+  process presence. Reads never call resume or mount a dormant worker. Native
+  durable `worker.followup` / `worker.interrupt` use `nativeControlExisting` and
+  their exact native command receipts; passive inspection also reads those receipts.
+- `submitTurn(uri,{commandId,text,clientId,origin:'agent'})` uses common admission,
+  an AHP agent origin, and `amplifier.dev/input.inputOrigin='coordination'` on the
+  native prompt. It cannot become a user-consent record or a user Recall trigger.
+  Explicit UI follow-ups retain the default user origin. A WebSocket client cannot
+  forge the trusted agent-origin admission path.
+- `interruptSession(uri,{commandId,turnId,clientId,origin?:'agent'|'ui'})` reserves an
+  exact interruption receipt and targets only the current admitted turn. A completed
+  control receipt means `delivery:'requested'`, not that execution stopped; inspect
+  the original turn through `waitForTurn`. Unknown delivery never retries, duplicate
+  commands return their receipt, and a cold/nonmatching turn is a known no-effect
+  refusal. It shares the ordinary standard cancellation path and never mounts.
+
+`inspectExportResource(uri, expectedSession)` returns immutable persisted export
+metadata plus its verified selected `session`, without reading any native body. It
+requires recorded `summary.format`, `scope`, and `minimal`; older incomplete export
+metadata is explicitly unavailable. Byte reads remain separately bounded through
+`readExportResource` and verified against `contentHash`.

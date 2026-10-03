@@ -227,3 +227,16 @@ test('actual native recorded voice stays between two admitted chat turns through
   await client.request('fetchTurns',{channel:chat,cursor:tail.turnsNextCursor});const full=(await client.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as any;assert.deepEqual(full.turns.map((turn:any)=>turn.id),[first,tail.turns[0].id,last]);assert.equal(full.turnsNextCursor,undefined);assert.equal(full.turns[0].state,'complete');assert.equal(full.turns[2].state,'complete');
  }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
 });
+
+test('actual native coordination preserves agent provenance and passive worker reads survive an impossible runtime',{skip:!process.env.ACP_EXECUTABLE||!process.env.ACP_NATIVE_TEST_CONFIG||!process.env.ACP_NATIVE_TEST_WORKSPACE},async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'ahp-native-coordination-')),workspace=await realpath(process.env.ACP_NATIVE_TEST_WORKSPACE!),{randomUUID}=await import('node:crypto');
+ const config={stateDirectory:join(directory,'host'),allowedWorkspaceRoots:[workspace],engines:[{id:'amplifier',label:'Amplifier',command:process.env.ACP_EXECUTABLE!,args:['--config',process.env.ACP_NATIVE_TEST_CONFIG!]}]};let host=await createHost(config);const client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();
+ try{
+  await client.initialize({clientId:'coordination-native',protocolVersions:['0.9.0']});const session='ahp-session:/'+randomUUID();await client.request('createSession',{channel:session,workingDirectories:[pathToFileURL(workspace).href]});const commandId=randomUUID();await host.submitTurn(session,{commandId,text:'Agent coordination acceptance',clientId:'native-coordinator',origin:'agent'});assert.equal((await host.waitForTurn(session,commandId,30000)).completed,true);
+  const selected=await host.readCoordinationSession(session);assert.equal(selected.available,true);assert.equal(selected.canFollowup,true);assert.equal(selected.canInterrupt,false);assert.equal(selected.results[0].inputId,commandId);
+  const revision=(await host.inspectRecallSource(session)).revision,history=await host.readRecallSource(session,{expectedRevision:revision,limit:1});assert.equal(history.rows.find(row=>row.role==='user')?.inputOrigin,'coordination');await assert.rejects(host.readUserMessage(session,commandId),(error:any)=>error.reason==='not-user');
+  const warm=await host.readCoordinationWorkers(session,{limit:1});assert.equal(warm.resident,true);await client.shutdown();await host.close();
+  const settings=JSON.parse(await readFile(process.env.ACP_NATIVE_TEST_CONFIG!,'utf8')),passiveConfig=join(directory,'passive-agent.json');await writeFile(passiveConfig,JSON.stringify({...settings,workerCommand:['/nonexistent-coordination-test-worker']}));host=await createHost({...config,engines:config.engines.map(engine=>({...engine,args:['--config',passiveConfig]}))});
+  const cold=await host.readCoordinationWorkers(session,{limit:1});assert.equal(cold.resident,false);assert.equal(cold.source,'native-worker-index');assert.equal(host.diagnostics().activeAgents,0);assert.equal((await host.readCoordinationSession(session)).results[0].inputId,commandId);
+ }finally{await client.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}
+});
