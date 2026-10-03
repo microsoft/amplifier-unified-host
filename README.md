@@ -6,6 +6,8 @@ Foundation, the Unified application service, or the separate `amplifier-agent`
 library. The Amplifier engine is provided by the independent `amplifier-acp`
 adapter over the full native Core/Foundation application runtime.
 
+See the local [vision](docs/VISION.md) and versioned [host boundary contract](docs/contracts/host-boundary.v1.md) for inherited direction, public promises, falsifiers and acceptance links.
+
 ## Run
 
 Node 22.16 or later is required. Qualification currently uses Node 22.22; its

@@ -39,6 +39,7 @@
     "README.md",
     "LICENSE",
     "fixtures",
-    "examples"
+    "examples",
+    "docs"
   ]
 }
