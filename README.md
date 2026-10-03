@@ -710,3 +710,10 @@ history payloads. Selected native turn-ID windows disappear after their last
 subscriber leaves; cursor caches retain at most 4,096 entries per cursor kind.
 Calling diagnostics queries small indexed host projections and never asks a native
 agent for history or starts an execution worker.
+
+`StdioCatalog` also exposes the public workspace metadata projection methods
+`listWorkspaces`, `getWorkspace`, `projectWorkspaces`, and
+`workspaceProjectionStatus`. Optional workspace owners use these bounded catalog
+RPCs for shared registration/visibility; the host does not own workspace folders
+or mirror client selection. Native history and filesystem creation remain with
+their respective owners.

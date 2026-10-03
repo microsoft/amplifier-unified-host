@@ -43,6 +43,10 @@ export class StdioCatalog implements Catalog {
   setVisibility(params:Parameters<NonNullable<Catalog['setVisibility']>>[0]){return this.request('setVisibility',params);}
   directoryInUse(path:string){return this.request('directoryInUse',{path});}
   hint(sessionDirectory:string){return this.request('hint',{sessionDirectory});}
+  listWorkspaces(params:Record<string,unknown>){return this.request('listWorkspaces',params);}
+  getWorkspace(params:{id:string}){return this.request('getWorkspace',params);}
+  projectWorkspaces(params:Record<string,unknown>){return this.request('projectWorkspaces',params);}
+  workspaceProjectionStatus(params:{source:string}){return this.request('workspaceProjectionStatus',params);}
   diagnostics(){return {closed:this.closed,pending:this.pending.size,stderrTail:this.stderr};}
   async close(){clearInterval(this.maintenance);this.fail(new Error('Catalog closed by owner'));this.process.stdin.end();await Promise.race([new Promise<void>(resolve=>this.process.once('close',()=>resolve())),new Promise<void>(resolve=>setTimeout(resolve,1000))]);if(this.process.exitCode===null)this.process.kill();}
 }
