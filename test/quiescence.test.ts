@@ -174,3 +174,17 @@ test('an ACP terminal that outlives its prompt remains owned work, even with zer
   const result=await f.host.admitQuiescence({commandId:'terminal-owned',purpose:'distribution-update'});assert.equal(result.admitted,false);assert.equal(result.work.counts.terminalJobs,1);assert.equal(f.host.diagnostics().activeAgents,1);assert.equal(f.host.inspectQuiescence().intakeClosed,false);
  }finally{await f.close();}
 });
+
+test('explicit retryRefused rechecks a known no-effect busy result under the same command and never replays held or unknown admission',async()=>{
+ let acquired=0;const entered=pause(),done=pause();const f=await fixture({quiescence:configuration({requiredOwners:['owner'],participants:[participant('owner',{acquire:async context=>{acquired++;return {ownerId:'owner',fenceId:context.fenceId,release:async()=>{}}}})]})});
+ try{
+  const work=f.host.withExternalMutation('owner',async()=>{entered.release();await done.promise});await entered.promise;
+  const command={commandId:'same-durable-update',purpose:'distribution-update' as const};const busy=await f.host.admitQuiescence(command);assert.equal(busy.executed,false);assert.equal(busy.intakeClosed,false);assert.equal(acquired,0);done.release();await work;
+  assert.deepEqual(await f.host.admitQuiescence(command),busy);assert.equal(acquired,0);
+  const held=await f.host.admitQuiescence({...command,retryRefused:true});assert.equal(held.admitted,true);assert.notEqual(held.fenceId,busy.fenceId);assert.equal(acquired,1);
+  assert.deepEqual(await f.host.admitQuiescence({...command,retryRefused:true}),held);assert.equal(acquired,1);
+  const unknown=await f.host.releaseQuiescence({fenceId:held.fenceId,commandId:command.commandId,outcome:'unknown'});assert.deepEqual(await f.host.admitQuiescence({...command,retryRefused:true}),unknown);assert.equal(acquired,1);
+  await assert.rejects(f.host.admitQuiescence({...command,purpose:'recovery',retryRefused:true}),/different arguments/);
+  const released=await f.host.releaseQuiescence({fenceId:held.fenceId,commandId:command.commandId,outcome:'unchanged'});assert.deepEqual(await f.host.admitQuiescence({...command,retryRefused:true}),released);assert.equal(acquired,1);
+ }finally{done.release();await f.close();}
+});

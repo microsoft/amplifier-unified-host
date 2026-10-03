@@ -49,7 +49,7 @@ export class QuiescenceGate {
    if(config.timeoutMs!==undefined&&(!Number.isSafeInteger(config.timeoutMs)||config.timeoutMs<25||config.timeoutMs>30000))throw Error('Quiescence deadline must be25..30000ms');
    if(typeof config.verifyRelease!=='function')throw Error('Authenticated quiescence reconciliation required');
   }
-  db.exec("CREATE TABLE IF NOT EXISTS host_quiescence_fence(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_commands(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,payload TEXT NOT NULL)");
+  db.exec("CREATE TABLE IF NOT EXISTS host_quiescence_fence(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_commands(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,command_id TEXT NOT NULL,payload TEXT NOT NULL)");
   const old=this.fence();if(old){old.phase='unknown';old.reason='host-restarted';this.save(old);}
  }
  private fence():QuiescenceFence|undefined {const row=this.db.prepare('SELECT payload FROM host_quiescence_fence WHERE id=1').get();return row?JSON.parse(String(row.payload)):undefined;}
@@ -89,17 +89,18 @@ export class QuiescenceGate {
   catch(error){return this.unknown(fence,String(error));}
  }
  private unknown(fence:QuiescenceFence,reason:string){fence.phase='unknown';fence.reason=reason.slice(0,500);this.save(fence);return this.receipt(fence.commandId);}
- async admit(input:{commandId:string;purpose:QuiescencePurpose}) {
-  token(input.commandId,'command identity');if(!['distribution-update','recovery'].includes(input.purpose))throw Error('Unknown quiescence purpose');
+ async admit(input:{commandId:string;purpose:QuiescencePurpose;retryRefused?:boolean}) {
+  token(input.commandId,'command identity');if(input.retryRefused!==undefined&&typeof input.retryRefused!=='boolean')throw Error('retryRefused must be an explicit boolean');if(!['distribution-update','recovery'].includes(input.purpose))throw Error('Unknown quiescence purpose');
   if(!this.config)throw new QuiescenceError('Quiescence coverage is not configured',{executed:false});
   if(this.changing)throw new QuiescenceError('Quiescence transition is already running',{executed:false});
   const signature=createHash('sha256').update(JSON.stringify([input.commandId,input.purpose])).digest('hex'),old=this.db.prepare('SELECT signature,payload FROM host_quiescence_commands WHERE command_id=?').get(input.commandId);
-  if(old){if(old.signature!==signature)throw new QuiescenceError('Quiescence identity has different arguments',{executed:false});return JSON.parse(String(old.payload));}
+  let retry=false;
+  if(old){if(old.signature!==signature)throw new QuiescenceError('Quiescence identity has different arguments',{executed:false});const prior=JSON.parse(String(old.payload));retry=input.retryRefused===true&&prior.admitted===false&&prior.executed===false&&prior.intakeClosed===false&&!this.fence();if(!retry)return prior;}
   if(this.fence())throw new QuiescenceError('Existing quiescence fence requires authoritative reconciliation',{executed:false,...this.inspect()});
   this.changing=true;
-  const fence:QuiescenceFence={...input,fenceId:randomUUID(),instanceId:this.config.instanceId,dataScope:this.config.dataScope,phase:'checking',owners:[],observedAt:Date.now()};
+  const fence:QuiescenceFence={commandId:input.commandId,purpose:input.purpose,fenceId:randomUUID(),instanceId:this.config.instanceId,dataScope:this.config.dataScope,phase:'checking',owners:[],observedAt:Date.now()};
   // Both command reservation and closed intake become durable before any await.
-  this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO host_quiescence_commands VALUES(?,?,?)').run(input.commandId,signature,'{}');this.save(fence);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');this.changing=false;throw error;}
+  this.db.exec('BEGIN IMMEDIATE');try{if(retry){this.db.prepare('INSERT INTO host_quiescence_attempts(command_id,payload) VALUES(?,?)').run(input.commandId,String(old!.payload));this.db.prepare('UPDATE host_quiescence_commands SET payload=? WHERE command_id=?').run('{}',input.commandId);}else this.db.prepare('INSERT INTO host_quiescence_commands VALUES(?,?,?)').run(input.commandId,signature,'{}');this.save(fence);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');this.changing=false;throw error;}
   try{
    const before=this.work();if(before.gaps.length||Object.values(before.counts).some(n=>n>0))return await this.refuse(fence,'work-or-coverage-unavailable',before);
    const owners=[...new Set([...this.config.requiredOwners,...this.requirements])];

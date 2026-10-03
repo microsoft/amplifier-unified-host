@@ -1645,7 +1645,7 @@ export class AmplifierHost {
     return {ready:true};
   }
   /** Trusted supervisor seam, never an AHP action or a client-supplied readiness claim. */
-  admitQuiescence(input:{commandId:string;purpose:QuiescencePurpose}) {return this.intake.admit(input);}
+  admitQuiescence(input:{commandId:string;purpose:QuiescencePurpose;retryRefused?:boolean}) {return this.intake.admit(input);}
   inspectQuiescence() {return this.intake.inspect();}
   quiescenceReceipt(commandId:string) {return this.intake.receipt(commandId);}
   releaseQuiescence(input:{fenceId:string;commandId:string;outcome:QuiescenceOutcome;evidence?:unknown}) {return this.intake.release(input);}

@@ -739,7 +739,10 @@ if (result.admitted) {
 Known busy/no-effect admission returns `{admitted:false,executed:false,
 intakeClosed:false,reason,work?}`. Unknown acquisition, retirement, or release keeps
 `intakeClosed:true` and `fence.phase:'unknown'`. Retrying the same command reads its
-receipt, never repeats acquisition. `inspectQuiescence()` and
+receipt by default. Explicit `retryRefused:true` re-evaluates only an exact prior
+`{admitted:false,executed:false,intakeClosed:false}` when no gate exists; the prior
+refusal is archived before reserving a fresh fence under the same command. Held,
+unknown, releasing, released and uncertain receipts never reacquire this way. `inspectQuiescence()` and
 `quiescenceReceipt(commandId)` are passive exact inspections. An existing gate
 survives process replacement, including a replacement accidentally omitting this
 configuration; it never opens on a timeout or restart.
@@ -803,7 +806,8 @@ The external supervisor must survive the child it replaces. Existing `close()`
 is shutdown, not an idle proof; restart composition must acquire this gate first.
 
 `onMayBeIdle` is an advisory wakeup after tracked work settles, not authorization.
-The next attempt uses a new durable command after the prior known busy result;
-unknown remains a reconciliation case. Acquisition/release callbacks have a
+An idle-triggered retry may retain the durable supervisor command with explicit
+`retryRefused:true` after a known busy/no-effect result; unknown remains a
+reconciliation case. Acquisition/release callbacks have a
 bounded `timeoutMs` (25–30,000; default 10,000). The public gate API does not invent
 release version/digest, account readiness, or complete owner coverage.
