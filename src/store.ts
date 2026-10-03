@@ -60,6 +60,9 @@ export class Store {
       CREATE INDEX IF NOT EXISTS lifecycle_target_status ON lifecycle_commands(target,status);
       CREATE TABLE IF NOT EXISTS session_visibility(uri TEXT PRIMARY KEY,deleted INTEGER NOT NULL,command_id TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS export_resources(uri TEXT PRIMARY KEY,session TEXT NOT NULL,snapshot_id TEXT NOT NULL,metadata TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS transfer_fences(session TEXT PRIMARY KEY,transfer_id TEXT NOT NULL,source TEXT NOT NULL,destination TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS transfer_identity ON transfer_fences(transfer_id);
+      CREATE TABLE IF NOT EXISTS transfer_commands(command_id TEXT PRIMARY KEY,session TEXT NOT NULL,transfer_id TEXT NOT NULL,operation TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL,result TEXT);
       CREATE TABLE IF NOT EXISTS creation_keys(identity TEXT PRIMARY KEY,command_id TEXT NOT NULL,uri TEXT NOT NULL,fingerprint TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS queue_intents(id TEXT PRIMARY KEY,chat TEXT NOT NULL,message TEXT,origin TEXT NOT NULL,position INTEGER NOT NULL,status TEXT NOT NULL,held INTEGER NOT NULL DEFAULT 0,reason TEXT,projected INTEGER NOT NULL DEFAULT 1);
       CREATE INDEX IF NOT EXISTS queue_pending ON queue_intents(status,chat,position);
@@ -78,6 +81,7 @@ export class Store {
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_execution ON sessions(execution_cwd); CREATE INDEX IF NOT EXISTS sessions_history ON sessions(cwd); UPDATE relocations SET status='unknown' WHERE status='admitted';");
     if(!this.db.prepare('PRAGMA table_info(queue_intents)').all().some(column=>column.name==='projected'))this.db.exec('ALTER TABLE queue_intents ADD COLUMN projected INTEGER NOT NULL DEFAULT 1');
     this.db.exec("UPDATE lifecycle_commands SET status='unknown' WHERE status='dispatching'");
+    this.db.exec("UPDATE transfer_commands SET status='unknown' WHERE status='dispatching'; UPDATE transfer_fences SET status='unknown' WHERE status='dispatching'");
     this.db.exec('CREATE INDEX IF NOT EXISTS queue_projection_pending ON queue_intents(projected)');
     this.db.exec("UPDATE queue_intents SET held=1,reason='host-restarted' WHERE status='pending'");
     this.db.exec("UPDATE steering_intents SET status='unknown',reason='host-restarted' WHERE status='dispatching'; UPDATE steering_intents SET held=1,reason='host-restarted' WHERE status='pending'");

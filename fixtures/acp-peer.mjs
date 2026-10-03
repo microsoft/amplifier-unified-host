@@ -9,7 +9,19 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,sessionLifecycle:{version:1,passive:true,deletion:'preserve-history'},configurationClone:{version:1},taskState:{version:1,passive:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,...(process.env.FIXTURE_TRANSFER?{transfer:{version:1,passiveInspection:true}}:{}),sessionLifecycle:{version:1,passive:true,deletion:'preserve-history'},configurationClone:{version:1},taskState:{version:1,passive:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  else if(message.method==='_amplifier/transfer'){
+    const file=process.env.FIXTURE_TRANSFER,entries=JSON.parse(readFileSync(file,'utf8')),value=entries[p.args.transferId];
+    if(!value||value.nativeSessionId!==p.sessionId||value.historyCwd!==p.cwd){send({id:message.id,error:{code:-32011,message:'Fixture signed authority differs'}});continue;}
+    if(p.operation==='inspect'){reply(message.id,{receipt:value.receipt??null,fence:value.fence??null,transferPhase:value.transferPhase??'prepared'});continue;}
+    appendFileSync(file+'.calls',p.operation+'\n');
+    const phase={'source.fence':'source-fenced','source.commit':'source-committed','source.cancel':'cancelled'}[p.operation];
+    if(!phase){send({id:message.id,error:{code:-32601,message:'Unknown fixture transition'}});continue;}
+    value.fence=phase==='cancelled'?null:{transfer_id:p.args.transferId,role:'source',destination_host:value.destination,phase:phase==='source-committed'?'committed':'prepared'};
+    value.receipt={version:1,transferId:p.args.transferId,nativeSessionId:p.sessionId,historyCwd:p.cwd,executionDirectory:p.cwd,phase,source:value.source,destination:value.destination,inputsReplayed:false,authority:'foundation-transfer-fence',...(value.fence?{fence:value.fence}:{})};
+    writeFileSync(file,JSON.stringify(entries));
+    if(process.env.FIXTURE_TRANSFER_LOST_OPERATION===p.operation){process.exit(17);continue;}reply(message.id,value.receipt);
+  }
   else if(message.method==='_amplifier/session'){
     const file=process.env.FIXTURE_LOG+'.lifecycle',rows=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{};
     if(p.operation==='inspect'){reply(message.id,{sessionId:p.sessionId,historyRevision:'fixture-history',metadata:{},location:{historyCwd:p.cwd,executionDirectory:p.cwd,executionRevision:0,blocked:false},state:{deleted:false},preserved:['transcript','events']});continue;}

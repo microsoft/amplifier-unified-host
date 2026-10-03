@@ -580,3 +580,41 @@ links require an explicitly configured shared-filesystem owner; generic remote
 agents cannot assume host paths. The original AHP resource references remain in
 history. Standard AHP 0.9 `resourceWrite` returns `{}`; upload progress belongs to
 the registered owner's resource contract.
+
+## Trusted session transfer ownership
+
+The optional library boundary uses `transferIdentity` (the configured local
+TransferNode Ed25519 public-key SHA256 fingerprint), never a browser-provided host
+identity. Engines must advertise native `transfer` v1 with passive inspection.
+The portability owner verifies its signed envelopes; the host independently
+fetches persisted native proof and the actual Foundation writer fence.
+
+- `beginTransfer(session, {commandId, transferId, destination,
+  expectedExecutionRevision})` durably fences host admission before quiescing the
+  resident worker and asking native `source.fence` to acquire real writer ownership.
+- `commitTransfer(session, {commandId, transferId})` requires a confirmed source
+  fence and the native signed release phase. A committed source never resumes.
+- `cancelTransfer(session, {commandId, transferId})` clears admission only after
+  native confirmation of the exact unreleased cancellation and absence of its fence.
+- `inspectTransfer(session, transferId)` reads persisted proof without a worker or
+  repeated mutation. It can reconcile confirmed native outcomes and retry only
+  idempotent catalog synchronization, never execution, capture, transfer or probes.
+- `adoptTransferredSession({session, commandId, transferId, engineId,
+  nativeSessionId, historyHome, executionDirectory, source, destination,
+  releaseHash, title?})` preserves the original AHP URI from the verified signed
+  envelope and the native ID. The native activated receipt must independently match
+  all identities, paths, destination and release hash; no writer fence may remain.
+  Existing AHP identities mapped to another native session are never overwritten.
+
+These are trusted composition APIs, not unqualified browser mutations. Transfer
+IDs are canonical UUIDs; fingerprints are lowercase 64-character hex. Source
+history remains in place. Uncertain admission or metadata handoff stays durably
+fenced across host restarts. Exact completed command retries return their receipt;
+unknown attempts require explicit inspection and cannot be replayed. Workspace
+capture, runtime controls, relocation and execution share the selected session
+admission boundary; unrelated sessions remain responsive. This does not freeze
+external filesystem edits or grant authority over a noncooperating writer.
+
+A selected session removed from discovery retains readable history and carries
+`state._meta['amplifier.dev/lifecycle']={version:1,deleted:true,...}` via standard
+`session/metaChanged`; confirmed restore changes `deleted` to false.

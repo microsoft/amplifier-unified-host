@@ -31,6 +31,10 @@ export interface SessionWorkspace {
   session:string;engineId:string;nativeSessionId?:string;historyHome:string;executionDirectory:string;executionRevision:number;
 }
 export interface SessionWorkspaceExpectation {expectedExecutionRevision?:number;expectedDirectory?:string;}
+export interface TransferCommand {commandId:string;transferId:string;}
+export interface BeginTransfer extends TransferCommand {destination:string;expectedExecutionRevision:number;}
+/** AHP identity/source originate in the authenticated signed portability envelope. */
+export interface AdoptTransfer extends TransferCommand {session:string;engineId:string;nativeSessionId:string;historyHome:string;executionDirectory:string;source:string;destination:string;releaseHash:string;title?:string;}
 export type PendingQueueAction=Extract<StateAction,{type:'chat/pendingMessageSet'|'chat/pendingMessageRemoved'|'chat/queuedMessagesReordered'}>;
 export interface TurnSettled {session:string;commandId:string;status:'completed'|'cancelled'|'failed'|'unknown';inputOrigin:string;}
 export interface AgentStopped {session:string;nativeSessionId?:string;engineId:string;workingDirectory:string;reason:'runtime-closed'|'process-closed'|'idle-retired'|'host-shutdown'|'relocated'|'relocation-unknown'|'startup-failed'|'session-lifecycle';exitCode?:number;signal?:string;}
@@ -44,6 +48,8 @@ export interface HostConfig {
   resolvePromptAttachment?:(context:{session:string;engineId:string;nativeSessionId?:string;workingDirectory:string},attachment:NonNullable<Message['attachments']>[number])=>Promise<ContentBlock[]|undefined>;
   resourceProviders?:Array<{scheme:string;read?:(params:Json,context:{clientId:string})=>Promise<Json>;resolve?:(params:Json,context:{clientId:string})=>Promise<Json>;list?:(params:Json,context:{clientId:string})=>Promise<Json>;write?:(params:Json,context:{clientId:string})=>Promise<Json>}>;
   catalog?:Catalog;
+  /** SHA256 of this TransferNode's Ed25519 raw public key; never caller-selected. */
+  transferIdentity?:string;
   /** Optional bounded handshake metadata, resolved by the authenticated distribution. */
   clientMetadata?:(context:{clientId:string;metadata:Json})=>Promise<Json|undefined>;
   capabilities?: {
@@ -101,6 +107,7 @@ export class AmplifierHost {
     if(!config.engines.length||!config.allowedWorkspaceRoots.length)throw new Error('At least one engine and allowed workspace root are required');
     if(!isAbsolute(config.stateDirectory))throw new Error('Host stateDirectory must be absolute');
     if(new Set(config.engines.map(e=>e.id)).size!==config.engines.length)throw new Error('Duplicate engine identifier');
+    if(config.transferIdentity!==undefined&&!/^[a-f0-9]{64}$/.test(config.transferIdentity))throw new Error('transferIdentity must be an exact node public-key fingerprint');
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
     this.store=new Store(config.stateDirectory,config.replayLimit);
     this.http=createServer((_request,response)=>{response.writeHead(404);response.end();});
@@ -225,7 +232,7 @@ export class AmplifierHost {
     const summary=this.catalogSummary(discovered);
     const chat:ChatState={resource:chatURI(session),title:summary.title,status:summary.status,modifiedAt:timestamp,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:false,reason:'Native history projection has not been imported'}}};
     record={uri:session,engineId:discovered.engineId,nativeSessionId:discovered.nativeSessionId,workingDirectory:discovered.workingDirectory,summary,
-      state:{provider:summary.provider,title:summary.title,status:summary.status,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:{'amplifier.dev/native':{availability:discovered.availability??'available'}}},chat};
+      state:{provider:summary.provider,title:summary.title,status:summary.status,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:{'amplifier.dev/native':{availability:discovered.availability??'available'},...(discovered.nativeDeleted?{'amplifier.dev/lifecycle':{version:1,deleted:true,source:'native-catalog'}}:{})}},chat};
     this.store.save(record);if(discovered.nativeDeleted){this.store.db.prepare('INSERT OR REPLACE INTO session_visibility VALUES(?,1,?)').run(record.uri,'catalog-native-deleted');this.store.db.prepare('UPDATE sessions SET hidden=1 WHERE uri=?').run(record.uri);}this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);return record;
   }
   private getRecord(uri:string):SessionRecord|undefined {return this.hotRecords.get(uri.startsWith('ahp-chat:/')?'ahp-session:/'+uri.slice('ahp-chat:/'.length):uri)??this.store.get(uri);}
@@ -529,7 +536,122 @@ export class AmplifierHost {
       catch(error){if(this.store.receipt(input.commandId))throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown'});return {accepted:false,executed:false,reason:(error as Error).message};}
     });
   }
+  private transferFence(session:string):Json|undefined {
+    const row=this.store.db.prepare("SELECT transfer_id,source,destination,status,payload FROM transfer_fences WHERE session=? AND status NOT IN ('cancelled','rejected','adopted')").get(session);
+    return row?{transferId:row.transfer_id,source:row.source,destination:row.destination,status:row.status,...JSON.parse(String(row.payload))}:undefined;
+  }
+  private guardTransfer(session:string) {if(this.transferFence(session))throw new RpcFault(-32011,'Session transfer is fenced; inspect its signed receipt without replay',{executed:false});}
+  private transferInput(input:TransferCommand) {
+    if(!this.config.transferIdentity)throw new RpcFault(-32601,'This host has no configured transfer identity',{executed:false});
+    if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>200||typeof input.transferId!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(input.transferId))throw new RpcFault(-32602,'A bounded command ID and canonical transfer UUID are required',{executed:false});
+  }
+  private async transferAgent<T>(record:SessionRecord,work:(agent:AcpProcess)=>Promise<T>) {
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached',{executed:false});
+    const engine=this.config.engines.find(engine=>engine.id===record.engineId);if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native transfer identity is unavailable',{executed:false});
+    this.passiveReads++;const agent=new AcpProcess(engine,record.workingDirectory,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}})});
+    try{const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.transfer;if(capability?.version!==1||capability.passiveInspection!==true)throw new RpcFault(-32601,'Agent does not advertise passive native transfer authority',{executed:false});return await work(agent);}finally{this.passiveReads--;await agent.retire();}
+  }
+  private async nativeTransfer(agent:AcpProcess,record:SessionRecord,operation:string,transferId:string):Promise<Json> {
+    const result=await agent.client.extMethod('_amplifier/transfer',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,operation,args:{transferId}});
+    if(!result||typeof result!=='object'||Array.isArray(result)||Buffer.byteLength(JSON.stringify(result))>65536)throw new Error('Invalid or oversized native transfer proof');return result;
+  }
+  private verifyTransferProof(record:SessionRecord,transferId:string,source:string,destination:string,proof:Json,phase:string) {
+    if(!proof||proof.version!==1||proof.transferId!==transferId||proof.nativeSessionId!==record.nativeSessionId||proof.historyCwd!==record.workingDirectory||proof.executionDirectory!==(record.executionDirectory??record.workingDirectory)||proof.source!==source||proof.destination!==destination||proof.phase!==phase||proof.inputsReplayed!==false||proof.authority!=='foundation-transfer-fence')throw new Error('Native transfer proof does not match the exact bound session and hosts');
+    if(phase==='source-fenced'||phase==='source-committed'){const fence=proof.fence;if(!fence||fence.transfer_id!==transferId||fence.role!=='source'||fence.destination_host!==destination||phase==='source-committed'&&fence.phase!=='committed')throw new Error('Exact native source writer fence was not confirmed');}
+  }
+  private completeTransfer(record:SessionRecord,entry:Json,proof:Json) {
+    const result={session:record.uri,transferId:entry.transfer_id,phase:proof.phase,inputsReplayed:false,receipt:entry.command_id,nativeReceipt:proof};
+    this.store.transaction(()=>{if(entry.operation==='source.fence'&&this.store.db.prepare('SELECT status FROM transfer_commands WHERE command_id=?').get(entry.command_id)?.status!=='completed'){this.store.bump(record.uri,'execution');this.store.bump(record.uri,'interruption');}this.store.db.prepare('UPDATE transfer_commands SET status=\'completed\',result=? WHERE command_id=?').run(JSON.stringify(result),entry.command_id);this.store.db.prepare('UPDATE transfer_fences SET status=?,payload=? WHERE session=? AND transfer_id=?').run(proof.phase,JSON.stringify({nativeReceipt:proof}),record.uri,entry.transfer_id);this.store.finish(String(entry.command_id),'completed');});return result;
+  }
+  private async sourceTransfer(session:string,operation:'source.fence'|'source.commit'|'source.cancel',input:BeginTransfer|TransferCommand) {
+    this.transferInput(input);const record=await this.record(session);
+    return this.withLock(record.uri,async()=>{
+      if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
+      const previous=this.store.db.prepare('SELECT * FROM transfer_commands WHERE command_id=?').get(input.commandId),payload=JSON.stringify(input);
+      if(previous){if(previous.session!==record.uri||previous.operation!==operation||previous.payload!==payload)throw new RpcFault(-32011,'Transfer command conflicts with its original request',{executed:false});if(previous.status==='completed')return JSON.parse(String(previous.result));throw new RpcFault(-32011,'Transfer already attempted; inspect its original receipt without replay',{receipt:input.commandId,outcome:previous.status});}
+      const current=this.getRecord(record.uri)!,fence=this.transferFence(record.uri),source=this.config.transferIdentity!,destination=operation==='source.fence'?(input as BeginTransfer).destination:fence?.destination;
+      if(operation==='source.fence'){
+        if(typeof destination!=='string'||!/^[a-f0-9]{64}$/.test(destination)||destination===source||!Number.isSafeInteger((input as BeginTransfer).expectedExecutionRevision))throw new RpcFault(-32602,'Exact remote fingerprint and execution revision required',{executed:false});
+        this.guardSessionLifecycle(record.uri);
+        if(this.store.revisions(record.uri).executionRevision!==(input as BeginTransfer).expectedExecutionRevision||this.relocationFence(record.uri)||this.store.unknown(current.chat.resource)||current.chat.activeTurn||this.active.get(record.uri)?.busy||this.starting.has(record.uri))throw new RpcFault(-32011,'Session must be conclusively idle at the expected execution revision',{executed:false});
+      }else if(!fence||fence.transferId!==input.transferId||fence.source!==source||fence.status==='source-committed'||operation==='source.commit'&&fence.status!=='source-fenced')throw new RpcFault(-32011,'No matching confirmed reversible source transfer fence',{executed:false});
+      return this.transferAgent(current,async agent=>{
+        const entry={command_id:input.commandId,session:record.uri,transfer_id:input.transferId,operation,payload};
+        this.store.transaction(()=>{this.store.admission(record.uri,{operation,input},input.commandId,'host:transfer',this.store.extensionSequence('host:transfer'));this.store.db.prepare('INSERT INTO transfer_commands(command_id,session,transfer_id,operation,status,payload) VALUES(?,?,?,?,?,?)').run(input.commandId,record.uri,input.transferId,operation,'dispatching',payload);this.store.db.prepare('INSERT INTO transfer_fences VALUES(?,?,?,?,?,?) ON CONFLICT(session) DO UPDATE SET transfer_id=excluded.transfer_id,source=excluded.source,destination=excluded.destination,status=excluded.status,payload=excluded.payload').run(record.uri,input.transferId,source,destination,'dispatching',JSON.stringify({commandId:input.commandId,operation}));this.store.finish(input.commandId,'dispatching');});
+        let nativeDispatched=false;
+        try{
+          await this.quiesceLifecycle(current);
+          this.holdQueue(current.chat.resource,'session-transfer');nativeDispatched=true;
+          const proof=await this.nativeTransfer(agent,current,operation,input.transferId),phase={'source.fence':'source-fenced','source.commit':'source-committed','source.cancel':'cancelled'}[operation];
+          this.verifyTransferProof(current,input.transferId,source,destination,proof,phase);
+          if(operation==='source.cancel'){const inspected=await this.nativeTransfer(agent,current,'inspect',input.transferId);if(inspected.fence!==null)throw new Error('Native source fence remains active');this.verifyTransferProof(current,input.transferId,source,destination,inspected.receipt,phase);}
+          return this.completeTransfer(current,entry,proof);
+        }catch(error){
+          const known=!nativeDispatched&&((error as RpcFault).data as Json|undefined)?.executed===false,status=known?'failed':'unknown';
+          this.store.transaction(()=>{this.store.db.prepare('UPDATE transfer_commands SET status=? WHERE command_id=?').run(status,input.commandId);this.store.db.prepare('UPDATE transfer_fences SET status=? WHERE session=?').run(known&&operation==='source.fence'?'rejected':'unknown',record.uri);this.store.finish(input.commandId,status,(error as Error).message);});
+          throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:status,...(known?{executed:false}:{})});
+        }
+      });
+    });
+  }
+  /** Source admission is fenced durably before native quiescence or any transfer effect. */
+  async beginTransfer(session:string,input:BeginTransfer) {return this.sourceTransfer(session,'source.fence',input);}
+  async commitTransfer(session:string,input:TransferCommand) {return this.sourceTransfer(session,'source.commit',input);}
+  async cancelTransfer(session:string,input:TransferCommand) {return this.sourceTransfer(session,'source.cancel',input);}
+  /** Inspection may confirm durable native proof; it never resubmits a transition. */
+  async inspectTransfer(session:string,transferId:string) {
+    this.transferInput({commandId:'inspect',transferId});const record=await this.record(session);
+    return this.withLock(record.uri,()=>this.transferAgent(record,async agent=>{
+      const result=await this.nativeTransfer(agent,record,'inspect',transferId),fence=this.transferFence(record.uri);
+      if(result.receipt&&fence?.transferId===transferId){
+        const phase=result.receipt.phase,operations:Record<string,string>={'source-fenced':'source.fence','source-committed':'source.commit',cancelled:'source.cancel'};
+        if(operations[phase]){this.verifyTransferProof(record,transferId,fence.source,fence.destination,result.receipt,phase);if(phase==='cancelled'?result.fence!==null:JSON.stringify(result.fence)!==JSON.stringify(result.receipt.fence))throw new Error('Transfer receipt differs from the actual native writer fence');
+          const entry=this.store.db.prepare('SELECT * FROM transfer_commands WHERE session=? AND transfer_id=? AND operation=? ORDER BY rowid DESC LIMIT 1').get(record.uri,transferId,operations[phase]);
+          if(entry&&fence.status!=='source-committed')this.completeTransfer(record,entry,result.receipt);
+        }
+        if(phase==='activated'){
+          const entry=this.store.db.prepare("SELECT * FROM transfer_commands WHERE session=? AND transfer_id=? AND operation='destination.adopt' ORDER BY rowid DESC LIMIT 1").get(record.uri,transferId);
+          if(entry){const args=JSON.parse(String(entry.payload));this.verifyTransferProof(record,transferId,args.source,args.destination,result.receipt,'activated');if(result.fence!==null||result.receipt.releaseHash!==args.releaseHash||args.destination!==this.config.transferIdentity)throw new Error('Destination activation does not match the reserved release');
+            await this.syncCatalog(record);const adopted={uri:record.uri,nativeSessionId:record.nativeSessionId,transferId,adopted:true,inputsReplayed:false,receipt:entry.command_id};
+            this.store.transaction(()=>{this.store.db.prepare("UPDATE transfer_commands SET status='completed',result=? WHERE command_id=?").run(JSON.stringify(adopted),entry.command_id);this.store.db.prepare("UPDATE transfer_fences SET status='adopted',payload=? WHERE session=?").run(JSON.stringify({nativeReceipt:result.receipt}),record.uri);this.store.finish(String(entry.command_id),'completed');});this.notify('root/sessionAdded',{channel:ROOT,summary:record.summary});
+          }
+        }
+      }
+      return {session:record.uri,transferId,hostFence:this.transferFence(record.uri)??null,native:result,replayed:false};
+    }));
+  }
+  /** Trusted composition boundary: preserve the AHP identity from a verified signed envelope. */
+  async adoptTransferredSession(input:AdoptTransfer) {
+    this.transferInput(input);
+    if(!/^ahp-session:\/[A-Za-z0-9_-]{1,200}$/.test(input.session)||typeof input.nativeSessionId!=='string'||!input.nativeSessionId||input.nativeSessionId.length>200||input.destination!==this.config.transferIdentity||!['source','releaseHash'].every(key=>/^[a-f0-9]{64}$/.test(input[key as 'source'|'releaseHash']))||input.source===input.destination||typeof input.title!=='undefined'&&(typeof input.title!=='string'||input.title.length>1000))throw new RpcFault(-32602,'Exact signed transfer identity and destination proof required',{executed:false});
+    const historyHome=await this.workspace(pathToFileURL(input.historyHome).href),executionDirectory=await this.workspace(pathToFileURL(input.executionDirectory).href);
+    return this.withLock(input.session,async()=>{
+      if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
+      const payload=JSON.stringify(input),prior=this.store.db.prepare('SELECT * FROM transfer_commands WHERE command_id=?').get(input.commandId);
+      if(prior){if(prior.operation!=='destination.adopt'||prior.payload!==payload)throw new RpcFault(-32011,'Transfer adoption ID was reused',{executed:false});if(prior.status==='completed')return JSON.parse(String(prior.result));throw new RpcFault(-32011,'Adoption already attempted; inspect the original receipt without replay',{receipt:input.commandId,outcome:prior.status});}
+      const existing=this.getRecord(input.session)??(this.config.catalog?await this.config.catalog.get(input.session):undefined);
+      if(existing&&(existing.nativeSessionId!==input.nativeSessionId||existing.engineId!==input.engineId||existing.workingDirectory!==historyHome))throw new RpcFault(-32011,'Existing AHP identity belongs to a different native session',{executed:false});
+      if(this.active.has(input.session)||this.starting.has(input.session)||this.transferFence(input.session))throw new RpcFault(-32011,'Destination session already has an owner or unresolved transition',{executed:false});
+      const timestamp=now(),title=input.title??(existing&&'summary' in existing?existing.summary.title:existing?.title)??'Transferred conversation';
+      const summary:SessionSummary={resource:input.session,provider:input.engineId,title,status:SessionStatus.Idle,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(historyHome).href]};
+      const chat:ChatState={resource:chatURI(input.session),title,status:SessionStatus.Idle,modifiedAt:timestamp,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:true}}};
+      const record:SessionRecord={uri:input.session,engineId:input.engineId,nativeSessionId:input.nativeSessionId,workingDirectory:historyHome,executionDirectory,summary,chat,state:{provider:input.engineId,title,status:SessionStatus.Idle,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories}};
+      return this.transferAgent(record,async agent=>{
+        const proof=await this.nativeTransfer(agent,record,'inspect',input.transferId);
+        this.verifyTransferProof(record,input.transferId,input.source,input.destination,proof.receipt,'activated');
+        if(proof.fence!==null||proof.receipt.releaseHash!==input.releaseHash||typeof proof.receipt.historyRevision!=='string')throw new RpcFault(-32011,'Destination activation and release are not proven',{executed:false});
+        return this.withLock('@directory-reservations',async()=>{
+          await this.workspace(pathToFileURL(historyHome).href);await this.workspace(pathToFileURL(executionDirectory).href);
+          const result={uri:record.uri,nativeSessionId:record.nativeSessionId,transferId:input.transferId,adopted:true,inputsReplayed:false,receipt:input.commandId};
+          this.store.transaction(()=>{this.store.admission(record.uri,{operation:'destination.adopt',input},input.commandId,'host:transfer',this.store.extensionSequence('host:transfer'));this.store.db.prepare('INSERT INTO transfer_commands VALUES(?,?,?,?,?,?,?)').run(input.commandId,record.uri,input.transferId,'destination.adopt','dispatching',payload,null);this.store.save(this.getRecord(record.uri)??record);this.store.db.prepare('INSERT INTO transfer_fences VALUES(?,?,?,?,?,?) ON CONFLICT(session) DO UPDATE SET transfer_id=excluded.transfer_id,source=excluded.source,destination=excluded.destination,status=excluded.status,payload=excluded.payload').run(record.uri,input.transferId,input.source,input.destination,'dispatching',JSON.stringify({nativeReceipt:proof.receipt}));});
+          try{await this.syncCatalog(record);this.store.transaction(()=>{this.store.db.prepare("UPDATE transfer_commands SET status='completed',result=? WHERE command_id=?").run(JSON.stringify(result),input.commandId);this.store.db.prepare("UPDATE transfer_fences SET status='adopted' WHERE session=?").run(record.uri);this.store.finish(input.commandId,'completed');});this.notify('root/sessionAdded',{channel:ROOT,summary});return result;}
+          catch(error){this.store.transaction(()=>{this.store.db.prepare("UPDATE transfer_commands SET status='unknown' WHERE command_id=?").run(input.commandId);this.store.db.prepare("UPDATE transfer_fences SET status='unknown' WHERE session=?").run(record.uri);this.store.finish(input.commandId,'unknown',(error as Error).message);});throw new RpcFault(-32011,'Destination metadata synchronization is unknown; inspect without replay',{receipt:input.commandId,outcome:'unknown'});}
+        });
+      });
+    });
+  }
   private guardSessionLifecycle(session:string) {
+    this.guardTransfer(session);
     if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(session,session))throw new RpcFault(-32011,'Session lifecycle outcome is unresolved; inspect the original receipt without replay');
     if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(session))throw new RpcFault(-32008,'Session was removed from discovery; restore it before execution');
   }
@@ -591,6 +713,7 @@ export class AmplifierHost {
       this.store.db.prepare('INSERT INTO session_visibility VALUES(?,?,?) ON CONFLICT(uri) DO UPDATE SET deleted=excluded.deleted,command_id=excluded.command_id').run(record.uri,native.deleted?1:0,entry.command_id);
       if(this.config.catalog){if(!this.config.catalog.setVisibility)throw new Error('Catalog does not support confirmed native visibility');await this.config.catalog.setVisibility({uri:record.uri,nativeSessionId:record.nativeSessionId!,workingDirectory:record.workingDirectory,deleted:native.deleted,commandId:String(entry.command_id),evidence:'native-completed-receipt'});}
       this.store.db.prepare('UPDATE sessions SET hidden=? WHERE uri=?').run(native.deleted?1:0,record.uri);
+      this.emit(record.uri,{type:'session/metaChanged',_meta:{...this.getRecord(record.uri)!.state._meta,'amplifier.dev/lifecycle':{version:1,deleted:native.deleted,preserved:native.preserved,receipt:entry.command_id}}} as StateAction);
       result={session:record.uri,deleted:native.deleted,preserved:native.preserved,historyRevision:native.historyRevision,receipt:native.receipt};
       if(native.deleted){this.holdQueue(record.chat.resource,'session-removed');this.notify('root/sessionRemoved',{channel:ROOT,session:record.uri});}else this.notify('root/sessionAdded',{channel:ROOT,summary:record.summary});
     }
@@ -602,6 +725,7 @@ export class AmplifierHost {
       if(this.closing)throw new RpcFault(-32008,'Host is shutting down',{executed:false});
       const previous=this.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(args.commandId);
       if(previous){if(previous.session!==record.uri||previous.operation!==operation||previous.payload!==JSON.stringify(args))throw new RpcFault(-32011,'Lifecycle command ID conflicts with its original request');if(previous.status==='completed')return JSON.parse(String(previous.result));throw new RpcFault(-32011,'Original lifecycle receipt is not completed; inspect it without replay',{receipt:args.commandId,outcome:previous.status,executed:previous.status==='failed'?false:undefined});}
+      this.guardTransfer(record.uri);
       if(operation!=='restore')this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
       if(this.store.unknown(record.chat.resource)||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
       if(this.config.catalog&&['delete','restore'].includes(operation)&&!this.config.catalog.setVisibility)throw new RpcFault(-32601,'Catalog cannot project native visibility',{executed:false});
@@ -1309,7 +1433,7 @@ export class AmplifierHost {
     const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
     const active=this.active.get(record.uri),admission=active?.busy&&active.turnId?this.store.receipt(active.turnId):undefined;
     const observationAdmission=admission?.status==='dispatching'&&active?.observationAdmission?{...active.observationAdmission,status:admission.status}:undefined;
-    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),title:record.summary.title,activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
   }
   /** Hold the selected session mapping through bounded trusted I/O. No filesystem snapshot is implied. */
   async withSessionWorkspace<T>(session:string,expected:SessionWorkspaceExpectation,capture:(workspace:Readonly<SessionWorkspace>)=>Promise<T>):Promise<T> {
@@ -1317,6 +1441,7 @@ export class AmplifierHost {
     const selected=await this.record(session);
     return this.withLock(selected.uri,async()=>{
       const record=await this.record(selected.uri);
+      this.guardTransfer(record.uri);
       if(this.relocationFence(record.uri))throw new RpcFault(-32011,'Session relocation is fenced; workspace capture was not started',{executed:false});
       const executionDirectory=await this.workspace(pathToFileURL(record.executionDirectory??record.workingDirectory).href),executionRevision=this.store.revisions(record.uri).executionRevision;
       if(expected.expectedExecutionRevision!==undefined&&expected.expectedExecutionRevision!==executionRevision)throw new RpcFault(-32011,'Execution revision changed; workspace capture was not started',{executed:false});
@@ -1366,6 +1491,7 @@ export class AmplifierHost {
     return this.withLock(record.uri,async()=>{
       let admitted=false;
       try {
+      this.guardTransfer(record.uri);
       const prior=this.store.db.prepare('SELECT uri,payload,status FROM relocations WHERE command_id=?').get(input.commandId);
       if(prior){const value=JSON.parse(String(prior.payload));if(prior.uri!==record.uri||value.target!==target||value.expectedExecutionRevision!==input.expectedExecutionRevision||value.reconciles!==input.reconciles)throw new RpcFault(-32011,'Relocation command reused with different content');if(prior.status==='applied')return value.result;if(prior.status==='rejected')return {applied:false,executed:false,reason:'Native relocation previously refused'};throw new RpcFault(-32011,'Relocation outcome is unresolved; the original operation must not be repeated',{receipt:input.commandId,outcome:'unknown',executed:true});}
       const latest=this.getRecord(record.uri)!,fence=this.relocationFence(record.uri),revision=this.store.revisions(record.uri).executionRevision;
@@ -1450,7 +1576,9 @@ export class AmplifierHost {
     const admissionMethod:Record<string,string>={'steer':'updatePendingQueue','steer.submit':'updatePendingQueue','schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation','history.revise':'reviseHistory'};
     if(admissionMethod[operation])throw new RpcFault(-32602,`Execution requires ${admissionMethod[operation]} admission`);
     const execute=async()=>{
+      this.guardTransfer(session);
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
+      this.guardTransfer(session);
       if(!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32008,'No existing owned native runtime; no process was started');
       if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.version!==1)throw new RpcFault(-32601,'Native control extension not negotiated');
       if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
