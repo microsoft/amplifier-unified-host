@@ -720,3 +720,33 @@ test('only explicit no-effect observation refusal may re-admit the same exact in
   await assert.rejects(f.host.submitObservation(session,retry),/already admitted/);
  }finally{await f.cleanup();}
 });
+
+test('standard shared archive survives subsequent turn status updates and host restart',async()=>{
+ const f=await setup();let restarted:any;try{
+  const a=await f.connect(),b=await f.connect(),{session}=await f.create(a);const sub=await b.subscribe(session);const actions:any[]=[];void(async()=>{for await(const event of sub.subscription)if(event.type==='action')actions.push(event.params.action);})();
+  a.dispatch(session,{type:'session/isArchivedChanged',isArchived:true});await waitFor(()=>actions.some(action=>action.type==='session/isArchivedChanged'));assert.ok(f.host.store.get(session)!.summary.status & 64);
+  const commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'Archive is shared organization',clientId:'owner'});await f.host.waitForTurn(session,commandId);assert.ok(f.host.store.get(session)!.summary.status & 64);assert.ok((await a.request('listSessions',{channel:'ahp-root://'})).items[0].status & 64);
+  for(const client of f.clients)await client.shutdown();await f.host.close();restarted=await createHost(f.config);assert.ok(restarted.store.get(session)!.summary.status & 64);await restarted.archiveSession(session,false);assert.equal(restarted.store.get(session)!.summary.status & 64,0);
+ }finally{if(restarted){await restarted.close();await rm(f.dir,{recursive:true,force:true});}else await f.cleanup();}
+});
+
+test('lost native fork acknowledgement fences source and reserved identity until exact receipt recovery',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),commandId='lost-'+randomUUID(),args={commandId,expectedHistoryRevision:'fixture-history'};
+  await assert.rejects(f.host.forkSession(session,args),(error:any)=>error.data?.outcome==='unknown');const row=f.host.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(commandId)!;
+  assert.equal(row.status,'unknown');await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'Unsafe continuation',clientId:'owner'}),/lifecycle outcome/);
+  await assert.rejects(client.request('createSession',{channel:String(row.target),provider:'fixture',workingDirectories:[pathToFileURL(f.dir).href]}),/lifecycle outcome/);
+  await assert.rejects(f.host.forkSession(session,args),/without replay/);const recovered=await f.host.inspectSessionLifecycleReceipt(session,commandId);assert.equal(recovered.status,'completed');assert.equal(recovered.result.uri,row.target);assert.equal(recovered.result.workReplayed,false);
+  assert.deepEqual(await f.host.forkSession(session,args),recovered.result);const receipts=JSON.parse(await readFile(f.log+'.lifecycle','utf8'));assert.equal(Object.keys(receipts).length,1);assert.equal(f.host.diagnostics().activeAgents,0);
+ }finally{await f.cleanup();}
+});
+
+test('committed attachment references resolve only on execution and never inflate retained history',async()=>{
+ const calls:any[]=[],f=await setup({resolvePromptAttachment:async(context:any,attachment:any)=>{calls.push({context,attachment});if(attachment.uri.includes('too-large'))return [{type:'text',text:'x'.repeat(8*1024*1024)}];return [{type:'resource_link',uri:'file:///owned-immutable/blob',name:attachment.label,mimeType:attachment.contentType}];}});try{
+  const a=await f.connect(),{session,chat}=await f.create(a),ref={type:'resource',uri:'amplifier-attachment://owned/body?session='+encodeURIComponent(session),label:'Report.pdf',contentType:'application/pdf'} as any;
+  const id=randomUUID();await f.host.submitTurn(session,{commandId:id,text:'Read this',clientId:'owner',attachments:[ref]});assert.equal((await f.host.waitForTurn(session,id)).completed,true);assert.equal(calls.length,1);assert.equal(calls[0].context.session,session);assert.equal(calls[0].context.engineId,'fixture');assert.ok(calls[0].context.nativeSessionId);
+  const wire=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(wire.prompt[1].uri,'file:///owned-immutable/blob');assert.equal(wire.prompt[1].name,'Report.pdf');const state=(await a.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as any;assert.deepEqual(state.turns[0].message.attachments,[ref]);assert.equal(calls.length,1);
+  const slow=randomUUID();await f.host.submitTurn(session,{commandId:slow,text:'slow',clientId:'owner'});const queued=randomUUID();await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'queued',id:queued,message:{text:'Later',origin:{kind:'user'},attachments:[ref]}} as any,{clientId:'owner'});assert.equal(calls.length,1);a.dispatch(chat,{type:'chat/turnCancelled',turnId:slow,duration:0});assert.equal((await f.host.waitForTurn(session,slow)).status,'cancelled');
+  const rejected=randomUUID();await assert.rejects(f.host.submitTurn(session,{commandId:rejected,text:'Invalid resolved size',clientId:'owner',attachments:[{...ref,uri:'amplifier-attachment://too-large/body'}]}),/wire budget/);assert.equal(f.host.store.receipt(rejected),undefined);
+ }finally{await f.cleanup();}
+});

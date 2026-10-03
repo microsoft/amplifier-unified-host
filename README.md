@@ -521,3 +521,62 @@ receipt and returned with explicit retry eligibility. Observation chat projectio
 begins only after native input acceptance or execution evidence, so a refused
 attempt never becomes a fictitious turn or duplicates a turn ID on connected
 clients.
+
+## Canonical session lifecycle
+
+Initialization advertises `amplifier.dev/sessionLifecycle` v1 and the negotiated
+`x-amplifier/sessionLifecycle` method. Parameters are `{channel,operation,args}`.
+The selected agent must additionally advertise its native passive lifecycle.
+`inspect`, `delete.preview`, `fork`, `export`, `delete`, `restore`, and `receipt`
+map to the public host methods `inspectSessionHistory`, `previewDeleteSession`,
+`forkSession`, `exportSession`, `deleteSession`, `restoreSession`, and
+`inspectSessionLifecycleReceipt`. Fork/export/delete/restore require a stable
+`commandId` and exact `expectedHistoryRevision`; fork optionally accepts a native
+user `throughMessageId` and a host title. This is an actual canonical history fork,
+not the separate configuration-only `createSession` API. Native task, job and
+runtime authority is not cloned.
+
+Mutations hold the selected session admission lock and ask the native owner to
+retire idle work atomically. Busy or owned background work refuses; no process is
+killed to acquire the history lease. A durable host reservation precedes the
+native mutation. Unknown responses fence source and reserved destination; the
+`receipt` operation can recover a completed native receipt without resending its
+mutation. A restart preserves this fence. History and event logs remain native
+owned. Delete requires the native preview token and removes the session from
+discovery while preserving canonical files. Restore requires native confirmation.
+Hard deletion is not advertised. Standard `session/isArchivedChanged` is shared
+organization and survives subsequent turn status changes.
+
+Exports contain public native conversation text/references with explicit omissions,
+not portable execution archives. The returned host-issued `resource` supports
+standard `resourceRead` with URI query `offset=<byte offset>&limit=<1..65536>`.
+Its UTF-8 JSON body is `{data,encoding:"base64",offset,nextOffset,contentHash,
+mimeType,totalBytes}`. Concatenate decoded bytes before UTF-8 decoding and verify
+the full SHA-256 `contentHash`; `nextOffset:null` denotes EOF. This avoids adding
+fields to the upstream `ResourceReadParams`. No storage path reaches clients.
+
+`history.revise` maps to `reviseHistory(session,{commandId,operationId,
+targetMessageId,expectedHistoryRevision,text})`. It admits one idle replacement
+turn through the same durable execution boundary. The native owner resolves the
+canonical boundary, rewinds its own context/checkpoint, and confirms the rewrite
+before the host emits standard `chat/truncated`, a bounded retained
+`chat/turnsLoaded` prefix, then the replacement `chat/turnStarted`. Superseded
+host projections are archived, receipts and native event logs are preserved,
+and an unknown rewrite never repeats input. The selected prefix is prepared
+passively before mutation; clients with different history windows converge.
+Older retained prefix pages use exact native boundaries and fresh revision checks.
+A bare client `chat/truncated` is not permission to rewrite native history.
+
+## Committed prompt resources
+
+`HostConfig.resolvePromptAttachment(context,attachment)` optionally resolves a
+committed resource reference to ACP blocks. Context contains the exact session,
+engine ID, native session ID when known, and authorized execution directory.
+Resolution runs only on new execution, before command admission; it never runs
+while rendering snapshots or storing queued intent. `undefined` preserves an
+ordinary ACP resource link. Each attachment yields at most sixteen blocks and
+the aggregate resolved ACP prompt is limited to 8 MiB encoded. Immutable file
+links require an explicitly configured shared-filesystem owner; generic remote
+agents cannot assume host paths. The original AHP resource references remain in
+history. Standard AHP 0.9 `resourceWrite` returns `{}`; upload progress belongs to
+the registered owner's resource contract.

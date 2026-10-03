@@ -52,6 +52,14 @@ export class Store {
       CREATE INDEX IF NOT EXISTS relocations_session ON relocations(uri,status);
       CREATE INDEX IF NOT EXISTS relocations_source ON relocations(source,status);
       CREATE INDEX IF NOT EXISTS relocations_target ON relocations(target,status);
+      CREATE TABLE IF NOT EXISTS history_edit_archives(operation_id TEXT NOT NULL,chat TEXT NOT NULL,ordinal INTEGER NOT NULL,turn_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(operation_id,chat,turn_id));
+      CREATE TABLE IF NOT EXISTS history_edits(operation_id TEXT PRIMARY KEY,session TEXT NOT NULL,input_id TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS history_edits_session ON history_edits(session,status);
+      CREATE TABLE IF NOT EXISTS lifecycle_commands(command_id TEXT PRIMARY KEY,session TEXT NOT NULL,operation TEXT NOT NULL,target TEXT,status TEXT NOT NULL,payload TEXT NOT NULL,result TEXT);
+      CREATE INDEX IF NOT EXISTS lifecycle_session_status ON lifecycle_commands(session,status);
+      CREATE INDEX IF NOT EXISTS lifecycle_target_status ON lifecycle_commands(target,status);
+      CREATE TABLE IF NOT EXISTS session_visibility(uri TEXT PRIMARY KEY,deleted INTEGER NOT NULL,command_id TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS export_resources(uri TEXT PRIMARY KEY,session TEXT NOT NULL,snapshot_id TEXT NOT NULL,metadata TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS creation_keys(identity TEXT PRIMARY KEY,command_id TEXT NOT NULL,uri TEXT NOT NULL,fingerprint TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS queue_intents(id TEXT PRIMARY KEY,chat TEXT NOT NULL,message TEXT,origin TEXT NOT NULL,position INTEGER NOT NULL,status TEXT NOT NULL,held INTEGER NOT NULL DEFAULT 0,reason TEXT,projected INTEGER NOT NULL DEFAULT 1);
       CREATE INDEX IF NOT EXISTS queue_pending ON queue_intents(status,chat,position);
@@ -65,8 +73,11 @@ export class Store {
     `);
     if(!this.db.prepare('PRAGMA table_info(terminals)').all().some(column=>column.name==='lifecycle'))this.db.exec("ALTER TABLE terminals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'exited'; UPDATE terminals SET lifecycle=json_extract(payload,'$.lifecycle.status');");
     if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='execution_cwd'))this.db.exec('ALTER TABLE sessions ADD COLUMN execution_cwd TEXT; ALTER TABLE sessions ADD COLUMN native_location_revision INTEGER NOT NULL DEFAULT 0; UPDATE sessions SET execution_cwd=cwd');
+    if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='hidden'))this.db.exec('ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0');
+    this.db.exec('CREATE INDEX IF NOT EXISTS sessions_visible_order ON sessions(hidden,modified DESC,uri DESC)');
     this.db.exec("CREATE INDEX IF NOT EXISTS sessions_execution ON sessions(execution_cwd); CREATE INDEX IF NOT EXISTS sessions_history ON sessions(cwd); UPDATE relocations SET status='unknown' WHERE status='admitted';");
     if(!this.db.prepare('PRAGMA table_info(queue_intents)').all().some(column=>column.name==='projected'))this.db.exec('ALTER TABLE queue_intents ADD COLUMN projected INTEGER NOT NULL DEFAULT 1');
+    this.db.exec("UPDATE lifecycle_commands SET status='unknown' WHERE status='dispatching'");
     this.db.exec('CREATE INDEX IF NOT EXISTS queue_projection_pending ON queue_intents(projected)');
     this.db.exec("UPDATE queue_intents SET held=1,reason='host-restarted' WHERE status='pending'");
     this.db.exec("UPDATE steering_intents SET status='unknown',reason='host-restarted' WHERE status='dispatching'; UPDATE steering_intents SET held=1,reason='host-restarted' WHERE status='pending'");
@@ -107,8 +118,8 @@ export class Store {
   }
   appendActive(channel:string,action:unknown){this.db.prepare('INSERT INTO active_events(channel,action) VALUES(?,?)').run(channel,JSON.stringify(action));}
   list(limit: number, after?: {modified: string; uri: string}): SessionSummary[] {
-    const rows = after ? this.db.prepare('SELECT summary FROM sessions WHERE (modified,uri)<(?,?) ORDER BY modified DESC,uri DESC LIMIT ?').all(after.modified, after.uri, limit)
-      : this.db.prepare('SELECT summary FROM sessions ORDER BY modified DESC,uri DESC LIMIT ?').all(limit);
+    const rows = after ? this.db.prepare('SELECT summary FROM sessions WHERE hidden=0 AND (modified,uri)<(?,?) ORDER BY modified DESC,uri DESC LIMIT ?').all(after.modified, after.uri, limit)
+      : this.db.prepare('SELECT summary FROM sessions WHERE hidden=0 ORDER BY modified DESC,uri DESC LIMIT ?').all(limit);
     return rows.map(row => JSON.parse(row.summary as string));
   }
   saveTurn(chat: string, turn: Turn) {

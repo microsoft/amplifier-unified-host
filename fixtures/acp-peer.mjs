@@ -9,7 +9,18 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,configurationClone:{version:1},taskState:{version:1,passive:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  if(message.method==='initialize')reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,sessionLifecycle:{version:1,passive:true,deletion:'preserve-history'},configurationClone:{version:1},taskState:{version:1,passive:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});
+  else if(message.method==='_amplifier/session'){
+    const file=process.env.FIXTURE_LOG+'.lifecycle',rows=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{};
+    if(p.operation==='inspect'){reply(message.id,{sessionId:p.sessionId,historyRevision:'fixture-history',metadata:{},location:{historyCwd:p.cwd,executionDirectory:p.cwd,executionRevision:0,blocked:false},state:{deleted:false},preserved:['transcript','events']});continue;}
+    if(p.operation==='receipt'){reply(message.id,{receipt:rows[p.args.commandId]??null});continue;}
+    const prior=rows[p.args.commandId];if(prior){reply(message.id,{...prior.result,receipt:prior});continue;}
+    if(p.operation==='fork'){
+      const result={sessionId:p.args.targetSessionId,creationConfirmed:true,historyCwd:p.cwd,executionDirectory:p.cwd,historyRevision:'fixture-history',source:{sessionId:p.sessionId,historyRevision:p.args.expectedHistoryRevision},workReplayed:false};const receipt={commandId:p.args.commandId,operation:'fork',status:'completed',result};rows[p.args.commandId]=receipt;writeFileSync(file,JSON.stringify(rows));
+      if(p.args.commandId.startsWith('lost-')){process.exit(17);continue;}reply(message.id,{...result,receipt});continue;
+    }
+    send({id:message.id,error:{code:-32601,message:'Unsupported fixture lifecycle operation'}});
+  }
   else if(message.method==='_amplifier/retire'){
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
