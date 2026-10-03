@@ -49,6 +49,8 @@ export interface HostConfig {
   resolvePromptAttachment?:(context:{session:string;engineId:string;nativeSessionId?:string;workingDirectory:string},attachment:NonNullable<Message['attachments']>[number])=>Promise<ContentBlock[]|undefined>;
   resourceProviders?:Array<{scheme:string;read?:(params:Json,context:{clientId:string})=>Promise<Json>;resolve?:(params:Json,context:{clientId:string})=>Promise<Json>;list?:(params:Json,context:{clientId:string})=>Promise<Json>;write?:(params:Json,context:{clientId:string})=>Promise<Json>}>;
   catalog?:Catalog;
+  /** Existing directory used for new-client workspace hints; must be within allowed roots. */
+  defaultWorkingDirectory?:string;
   /** SHA256 of this TransferNode's Ed25519 raw public key; never caller-selected. */
   transferIdentity?:string;
   /** Optional bounded handshake metadata, resolved by the authenticated distribution. */
@@ -110,10 +112,12 @@ export class AmplifierHost {
   private settledCallbackDropped=0;
   private closing=false;
   private roots:string[]=[];
+  private defaultWorkingDirectory='';
   url='';
   constructor(readonly config:HostConfig) {
     if(!config.engines.length||!config.allowedWorkspaceRoots.length)throw new Error('At least one engine and allowed workspace root are required');
     if(!isAbsolute(config.stateDirectory))throw new Error('Host stateDirectory must be absolute');
+    if(config.defaultWorkingDirectory!==undefined&&!isAbsolute(config.defaultWorkingDirectory))throw new Error('defaultWorkingDirectory must be absolute');
     if(new Set(config.engines.map(e=>e.id)).size!==config.engines.length)throw new Error('Duplicate engine identifier');
     if(config.transferIdentity!==undefined&&!/^[a-f0-9]{64}$/.test(config.transferIdentity))throw new Error('transferIdentity must be an exact node public-key fingerprint');
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
@@ -139,6 +143,7 @@ export class AmplifierHost {
   }
   async listen():Promise<this> {
     this.roots=await Promise.all(this.config.allowedWorkspaceRoots.map(root=>realpath(root)));
+    this.defaultWorkingDirectory=await this.workspace(pathToFileURL(this.config.defaultWorkingDirectory??this.roots[0]).href);
     await new Promise<void>((resolve,reject)=>{this.http.once('error',reject);this.http.listen(this.config.port??0,this.config.host??'127.0.0.1',resolve);});
     const address=this.http.address();if(!address||typeof address==='string')throw new Error('Missing bound address');
     this.url=`ws://${address.address.includes(':')?'['+address.address+']':address.address}:${address.port}/ahp`;return this;
@@ -187,7 +192,7 @@ export class AmplifierHost {
     peer.socket.send(JSON.stringify(message));
   }
   private notify(method:string,params:Json,channel=ROOT) {for(const peer of this.peers)if(peer.subscriptions.has(channel))this.send(peer,{jsonrpc:'2.0',method,params});}
-  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',features:{receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
+  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
   private terminalList(){return this.store.db.prepare("SELECT uri,payload FROM terminals WHERE lifecycle='running' ORDER BY modified DESC LIMIT 128").all().map(row=>{const state=JSON.parse(row.payload as string);return {resource:row.uri,title:state.title,claim:state.claim,lifecycle:state.lifecycle};});}
   private terminalState(uri:string):TerminalState|undefined {const row=this.store.db.prepare('SELECT payload FROM terminals WHERE uri=?').get(uri);return row?JSON.parse(row.payload as string):undefined;}
   private terminalEvent(session:string,event:Parameters<NonNullable<AgentHandlers['terminal']>>[0]) {
@@ -479,7 +484,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.roots[0]).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
