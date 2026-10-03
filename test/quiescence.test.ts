@@ -188,3 +188,11 @@ test('explicit retryRefused rechecks a known no-effect busy result under the sam
   const released=await f.host.releaseQuiescence({fenceId:held.fenceId,commandId:command.commandId,outcome:'unchanged'});assert.deepEqual(await f.host.admitQuiescence({...command,retryRefused:true}),released);assert.equal(acquired,1);
  }finally{done.release();await f.close();}
 });
+
+test('composite native callback coverage holds actual owners without inventing a router participant',async()=>{
+ const acquired:string[]=[];const owners=['operations','resources'].map(id=>participant(id,{acquire:async context=>{acquired.push(id);return {ownerId:id,fenceId:context.fenceId,release:async()=>{}}}}));
+ const f=await fixture({nativeHostRequest:async()=>({}),nativeEvent:async()=>{},quiescence:configuration({coverage:{nativeHostOwners:['operations','resources']},participants:owners})});
+ try{const lease=await f.host.admitQuiescence({commandId:'composite-native',purpose:'recovery'});assert.equal(lease.admitted,true);assert.deepEqual(acquired,['operations','resources']);}finally{await f.close();}
+ const missing=await fixture({nativeEvent:async()=>{},quiescence:configuration({coverage:{nativeHostOwners:['resources']}})});
+ try{const result=await missing.host.admitQuiescence({commandId:'missing-native-authority',purpose:'recovery'});assert.equal(result.admitted,false);assert.deepEqual(result.work.gaps,['resources']);}finally{await missing.close();}
+});

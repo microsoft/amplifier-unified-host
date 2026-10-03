@@ -748,8 +748,12 @@ survives process replacement, including a replacement accidentally omitting this
 configuration; it never opens on a timeout or restart.
 
 `coverage.capabilities` maps execution-capable manifest topics to owner IDs;
-`coverage.resources` maps writable URI schemes; `coverage.nativeHost` identifies
-the trusted native callback bridge owner. `requiredOwners` additionally names all
+`coverage.resources` maps writable URI schemes; `coverage.nativeHostOwners` lists the actual effect-owner IDs behind a composite
+trusted native callback bridge (`nativeHostRequest` / `nativeEvent`), while
+`coverage.nativeHost` remains a single-owner shorthand. The router itself needs
+no invented lease: host core counts in-flight callbacks, and composition declares
+every actual effect authority behind its routes. The list must be nonempty and
+bounded, and every listed owner must supply its real held participant. `requiredOwners` additionally names all
 execution authorities without those surfaces: timers, scheduling, voice, upload
 processing, native administration, and other background work. Each ID requires a
 real `QuiescenceParticipant`. Undeclared coverage refuses admission. A participant

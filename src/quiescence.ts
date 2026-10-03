@@ -18,7 +18,7 @@ export interface QuiescenceConfig {
  instanceId:string;dataScope:string;
  /** Includes background authorities with no advertised action or resource writer. */
  requiredOwners:string[];
- coverage:{capabilities?:Record<string,string>;resources?:Record<string,string>;nativeHost?:string};
+ coverage:{capabilities?:Record<string,string>;resources?:Record<string,string>;nativeHost?:string;nativeHostOwners?:string[]};
  participants:QuiescenceParticipant[];
  /** Reads authenticated supervisor receipts; caller assertions never count as proof. */
  verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';evidence:unknown})=>Promise<QuiescenceProof>;
@@ -46,6 +46,7 @@ export class QuiescenceGate {
    if(!Array.isArray(config.requiredOwners)||config.requiredOwners.length>128||!Array.isArray(config.participants)||config.participants.length>128)throw Error('Bounded quiescence owner declarations required');
    const owners=new Set<string>();for(const p of config.participants){token(p.id,'participant');if(owners.has(p.id)||typeof p.acquire!=='function')throw Error('Invalid quiescence participant');owners.add(p.id);}
    for(const id of config.requiredOwners)token(id,'required owner');
+   if(config.coverage.nativeHostOwners!==undefined){if(!Array.isArray(config.coverage.nativeHostOwners)||!config.coverage.nativeHostOwners.length||config.coverage.nativeHostOwners.length>128)throw Error('Native callback owner coverage must be a nonempty bounded list');for(const owner of config.coverage.nativeHostOwners)token(owner,'native callback owner');}
    if(config.timeoutMs!==undefined&&(!Number.isSafeInteger(config.timeoutMs)||config.timeoutMs<25||config.timeoutMs>30000))throw Error('Quiescence deadline must be25..30000ms');
    if(typeof config.verifyRelease!=='function')throw Error('Authenticated quiescence reconciliation required');
   }
