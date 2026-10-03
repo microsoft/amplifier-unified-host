@@ -816,6 +816,81 @@ reconciliation case. Acquisition/release callbacks have a
 bounded `timeoutMs` (25–30,000; default 10,000). The public gate API does not invent
 release version/digest, account readiness, or complete owner coverage.
 
+### Persistent service stop and explicit resume
+
+Service lifecycle is optional trusted composition, distinct from distribution
+updates and recovery. `quiescence.serviceLifecycle` declares `identity` and its own
+`verifyRelease` callback. Identity has five required fields: `installationId`,
+`dataScope`, `ownerId`, `instanceId`, and `releaseDigest`. `instanceId` must identify
+this actual runtime launch, and must match the enclosing quiescence configuration;
+it cannot be a static installer ID. `dataScope` must also match. The remaining
+fields come from the authenticated platform owner and retained signed release.
+
+```ts
+const admission = await host.admitServiceStop({
+  commandId: durableStopCommandId,
+  expected: authenticatedCurrentIdentity,
+});
+// Only admission.admitted === true authorizes the platform owner to stop its
+// retained process. The host sends no signal and discovers or adopts no PID.
+```
+
+All receipts retain `purpose:'service-stop'` and `expected`. A held receipt adds
+`admitted:true`, `intakeClosed:true`, `fenceId`, `commandId`, and the ordinary
+bounded work evidence. Known refusal is `admitted:false,executed:false,
+intakeClosed:false`; an unknown receipt includes `fence.phase:'unknown'` and closed
+intake. `serviceStopReceipt(commandId)` is passive and rejects a command from
+another lifecycle. `inspectServiceLifecycle()` returns configured identity and
+any retained service fence; it does not claim operating-system process ownership.
+`retryRefused:true` has the same narrowly defined known-no-effect semantics as
+ordinary quiescence. A changed expected identity never reuses a stop command.
+
+The platform supervisor owns durable stop/resume receipts and authoritative
+process exit. A stopped process, an absent endpoint, a PID, or an unknown outcome
+never releases intake. Replacement startup preserves the original gate and only
+explicit service reconciliation can open it:
+
+```ts
+await host.releaseServiceStop({
+  fenceId, commandId: durableStopCommandId, outcome: 'resumed',
+  resumeCommandId: durableResumeCommandId,
+  evidence: authenticatedOwnerReceiptReference,
+});
+```
+
+`verifyRelease` receives the retained fence, `serviceIdentity` (original exact
+identity), requested outcome, resume command, and bounded evidence. It must read
+actual authenticated owner receipts. It returns the ordinary proof fields
+`verified:true,fenceId,commandId,outcome,instanceId,dataScope,receiptId` **plus**:
+
+- `kind:'service-lifecycle'`, `serviceOutcome:'resumed'|'stop-refused'`;
+- `expected` (exact original identity) and `observed` (exact currently configured
+  identity);
+- for resumed: `outcome:'ready'`, the exact `resumeCommandId`, `exitReceiptId` and
+  `readyReceiptId`. The new instance must differ; installation, owner, scope and
+  release digest must remain identical;
+- for stop-refused: `outcome:'unchanged'` and `refusalReceiptId` proving no stop
+  effect. Original and observed identities must be identical, with no resume or
+  exit/readiness claims.
+
+Passing `outcome:'unknown'` preserves the fence. Generic `releaseQuiescence` and
+`withQuiescenceMaintenance` refuse service fences: service stop grants no recovery
+or native-admin mutation privileges. Each participant must explicitly advertise `serviceStop:{version:1}`; any missing
+declaration refuses before the first participant is acquired. A marker is an
+implementation contract, not a composition override for older owners. Each
+participant retains the complete service
+identity and validates the service proof. Before stop admission succeeds, a known
+busy participant can unwind only exact leases acquired in that same live attempt
+with `admission-refused`; this shortcut must never reconcile a recovered fence.
+
+The host persists the canonical exact release request and authenticated proof
+before releasing any participant. A lost acknowledgement can be reconciled with
+the same request and same proof, including after process replacement. Changed
+proof, outcome, or identity refuses; unknown never triggers another stop, launch,
+agent turn, or queued-input replay. A host receipt reports only the admission gate,
+not that a platform service is stopped or resumed. Actual platform qualification
+belongs to the independently configured supervisor.
+
 ### Exclusive host state ownership
 
 Before opening `host.sqlite` or running any recovery migration, the host holds a

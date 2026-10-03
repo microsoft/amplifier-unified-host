@@ -1,4 +1,4 @@
-import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome} from './quiescence.js';
+import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest} from './quiescence.js';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -1751,7 +1751,11 @@ export class AmplifierHost {
     return {ready:true};
   }
   /** Trusted supervisor seam, never an AHP action or a client-supplied readiness claim. */
-  admitQuiescence(input:{commandId:string;purpose:QuiescencePurpose;retryRefused?:boolean}) {return this.intake.admit(input);}
+  admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'>;retryRefused?:boolean}) {return this.intake.admit(input);}
+  admitServiceStop(input:ServiceStopRequest) {return this.intake.admitServiceStop(input);}
+  serviceStopReceipt(commandId:string) {return this.intake.serviceStopReceipt(commandId);}
+  inspectServiceLifecycle() {return this.intake.inspectServiceLifecycle();}
+  releaseServiceStop(input:ServiceStopReleaseRequest) {return this.intake.releaseServiceStop(input);}
   inspectQuiescence() {return this.intake.inspect();}
   quiescenceReceipt(commandId:string) {return this.intake.receipt(commandId);}
   releaseQuiescence(input:{fenceId:string;commandId:string;outcome:QuiescenceOutcome;evidence?:unknown}) {return this.intake.release(input);}

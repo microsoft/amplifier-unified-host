@@ -6,4 +6,4 @@ export { StdioCatalog, type CatalogProcessConfig } from './catalog.js';
 export { RECALL_LIMITS, type RecallSource, type RecallRow } from './recall.js';
 export { type TransferCommand, type BeginTransfer, type AdoptTransfer, type AdoptImport } from './host.js';
 
-export type {QuiescenceFence,QuiescenceConfig,QuiescenceParticipant,QuiescenceLease,QuiescenceContext,QuiescenceProof,QuiescenceOutcome,QuiescencePurpose} from './quiescence.js';
+export type {QuiescenceFence,QuiescenceConfig,QuiescenceParticipant,QuiescenceLease,QuiescenceContext,QuiescenceProof,QuiescenceOutcome,QuiescencePurpose,ServiceIdentity,ServiceStopRequest,ServiceStopReleaseRequest,ServiceReleaseProof,ServiceLifecycleConfig,ServiceStopAdmission,ServiceStopReleaseResult,ServiceStopReceipt} from './quiescence.js';
