@@ -877,3 +877,20 @@ test('coordination interrupt transport uncertainty is durable and cannot be repl
   await f.host.waitForTurn(session,turnId);assert.equal((await f.host.readCoordinationSession(session)).status,'unknown');
  }finally{await f.cleanup();}
 });
+
+
+test('readable recovery preserves unknown source admission and requires bounded stable family metadata',async()=>{
+ const records=new Map<string,any>();let changed=false,overflow=false;
+ const catalog:any={list:async()=>({items:[...records.values()]}),get:async(uri:string)=>records.get(uri),upsert:async(record:any)=>{records.set(record.uri,structuredClone(record));},descendants:async({parentUri}:any)=>({parentUri,rootKnown:records.has(parentUri),root:records.get(parentUri),items:[...records.values()].filter(row=>row.parentUri===parentUri),completeIndexedCoverage:!overflow,truncated:overflow,issues:overflow?['result-limit']:[],excludedKinds:[],revision:changed?randomUUID():'stable',coverage:'indexed-native-history',externalWriterCoverage:false,freshness:{phase:'complete',issues:0,completedAt:new Date().toISOString()}})};
+ const f=await setup({catalog});try{
+  const client=await f.connect(),{session,chat}=await f.create(client),child=await f.create(client),input=randomUUID();
+  records.get(child.session).parentUri=session;
+  await f.host.submitTurn(session,{commandId:input,text:'crash',clientId:'owner'});await f.host.waitForTurn(session,input);assert.equal(f.host.store.receipt(input)!.status,'unknown');
+  await assert.rejects(f.host.forkSession(session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history'}),/Unresolved execution/);
+  overflow=true;await assert.rejects(f.host.forkSession(session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'}),/coverage/);overflow=false;
+  changed=true;await assert.rejects(f.host.forkSession(session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'}),/family changed/);changed=false;
+  const commandId=randomUUID(),args={commandId,expectedHistoryRevision:'fixture-history',mode:'recovery' as const};
+  const copy=await f.host.forkSession(session,args);assert.equal(copy.mode,'recovery');assert.equal(copy.workReplayed,false);assert.equal(f.host.store.receipt(input)!.status,'unknown');assert.ok(f.host.store.unknown(chat));
+  assert.deepEqual(await f.host.forkSession(session,args),copy);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1,'Copy must not prompt source, children, or target');
+ }finally{await f.cleanup();}
+});

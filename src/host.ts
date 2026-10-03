@@ -15,6 +15,7 @@ import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
 export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;isArchived?:boolean;}
+export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};}
 export interface Catalog {
   list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
   projectSessionArchives?(params:{items:Array<{uri:string;isArchived:boolean}>}):Promise<unknown>;
@@ -24,6 +25,7 @@ export interface Catalog {
   hint?(sessionDirectory:string):Promise<unknown>;
   directoryInUse?(path:string):Promise<{inUse:boolean;sessions?:Array<{session:string;reason:string}>;freshness?:{phase?:string;completedAt?:string;issues?:number};coverage?:string}>;
   setVisibility?(params:{uri:string;nativeSessionId:string;workingDirectory:string;deleted:boolean;commandId:string;evidence:"native-completed-receipt"}):Promise<unknown>;
+  descendants?(params:{parentUri:string;limit:number}):Promise<CatalogFamily>;
   close?():Promise<void>;
 }
 export type MessageUnavailableReason='not-indexed'|'not-user'|'oversized'|'invalid-provenance';
@@ -878,7 +880,7 @@ export class AmplifierHost {
   }
   /** Native storage owner inspection; no transcript body or prepared runtime. */
   async inspectSessionHistory(session:string):Promise<Json> {
-    const record=await this.record(session),result=await this.lifecycleAgent(record,agent=>this.nativeLifecycle(agent,record,'inspect'));
+    const record=await this.record(session),result:Json=await this.lifecycleAgent(record,async agent=>{const inspected=await this.nativeLifecycle(agent,record,'inspect');return {...inspected,lifecycleCapabilities:(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle};});
     if(result.sessionId!==record.nativeSessionId||typeof result.historyRevision!=='string'||result.historyRevision.length>512||result.location?.historyCwd!==record.workingDirectory)throw new RpcFault(-32000,'Native lifecycle inspection returned a different identity');
     return {session:record.uri,...result,lifecycleFence:this.store.db.prepare("SELECT command_id,operation,status FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown') LIMIT 1").get(record.uri)};
   }
@@ -926,9 +928,10 @@ export class AmplifierHost {
   }
   async previewDeleteSession(session:string) {const record=await this.record(session);return this.lifecycleAgent(record,agent=>this.nativeLifecycle(agent,record,'delete.preview'));}
   private lifecycleArgs(operation:string,args:Json) {
-    const allowed:Record<string,string[]>={fork:['commandId','expectedHistoryRevision','throughMessageId','title'],export:['commandId','expectedHistoryRevision','format','scope','fromMessageId','throughMessageId','minimal'],delete:['commandId','expectedHistoryRevision','confirmationToken'],restore:['commandId','expectedHistoryRevision']};
+    const allowed:Record<string,string[]>={fork:['commandId','expectedHistoryRevision','throughMessageId','title','mode','bundle','bundleRevision','resetModel'],export:['commandId','expectedHistoryRevision','format','scope','fromMessageId','throughMessageId','minimal'],delete:['commandId','expectedHistoryRevision','confirmationToken'],restore:['commandId','expectedHistoryRevision']};
     if(!allowed[operation]||!args||typeof args!=='object'||Array.isArray(args)||Object.keys(args).some(key=>!allowed[operation].includes(key))||Buffer.byteLength(JSON.stringify(args))>32768||typeof args.commandId!=='string'||!args.commandId||args.commandId.length>200||typeof args.expectedHistoryRevision!=='string'||!args.expectedHistoryRevision||args.expectedHistoryRevision.length>512)throw new RpcFault(-32602,'Exact lifecycle operation, bounded command identity and history revision required');
     for(const key of ['throughMessageId','fromMessageId','title','confirmationToken'])if(args[key]!==undefined&&(typeof args[key]!=='string'||!args[key]||args[key].length>1000))throw new RpcFault(-32602,'Invalid lifecycle boundary or title');
+    if(operation==='fork'&&(args.mode!==undefined&&!['complete','recovery'].includes(args.mode)||args.bundle!==undefined&&(typeof args.bundle!=='string'||!args.bundle||args.bundle.length>200)||args.resetModel!==undefined&&typeof args.resetModel!=='boolean'||args.bundle!==undefined&&!/^[a-f0-9]{64}$/.test(args.bundleRevision??'')||args.bundle===undefined&&(args.bundleRevision!==undefined||args.resetModel===true)))throw new RpcFault(-32602,'Negotiated fork mode and configured bundle identity required');
     if(operation==='export'&&(!['markdown','json'].includes(args.format)||args.scope!==undefined&&!['all','from','range'].includes(args.scope)||args.minimal!==undefined&&typeof args.minimal!=='boolean'))throw new RpcFault(-32602,'Unsupported native export shape');
     if(operation==='delete'&&typeof args.confirmationToken!=='string')throw new RpcFault(-32602,'Exact native delete preview token required');
   }
@@ -936,6 +939,7 @@ export class AmplifierHost {
     if(native.receipt?.status!=='completed'||native.receipt.commandId!==entry.command_id)throw new Error('Native lifecycle outcome lacks completed receipt proof');
     const operation=String(entry.operation),args=JSON.parse(String(entry.payload)),timestamp=now();let result:Json;
     if(operation==='fork') {
+      if(args.mode==='recovery'&&(native.mode!=='recovery'||native.preservedSource!==true)||args.bundle!==undefined&&native.bundleSelection!==args.bundle)throw new Error('Native copy mode does not match the reviewed request');
       if(native.creationConfirmed!==true||native.sessionId!==entry.target?.slice('ahp-session:/'.length)||native.historyCwd!==record.workingDirectory||native.workReplayed!==false||native.source?.sessionId!==record.nativeSessionId||native.source?.historyRevision!==args.expectedHistoryRevision||typeof native.executionDirectory!=='string')throw new Error('Native fork confirmation does not match reserved identity');
       await this.workspace(pathToFileURL(native.executionDirectory).href);
       const uri=String(entry.target),existing=this.getRecord(uri),title=args.title??record.summary.title;
@@ -943,7 +947,7 @@ export class AmplifierHost {
       const summary:SessionSummary={resource:uri,provider:record.engineId,title,status:SessionStatus.Idle,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(record.workingDirectory).href]};
       const target:SessionRecord=existing??{uri,engineId:record.engineId,nativeSessionId:native.sessionId,workingDirectory:record.workingDirectory,executionDirectory:native.executionDirectory,summary,chat,state:{provider:record.engineId,title,status:SessionStatus.Idle,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories}};
       if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==record.workingDirectory)throw new Error('Reserved fork target now has a different identity');
-      this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,workReplayed:false,receipt:native.receipt};
+      this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,workReplayed:false,mode:native.mode??'complete',...(native.bundleSelection!==undefined?{bundleSelection:native.bundleSelection}:{}),preservedSource:true,receipt:native.receipt};
       this.notify('root/sessionAdded',{channel:ROOT,summary:target.summary});
     }else if(operation==='export'){
       if(typeof native.snapshotId!=='string'||!/^[a-f0-9]{64}$/.test(native.snapshotId)||!Number.isSafeInteger(native.summary?.bytes)||native.summary.bytes<0||native.summary.bytes>64*1024*1024||native.historyRevision!==args.expectedHistoryRevision||typeof native.contentHash!=='string')throw new Error('Invalid native immutable export confirmation');
@@ -961,6 +965,29 @@ export class AmplifierHost {
     }
     this.store.transaction(()=>{this.store.db.prepare("UPDATE lifecycle_commands SET status='completed',result=? WHERE command_id=?").run(JSON.stringify(result),entry.command_id);this.store.finish(String(entry.command_id),'completed');});return result;
   }
+  /** Caller holds source admission; indexed facts never stand in for native ownership. */
+  private async withLifecycleFamily<T>(record:SessionRecord,required:boolean,work:(descendants:Json[])=>Promise<T>):Promise<T> {
+    const catalog=this.config.catalog;
+    if(!catalog){if(required)throw new RpcFault(-32601,'Recovery and bundle copies require indexed family coverage',{executed:false});return work([]);}
+    if(!catalog.descendants)throw new RpcFault(-32601,'Catalog cannot provide bounded descendant coverage',{executed:false});
+    const family=await catalog.descendants({parentUri:record.uri,limit:100}),fresh=family.freshness,age=Date.now()-Date.parse(fresh?.completedAt??'');
+    if(!family.rootKnown||!family.completeIndexedCoverage||family.truncated||family.issues?.length||family.excludedKinds?.length||family.coverage!=='indexed-native-history'||family.root?.nativeSessionId!==record.nativeSessionId||family.root?.engineId!==record.engineId||family.root?.workingDirectory!==record.workingDirectory||!Array.isArray(family.items)||family.items.length>100||fresh?.phase!=='complete'||fresh.issues!==0||!Number.isFinite(age)||age<0||age>600000)throw new RpcFault(-32011,'Indexed family coverage is incomplete or stale; copy was not executed',{executed:false});
+    const rows=new Map<string,CatalogRecord>([[record.uri,family.root],...family.items.map(row=>[row.uri,row] as [string,CatalogRecord])]);
+    if(rows.size!==family.items.length+1)throw new RpcFault(-32011,'Indexed family contains conflicting identities',{executed:false});
+    const descendants:Json[]=[];
+    for(const row of family.items){
+      const parent=row.parentUri&&rows.get(row.parentUri);if(!parent||!parent.nativeSessionId||!row.nativeSessionId||row.engineId!==record.engineId||parent.engineId!==row.engineId)throw new RpcFault(-32011,'Descendant ownership belongs to an unavailable engine or parent',{executed:false});
+      await this.workspace(pathToFileURL(row.workingDirectory).href);
+      descendants.push({sessionId:row.nativeSessionId,cwd:row.workingDirectory,parentSessionId:parent.nativeSessionId});
+    }
+    const lock=async(index:number):Promise<T>=>{
+      if(index<family.items.length)return this.withLock(family.items[index].uri,()=>lock(index+1));
+      for(const row of family.items){const child=await this.record(row.uri);this.guardSessionLifecycle(child.uri);if(this.store.unknown(child.chat.resource)||child.chat.activeTurn||this.relocationFence(child.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle(child);}
+      if((await catalog.descendants!({parentUri:record.uri,limit:100})).revision!==family.revision)throw new RpcFault(-32011,'Indexed family changed while acquiring ownership',{executed:false});
+      return work(descendants);
+    };
+    family.items.sort((a,b)=>a.uri.localeCompare(b.uri));return lock(0);
+  }
   private async mutateLifecycle(session:string,operation:string,args:Json) {
     return this.intake.run(async()=>{
     this.lifecycleArgs(operation,args);const record=await this.record(session);
@@ -970,26 +997,29 @@ export class AmplifierHost {
       if(previous){if(previous.session!==record.uri||previous.operation!==operation||previous.payload!==JSON.stringify(args))throw new RpcFault(-32011,'Lifecycle command ID conflicts with its original request');if(previous.status==='completed')return JSON.parse(String(previous.result));throw new RpcFault(-32011,'Original lifecycle receipt is not completed; inspect it without replay',{receipt:args.commandId,outcome:previous.status,executed:previous.status==='failed'?false:undefined});}
       this.guardTransfer(record.uri);
       if(operation!=='restore')this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
-      if(this.store.unknown(record.chat.resource)||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
+      if(this.store.unknown(record.chat.resource)&&!(operation==='fork'&&args.mode==='recovery')||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
       if(this.config.catalog&&['delete','restore'].includes(operation)&&!this.config.catalog.setVisibility)throw new RpcFault(-32601,'Catalog cannot project native visibility',{executed:false});
       await this.quiesceLifecycle(record);
-      return this.lifecycleAgent(record,async agent=>{
+      const execute=async(descendants:Json[])=>this.lifecycleAgent(record,async agent=>{
+        const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle;
+        if(args.mode==='recovery'&&capability?.recoveryCopy?.version!==1||args.bundle!==undefined&&capability?.bundleFork?.version!==1||descendants.length&&capability?.descendantGuard?.version!==1)throw new RpcFault(-32601,'Configured engine does not support this guarded copy operation',{executed:false});
         const inspected=await this.nativeLifecycle(agent,record,'inspect');if(inspected.historyRevision!==args.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed; inspect a fresh revision',{executed:false});
         const target=operation==='fork'?'ahp-session:/'+randomUUID():null;
         const entry={command_id:args.commandId,session:record.uri,operation,target,status:'dispatching',payload:JSON.stringify(args)};
         this.store.transaction(()=>{this.store.admission(record.uri,{operation,args},args.commandId,'host:lifecycle',this.store.extensionSequence('host:lifecycle'));this.store.db.prepare('INSERT INTO lifecycle_commands(command_id,session,operation,target,status,payload) VALUES(?,?,?,?,?,?)').run(entry.command_id,entry.session,operation,target,entry.status,entry.payload);this.store.finish(args.commandId,'dispatching');});
         const {title,...nativeArgs}=args;
-        try{return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,operation,{...nativeArgs,...(target?{targetSessionId:target.slice('ahp-session:/'.length)}:{})}));}
+        try{return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,operation,{...nativeArgs,...(target?{targetSessionId:target.slice('ahp-session:/'.length),...(capability?.descendantGuard?.version===1?{descendants}: {})}:{})}));}
         catch(error){
           let proof:Json|undefined;try{proof=await this.nativeLifecycle(agent,record,'receipt',{commandId:args.commandId});}catch{}
           if(proof?.receipt?.status==='completed'){try{return await this.applyLifecycleResult(record,entry,{...proof.receipt.result,receipt:proof.receipt});}catch{}}
           const status=proof?.receipt===null?'failed':'unknown';this.store.transaction(()=>{this.store.db.prepare('UPDATE lifecycle_commands SET status=? WHERE command_id=?').run(status,args.commandId);this.store.finish(args.commandId,status,(error as Error).message);});throw new RpcFault(-32011,(error as Error).message,{receipt:args.commandId,outcome:status,...(status==='failed'?{executed:false}: {})});
         }
       });
+      return operation==='fork'?this.withLifecycleFamily(record,!!(args.mode==='recovery'||args.bundle),execute):execute([]);
     });
       });
   }
-  async forkSession(session:string,args:{commandId:string;expectedHistoryRevision:string;throughMessageId?:string;title?:string}) {return this.mutateLifecycle(session,'fork',args);}
+  async forkSession(session:string,args:{commandId:string;expectedHistoryRevision:string;throughMessageId?:string;title?:string;mode?:'complete'|'recovery';bundle?:string;bundleRevision?:string;resetModel?:boolean}) {return this.mutateLifecycle(session,'fork',args);}
   async exportSession(session:string,args:{commandId:string;expectedHistoryRevision:string;format:'markdown'|'json';scope?:'all'|'from'|'range';fromMessageId?:string;throughMessageId?:string;minimal?:boolean}) {return this.mutateLifecycle(session,'export',args);}
   async deleteSession(session:string,args:{commandId:string;expectedHistoryRevision:string;confirmationToken:string}) {return this.mutateLifecycle(session,'delete',args);}
   async restoreSession(session:string,args:{commandId:string;expectedHistoryRevision:string}) {return this.mutateLifecycle(session,'restore',args);}

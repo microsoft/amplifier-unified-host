@@ -941,3 +941,32 @@ Neither method ever invokes native import commit or replays source work.
 Generic ACP engines lacking the extension report unsupported. The staged source,
 normalization, native writer leases and original bytes belong exclusively to the
 native import owner; the host stores only bounded proof and mapping receipts.
+
+### Independent recovery copies and configured bundle forks
+
+`forkSession` and negotiated `x-amplifier/sessionLifecycle` `fork` accept optional
+`mode: 'recovery'` for a readable independent copy. Only the source's unknown
+input outcome is allowed: its original receipt/fence stays unknown, and no input
+is replayed. Native owner confirmation must prove the exact copy mode and identity.
+Canonical corruption/pending rewrites, relocation/transfer fences, or active and
+unknown descendant work refuse. Targets remain cold until a new explicit request.
+
+Configured bundle forks use `bundle`, exact `bundleRevision` from
+`inspectSessionHistory().forkBundles`, and optional `resetModel`. The native
+launcher owns the named choices; client filesystem references are not accepted.
+The original composition is retained in the source. Neither copying nor selecting
+a bundle claims model/account readiness.
+
+The independently installed catalog now optionally exposes `descendants`.
+Recovery and bundle copies require complete indexed family coverage (at most100),
+a completed issue-free discovery no older than10minutes, authorized workspaces,
+one configured engine and stable indexed revision while host child admission
+locks are held. Native Foundation writer leases guard actual known descendants.
+Child histories remain cold. An index cannot prove absence of undiscovered or
+noncooperating external writers; returned native coverage preserves that limit.
+Ordinary complete forks without a catalog retain native selected-worker-family
+coverage only. Configured catalogs lacking descendant support refuse copy effects.
+
+`inspectSessionHistory` exposes negotiated per-engine `lifecycleCapabilities` and
+optional bounded native `failure` guidance. It never fabricates historical failure
+causes from a generic host error. Capability absent means the operation is unavailable.

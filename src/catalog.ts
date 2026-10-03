@@ -43,6 +43,7 @@ export class StdioCatalog implements Catalog {
   upsert(record:CatalogRecord){return this.request('upsert',{record});}
   claimNative(params:Parameters<NonNullable<Catalog['claimNative']>>[0]):Promise<CatalogRecord>{return this.request('claimNative',params);}
   setVisibility(params:Parameters<NonNullable<Catalog['setVisibility']>>[0]){return this.request('setVisibility',params);}
+  descendants(params:{parentUri:string;limit:number}){return this.request('descendants',params);}
   directoryInUse(path:string){return this.request('directoryInUse',{path});}
   hint(sessionDirectory:string){return this.request('hint',{sessionDirectory});}
   listWorkspaces(params:Record<string,unknown>){return this.request('listWorkspaces',params);}
