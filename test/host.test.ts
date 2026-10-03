@@ -750,3 +750,10 @@ test('committed attachment references resolve only on execution and never inflat
   const rejected=randomUUID();await assert.rejects(f.host.submitTurn(session,{commandId:rejected,text:'Invalid resolved size',clientId:'owner',attachments:[{...ref,uri:'amplifier-attachment://too-large/body'}]}),/wire budget/);assert.equal(f.host.store.receipt(rejected),undefined);
  }finally{await f.cleanup();}
 });
+
+test('passive response parts preserve distinct canonical native message boundaries for export',async()=>{
+ const f=await setup();try{
+  const history=join(f.dir,'history.json');await writeFile(history,JSON.stringify([{id:'native-user',state:'complete',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:'User'},_meta:{'amplifier.dev/history':{messageId:'native:user',inputOrigin:'unknown'}}},{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'First answer'},_meta:{'amplifier.dev/history':{messageId:'native:first'}}},{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Second answer'},_meta:{'amplifier.dev/history':{messageId:'native:second'}}}]}]));f.config.engines[0].env={...f.config.engines[0].env,FIXTURE_HISTORY:history};
+  const client=await f.connect(),{session,chat}=await f.create(client);await f.host.invalidateNativeHistory(session);const state=(await client.subscribe(chat,{view:{turns:1}})).result.snapshot!.state as any;const parts=state.turns[0].responseParts.filter((part:any)=>part.kind==='markdown');assert.deepEqual(parts.map((part:any)=>[part.content,part._meta['amplifier.dev/history'].messageId]),[['First answer','native:first'],['Second answer','native:second']]);
+ }finally{await f.cleanup();}
+});
