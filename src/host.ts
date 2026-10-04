@@ -1415,11 +1415,14 @@ export class AmplifierHost {
     if(operation==='legacyCopy.inventory')return this.inventoryRetiredCopies(session);if(operation==='legacyCopy.preview')return this.previewRetiredCopyPurge(session,args as any);if(operation==='legacyCopy.receipt')return this.retiredCopyPurgeReceipt(session,args.commandId);
     if(['fork','export','delete','restore','legacyCopy.purge'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
   }
+  private guardRetirement(active:Active) {
+    if(['pending','unknown','retired'].includes(active.agent.retirementOutcome))throw new RpcFault(-32011,'Native retirement outcome is unresolved; reconcile the original retirement without replay',{executed:false,replayed:false,outcome:'unknown'});
+  }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
     return this.intake.run(async()=>{
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     this.guardSessionLifecycle(uri);
-    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
+    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing&&!existing.agent.closed){this.guardRetirement(existing);existing.lastUsed=Date.now();return existing;}
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
     const pending=(async()=>{
@@ -1765,6 +1768,7 @@ export class AmplifierHost {
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
     const blocks=await this.prompt(action.message,record),active=special?.operation==='observation.submit'?this.active.get(record.uri):await this.ensureAgent(record.uri);
     if(!active||active.agent.closed||special?.operation==='observation.submit'&&active.stopNotified)throw new RpcFault(-32008,'waiting_worker',{executed:false});
+    this.guardRetirement(active);
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
@@ -2220,13 +2224,11 @@ export class AmplifierHost {
         if(active.agent.closed){this.active.delete(session);return {ready:true};}
         const lifecycle=(active.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle;
         if(lifecycle?.version!==1||lifecycle.gracefulRetire!==true||!active.agent.nativeId)return {ready:false,reason:'native-atomic-retirement-unavailable'};
-        active.controlDepth=(active.controlDepth??0)+1;let timer:ReturnType<typeof setTimeout>|undefined;
+        active.controlDepth=(active.controlDepth??0)+1;
         try{
-          const proof=await Promise.race([active.agent.client.extMethod('_amplifier/retire',{sessionId:active.agent.nativeId}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('native-retirement-timeout')),this.config.quiescence?.timeoutMs??10000);timer.unref();})]);
-          if(proof.retired===false&&['owned_work','active_request'].includes(String(proof.reason)))return {ready:false,reason:'native-owned-work'};
-          if(proof.retired!==true)return {ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
+          if(!await active.agent.retireIfIdle(this.config.quiescence?.timeoutMs??10000))return active.agent.retirementOutcome==='refused'?{ready:false,reason:'native-owned-work'}:{ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
           active.retireReason='quiesced';await active.agent.retire();await active.stopCallback;this.active.delete(session);return {ready:true};
-        }catch{return {ready:false,unknown:true,reason:'native-retirement-transport-unknown'};}finally{clearTimeout(timer);active.controlDepth!--;}
+        }catch{return {ready:false,unknown:true,reason:'native-retirement-transport-unknown'};}finally{active.controlDepth!--;}
       });
       if(!result.ready)return result;
     }
@@ -2462,6 +2464,7 @@ export class AmplifierHost {
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
       this.guardTransfer(session);
       if(!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32008,'No existing owned native runtime; no process was started');
+      this.guardRetirement(active);
       if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.version!==1)throw new RpcFault(-32601,'Native control extension not negotiated');
       if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
       if(['worker.stop','operations.cancel'].includes(operation))this.store.bump(session,'interruption');

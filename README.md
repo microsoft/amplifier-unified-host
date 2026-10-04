@@ -336,8 +336,12 @@ capacity eviction requires negotiated native
 approvals, bridge requests or auxiliary work remain; success permanently retires
 the native session handle before the host closes its ACP connection. The host holds
 the session admission lock through this decision and retains its own running ACP
-terminals. Refusal, unsupported capability or a missing response retains the agent;
-new capacity is refused rather than killing that work. Generic ACP peers without
+terminals. A definite `owned_work` or `active_request` refusal retains a usable agent.
+Unsupported capability retains the agent. Missing, malformed or uncertain
+retirement responses retain the connection but fence new execution before
+admission; they never authorize killing work or retrying the retirement. A
+`runtime.closed` worker notification alone does not prove session retirement.
+New capacity is refused rather than killing retained work. Generic ACP peers without
 this explicit retirement proof are not automatically evicted from the configured
 active-agent bound. Explicit host shutdown remains a separate stopping operation.
 

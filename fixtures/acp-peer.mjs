@@ -56,6 +56,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='_amplifier/retire'){
     if(process.env.FIXTURE_RETIRE_CALLBACK){const id=permissionId++;pending.set(id,result=>appendFileSync(process.env.FIXTURE_LOG+'.late-write',JSON.stringify(result)+'\n'));send({id,method:'fs/write_text_file',params:{sessionId:p.sessionId,path:process.cwd()+'/blocked-native-write',content:'must not write'}});}
     if(process.env.FIXTURE_RETIRE_LOST){retired=true;appendFileSync(process.env.FIXTURE_LOG+'.retired','retired without acknowledgement\n');continue;}
+    if(process.env.FIXTURE_RETIRE_RESPONSE){const result=JSON.parse(process.env.FIXTURE_RETIRE_RESPONSE);if(result.retired!==false||!['owned_work','active_request'].includes(result.reason))retired=true;reply(message.id,result);continue;}
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
   }
@@ -71,6 +72,9 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.stop'){clearInterval(background);background=undefined;reply(message.id,{});}
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.history.persisted'){
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'history.persisted',metadataPath:p.args.metadataPath}}});reply(message.id,{});
+  }
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.worker.idle'){
+    send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});
   }
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.runtime.loss'){
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});setTimeout(()=>process.exit(17),20);
