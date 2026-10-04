@@ -2078,7 +2078,15 @@ export class AmplifierHost {
   private configState(uri:string,options:any[]) {
     const record=this.getRecord(uri)!;
     const properties:Record<string,any>={},values:Record<string,unknown>={};
-    for(const option of options) {if(option.type!=='select')continue;const choices=(option.options??[]).flatMap((o:any)=>o.options??[o]);properties[option.id]={type:'string',title:option.name,description:option.description,enum:choices.map((o:any)=>o.value),enumLabels:choices.map((o:any)=>o.name),sessionMutable:true};values[option.id]=option.currentValue;}
+    for(const option of options) {
+      if(option.type!=='select')continue;
+      const choices=(option.options??[]).flatMap((o:any)=>o.options??[o]);
+      // Keep ordinary enum consumers compatible while retaining the standard
+      // ACP choices, including groups and opaque vendor metadata, for rich clients.
+      properties[option.id]={type:'string',title:option.name,description:option.description,enum:choices.map((o:any)=>o.value),enumLabels:choices.map((o:any)=>o.name),sessionMutable:true,
+        options:structuredClone(option.options??[]),...(option.category!==undefined?{category:option.category}:{}),...(option._meta!==undefined?{_meta:structuredClone(option._meta)}:{})};
+      values[option.id]=option.currentValue;
+    }
     if(JSON.stringify(record.state.config?.values??{})!==JSON.stringify(values))this.store.bump(uri,'configuration');
     record.state.config={schema:{type:'object',properties},values};record.state._meta={...record.state._meta,'amplifier.dev/acp':{...(record.state._meta?.['amplifier.dev/acp'] as Json),configOptions:options}};this.store.saveSessionMetadata(record);
     this.emit(uri,{type:'session/metaChanged',_meta:record.state._meta} as StateAction);
