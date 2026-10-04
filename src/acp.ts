@@ -37,6 +37,7 @@ export class AcpProcess {
   private retiring = false;
   retirementOutcome: 'active'|'pending'|'refused'|'retired'|'unknown' = 'active';
   private retirement?:Promise<void>;
+  private processClose:Promise<void>;
   private stderr = '';
   constructor(readonly engine: EngineConfig, readonly cwd: string, readonly handlers: AgentHandlers) {
     if(engine.messagePrincipal!==undefined&&(typeof engine.messagePrincipal!=='string'||!engine.messagePrincipal.trim()||[...engine.messagePrincipal].length>200||/[\x00-\x1f]/.test(engine.messagePrincipal)))throw Error('Server message principal must be a bounded nonempty account string');
@@ -95,7 +96,7 @@ export class AcpProcess {
     };
     this.client = new ClientSideConnection(()=>callbacks,stream);
     let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;for(const terminal of this.terminalLifetimes)terminal.process.kill();handlers.stopped?.(event);};
-    this.process.once('close',(code,signal)=>reportStopped({...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})}));
+    this.processClose=new Promise(resolve=>this.process.once('close',(code,signal)=>{try{reportStopped({...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})});}finally{resolve();}}));
     this.process.once('error',()=>reportStopped({}));
   }
   private async effect<T>(work:()=>Promise<T>):Promise<T> {
@@ -188,10 +189,13 @@ export class AcpProcess {
     // SIGKILL bounds a direct child that ignores the first shutdown signal;
     // completion still requires its real close event, not the timer.
     const terminalKill=setTimeout(()=>{for(const t of this.terminalLifetimes)t.process.kill('SIGKILL');},1000);terminalKill.unref();
+    // Exit status does not mean stdio closed: inherited pipes can still deliver
+    // callbacks. The deadline sends the final signal; only real close completes.
+    const processKill=setTimeout(()=>{if(this.process.exitCode===null&&!this.closed)this.process.kill('SIGKILL');},1000);processKill.unref();
     try {
-      if(this.process.exitCode===null&&!this.closed)await Promise.race([new Promise<void>(resolve=>this.process.once('close',()=>resolve())),new Promise<void>(resolve=>{const timer=setTimeout(()=>{this.process.kill('SIGKILL');resolve();},1000);timer.unref();})]);
+      await this.processClose;
       await Promise.all([...this.terminalLifetimes].map(t=>t.done));
-    }finally{clearTimeout(terminalKill);}
+    }finally{clearTimeout(terminalKill);clearTimeout(processKill);}
   }
   diagnostics() {return {closed:this.closed,stderrTail:this.stderr,terminals:this.terminals.size};}
 }
