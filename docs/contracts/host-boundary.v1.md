@@ -227,3 +227,47 @@ races, wrong identity/proof, missing owner coverage, retirement/legacy fences,
 changed retries, and owner-commit/lost-reply recovery through the public Host.
 This is source/API coverage, not authority to hot-patch or reopen an older deployed
 unknown fence.
+
+## Passive retirement proof reconciliation
+
+Idle worker `runtime.closed` is not session-handle retirement authority. Host
+retirement retains uncertain connections and refuses new input before admission.
+Only explicit `retired:false` with `owned_work` or `active_request` preserves a
+usable handle. Missing, malformed or other outcomes fence it without repeating
+retirement or terminating uncertain work. Idle, lifecycle and quiescence paths
+share this classification.
+
+A negotiated optional `lifecycle.retirementStatus` version 1 marker names
+`_amplifier/retire/status` and declares `passive:true`. One bounded selected-session
+read sends `{sessionId}` on the same connection; a response must bind that exact
+session and attest `retired:true` from an exact literal worker retirement acknowledgement
+and the same captured worker clean exit 0. Native owns that proof. The status method must not issue
+a worker retirement command, start/close workers, mutate history or execute input.
+
+Host accepts no authority from a worker-closed notification alone. Unsupported,
+false, malformed, lost or mismatched status keeps the fence. Confirmed status
+allows Host to close that bridge and load/resume the same identity for a NEW
+original input. `reconcileSessionRetirement` is a trusted explicit seam; new input
+also performs one bounded status read if fenced. Prior unknown input receipts
+remain unchanged and block admission until independently reconciled. See
+[causal fixtures](../../test/retirement-uncertainty.test.ts). Source/package
+fixtures are separate from actual Native worker proof and live account acceptance.
+
+### Connection loss and durable retirement uncertainty
+
+Before dispatch, Host stores a bounded retirement fence in existing selected
+session metadata and a session-scoped Host receipt. It binds the original
+connection, Native mapping and captured retirement command. Definite refusal
+or confirmed retirement settles only that receipt and clears its matching fence.
+Passive status proof must match both the captured in-memory command and its
+existing journal receipt; an older proof cannot clear a changed fence.
+
+Closing an ACP process, removing a viewer or restarting Host does not clear
+pending/unknown retirement. Execution, lifecycle and host quiescence retain that
+uncertainty. Quiescence checks the indexed retirement receipt namespace rather
+than loading session states globally. No new store or recovery subsystem is
+introduced. Losing the original connection prevents this same-connection status
+seam from recovering the chat; separate authoritative recovery is required.
+Process exit alone is insufficient. These limits do not alter safe cold resume
+after definite refusal or confirmed retirement, or settle any prior unknown user
+input. See [durable causal checks](../../test/retirement-durable.test.ts).

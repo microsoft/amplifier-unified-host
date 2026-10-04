@@ -9,7 +9,7 @@ const locations=()=>process.env.FIXTURE_LOG&&existsSync(process.env.FIXTURE_LOG+
 for await(const line of readline.createInterface({input:process.stdin})) {
   const message=JSON.parse(line),p=message.params??{};
   if(message.result!==undefined||message.error){pending.get(message.id)?.(message.error?{error:message.error}:message.result);pending.delete(message.id);continue;}
-  if(message.method==='initialize'){if(process.env.FIXTURE_MESSAGE_INIT)appendFileSync(process.env.FIXTURE_MESSAGE_INIT,JSON.stringify(p)+'\n');reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,...(process.env.FIXTURE_INPUT_OUTCOME?{inputOutcome:JSON.parse(process.env.FIXTURE_INPUT_OUTCOME)}:{}),...(process.env.FIXTURE_MESSAGE_INTERACTIONS?{messageInteractions:JSON.parse(process.env.FIXTURE_MESSAGE_INTERACTIONS)}:{}),...(process.env.FIXTURE_MANAGED?{managedCreation:{version:1,passive:true,configurationScope:'global-and-session',typedSelection:true}}:{}),...(process.env.FIXTURE_TRANSFER?{transfer:{version:1,passiveInspection:true}}:{}),sessionLifecycle:{version:1,passive:true,deletion:'preserve-history',retention:{version:1},...(process.env.FIXTURE_RETIRED_COPIES?{retiredCopies:{version:1,duplicateFilesOnly:true,retirementAuthority:'launcher-assertion'}}:{}),recoveryCopy:{version:1},bundleFork:{version:1},descendantGuard:{version:1}},configurationClone:{version:1},taskState:{version:1,passive:true},workers:{version:1,passiveInspection:true,residentControls:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});}
+  if(message.method==='initialize'){if(process.env.FIXTURE_MESSAGE_INIT)appendFileSync(process.env.FIXTURE_MESSAGE_INIT,JSON.stringify(p)+'\n');reply(message.id,{protocolVersion:1,agentInfo:{name:'independent-fixture',version:'1'},agentCapabilities:{loadSession:true,sessionCapabilities:{resume:{},close:{}},promptCapabilities:{image:true,audio:true,embeddedContext:true},_meta:{'amplifier.dev/native':{version:1,...(process.env.FIXTURE_INPUT_OUTCOME?{inputOutcome:JSON.parse(process.env.FIXTURE_INPUT_OUTCOME)}:{}),...(process.env.FIXTURE_MESSAGE_INTERACTIONS?{messageInteractions:JSON.parse(process.env.FIXTURE_MESSAGE_INTERACTIONS)}:{}),...(process.env.FIXTURE_MANAGED?{managedCreation:{version:1,passive:true,configurationScope:'global-and-session',typedSelection:true}}:{}),...(process.env.FIXTURE_TRANSFER?{transfer:{version:1,passiveInspection:true}}:{}),sessionLifecycle:{version:1,passive:true,deletion:'preserve-history',retention:{version:1},...(process.env.FIXTURE_RETIRED_COPIES?{retiredCopies:{version:1,duplicateFilesOnly:true,retirementAuthority:'launcher-assertion'}}:{}),recoveryCopy:{version:1},bundleFork:{version:1},descendantGuard:{version:1}},configurationClone:{version:1},taskState:{version:1,passive:true},workers:{version:1,passiveInspection:true,residentControls:true},activeSteering:{version:1,mode:'request_boundary',cancellable:false},...(process.env.FIXTURE_NO_RETIRE?{}:{lifecycle:{version:1,gracefulRetire:true,...(process.env.FIXTURE_RETIRE_STATUS_CAPABILITY?{retirementStatus:{version:1,method:'_amplifier/retire/status',passive:true}}:{})}}),relocation:{version:1,passiveInspection:true},scheduledTurns:{version:1,completion:'settled'},questionTurns:{version:1,completion:'settled',active:false},observationTurns:{version:1,completion:'settled',active:false},history:{version:1,paging:'complete-turns',passive:true,passiveInspect:true}}}},authMethods:[]});}
   else if(message.method==='_amplifier/managed'){
     const file=process.env.FIXTURE_LOG+'.managed',rows=existsSync(file)?JSON.parse(readFileSync(file,'utf8')):{};
     if(p.operation==='receipt'){reply(message.id,rows[p.commandId]??null);continue;}
@@ -53,9 +53,18 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     }
     send({id:message.id,error:{code:-32601,message:'Unsupported fixture lifecycle operation'}});
   }
+  else if(message.method==='_amplifier/retire/status'){
+    appendFileSync(process.env.FIXTURE_LOG+'.retirement-status',JSON.stringify(p)+'\n');
+    if(process.env.FIXTURE_RETIRE_STATUS_LOST)continue;
+    const value=process.env.FIXTURE_RETIRE_STATUS_FILE?JSON.parse(readFileSync(process.env.FIXTURE_RETIRE_STATUS_FILE,'utf8')):JSON.parse(process.env.FIXTURE_RETIRE_STATUS??'{"retired":false}');
+    reply(message.id,{sessionId:p.sessionId,...value});
+  }
   else if(message.method==='_amplifier/retire'){
     if(process.env.FIXTURE_RETIRE_CALLBACK){const id=permissionId++;pending.set(id,result=>appendFileSync(process.env.FIXTURE_LOG+'.late-write',JSON.stringify(result)+'\n'));send({id,method:'fs/write_text_file',params:{sessionId:p.sessionId,path:process.cwd()+'/blocked-native-write',content:'must not write'}});}
     if(process.env.FIXTURE_RETIRE_LOST){retired=true;appendFileSync(process.env.FIXTURE_LOG+'.retired','retired without acknowledgement\n');continue;}
+    if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.retirement-requests','retire\n');
+    if(process.env.FIXTURE_RETIRE_DELAY){retired=true;setTimeout(()=>reply(message.id,{retired:false,reason:'retirement_unknown'}),Number(process.env.FIXTURE_RETIRE_DELAY));continue;}
+    if(process.env.FIXTURE_RETIRE_RESPONSE){const result=JSON.parse(process.env.FIXTURE_RETIRE_RESPONSE);if(result.retired!==false||!['owned_work','active_request'].includes(result.reason))retired=true;reply(message.id,result);continue;}
     if(background){reply(message.id,{retired:false,reason:'owned_work'});continue;}
     retired=true;reply(message.id,{retired:true});
   }
@@ -71,6 +80,9 @@ for await(const line of readline.createInterface({input:process.stdin})) {
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.background.stop'){clearInterval(background);background=undefined;reply(message.id,{});}
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.history.persisted'){
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'history.persisted',metadataPath:p.args.metadataPath}}});reply(message.id,{});
+  }
+  else if(message.method==='_amplifier/native'&&p.operation==='fixture.worker.idle'){
+    send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});
   }
   else if(message.method==='_amplifier/native'&&p.operation==='fixture.runtime.loss'){
     send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'runtime.closed'}}});reply(message.id,{});setTimeout(()=>process.exit(17),20);

@@ -25,6 +25,7 @@ interface Terminal {
 /** One process per active agent session. Sessions are not tied to viewers. */
 export class AcpProcess {
   readonly process: ChildProcessWithoutNullStreams;
+  readonly connectionId = randomUUID();
   readonly client: ClientSideConnection;
   initialized!: InitializeResponse;
   nativeId?: string;
@@ -34,6 +35,7 @@ export class AcpProcess {
   // Released terminal handles still own callbacks until their stdio closes.
   private terminalLifetimes = new Set<Terminal>();
   private retiring = false;
+  retirementOutcome: 'active'|'pending'|'refused'|'retired'|'unknown' = 'active';
   private retirement?:Promise<void>;
   private stderr = '';
   constructor(readonly engine: EngineConfig, readonly cwd: string, readonly handlers: AgentHandlers) {
@@ -142,16 +144,36 @@ export class AcpProcess {
     } finally {this.loading=false;}
   }
   /** Native atomic graceful retirement; refusal/uncertainty never force-closes owned work. */
-  async retireIfIdle():Promise<boolean> {
+  async retireIfIdle(timeoutMs=10000,beforeDispatch?:()=>void):Promise<boolean> {
+    if(this.retirementOutcome==='unknown'||this.retirementOutcome==='pending')return false;
+    if(this.retirementOutcome==='retired')return true;
     if(this.terminalLifetimes.size)return false;
     if(this.closed)return true;
     const lifecycle=(this.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.lifecycle;
     if(!this.nativeId||lifecycle?.version!==1||lifecycle.gracefulRetire!==true)return false;
     let timer:ReturnType<typeof setTimeout>|undefined;
+    this.retirementOutcome='pending';
     try {
-      const result=await Promise.race([this.client.extMethod('_amplifier/retire',{sessionId:this.nativeId}),new Promise<undefined>(resolve=>{timer=setTimeout(()=>resolve(undefined),10000);timer.unref();})]);
-      return result?.retired===true;
-    }catch{return false;}finally{clearTimeout(timer);}
+      beforeDispatch?.();
+      const result=await Promise.race([this.client.extMethod('_amplifier/retire',{sessionId:this.nativeId}),new Promise<undefined>(resolve=>{timer=setTimeout(()=>resolve(undefined),timeoutMs);timer.unref();})]);
+      if(result?.retired===true){this.retirementOutcome='retired';return true;}
+      this.retirementOutcome=result?.retired===false&&['owned_work','active_request'].includes(String(result.reason))?'refused':'unknown';
+      return false;
+    }catch{this.retirementOutcome='unknown';return false;}finally{clearTimeout(timer);}
+  }
+  /** Passive proof read on this same connection; never repeats retirement. */
+  async inspectRetirement(timeoutMs=1000):Promise<{retired:boolean;reason?:string}> {
+    if(this.retirementOutcome==='retired')return {retired:true};
+    if(this.retirementOutcome!=='unknown'||this.closed||!this.nativeId)return {retired:false,reason:'not-fenced'};
+    const status=(this.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.lifecycle?.retirementStatus;
+    if(status?.version!==1||status.method!=='_amplifier/retire/status'||status.passive!==true)return {retired:false,reason:'unsupported'};
+    const nativeId=this.nativeId;
+    let timer:ReturnType<typeof setTimeout>|undefined;
+    try {
+      const result=await Promise.race([this.client.extMethod('_amplifier/retire/status',{sessionId:nativeId}),new Promise<undefined>(resolve=>{timer=setTimeout(()=>resolve(undefined),timeoutMs);timer.unref();})]);
+      if(!this.closed&&this.nativeId===nativeId&&result?.sessionId===nativeId&&result.retired===true){this.retirementOutcome='retired';return {retired:true};}
+      return {retired:false,reason:'unconfirmed'};
+    }catch{return {retired:false,reason:'transport-unknown'};}finally{clearTimeout(timer);}
   }
   retire():Promise<void> {
     this.retiring=true;

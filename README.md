@@ -336,8 +336,25 @@ capacity eviction requires negotiated native
 approvals, bridge requests or auxiliary work remain; success permanently retires
 the native session handle before the host closes its ACP connection. The host holds
 the session admission lock through this decision and retains its own running ACP
-terminals. Refusal, unsupported capability or a missing response retains the agent;
-new capacity is refused rather than killing that work. Generic ACP peers without
+terminals. A definite `owned_work` or `active_request` refusal retains a usable agent.
+Unsupported capability retains the agent. Missing, malformed or uncertain
+retirement responses retain the connection but fence new execution before
+admission; they never authorize killing work or retrying the retirement. A
+`runtime.closed` worker notification alone does not prove session retirement.
+New capacity is refused rather than killing retained work.
+
+An optional `lifecycle.retirementStatus: {version:1,
+method:"_amplifier/retire/status",passive:true}` permits one bounded passive
+`{sessionId}` read on the same existing connection. The response must identify
+that exact session and return `retired:true` only after Native correlates the
+literal worker retirement acknowledgement with the same captured worker clean exit 0. It must never start,
+retire or close a worker, change history, or execute input. Host closes the old
+connection only on this proof. `reconcileSessionRetirement(session)` exposes a
+trusted selected-session recheck; a new original input also performs one read
+when it encounters the fence. Unsupported, false, malformed, wrong-identity or
+missing proof retains the fence. Any prior unknown input receipt remains unknown
+and is never resubmitted. After confirmed retirement a new input resumes the same
+Native identity through ordinary ACP load/resume. Generic ACP peers without
 this explicit retirement proof are not automatically evicted from the configured
 active-agent bound. Explicit host shutdown remains a separate stopping operation.
 
@@ -1345,3 +1362,12 @@ state or normalizing interrupted commands. Genuine new stores, documented legacy
 migrations and never-initialized optional owners remain supported. Preserve a
 refused database and its WAL for inspection or exact backup restoration; do not
 clear it to retry. See [schema admission and its limits](docs/authoritative-schema.md).
+
+Unresolved retirement is journaled before its RPC in the existing Host receipts
+and selected session metadata. A closed ACP connection or Host restart cannot
+erase this fence. Only the matching original connection, mapping and retirement
+receipt may clear it on proof. If that connection is lost before proof arrives,
+this seam cannot recover it: the chat stays blocked until a separate authoritative
+recovery path resolves the original uncertainty. Process exit alone is not proof.
+Definitive refusal or confirmed retirement settles only the retirement receipt;
+ordinary cold resume remains available and user-input receipts are untouched.

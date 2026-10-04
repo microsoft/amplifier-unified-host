@@ -99,7 +99,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {retirementCommandId?:string;finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -1152,10 +1152,12 @@ export class AmplifierHost {
       });
   }
   private async quiesceLifecycle(record:Pick<SessionRecord,'uri'>) {
+    const current=this.getRecord(record.uri);if(current)this.guardRetirementRecord(current);
     const active=this.active.get(record.uri);if(!active)return;
+    this.guardRetirement(active);
     if(active.busy||active.controlDepth||this.starting.has(record.uri))throw new RpcFault(-32008,'Session has active work; lifecycle change was not executed',{executed:false});
     active.controlDepth=(active.controlDepth??0)+1;
-    try{if(!active.agent.closed&&!await active.agent.retireIfIdle())throw new RpcFault(-32008,'Native session still owns work; lifecycle change was not executed',{executed:false});active.retireReason='session-lifecycle';await active.agent.retire();await active.stopCallback;this.active.delete(record.uri);}finally{active.controlDepth--;}
+    try{if(!active.agent.closed&&!await this.retireActive(record.uri,active))throw new RpcFault(-32008,'Native session still owns work; lifecycle change was not executed',{executed:false});active.retireReason='session-lifecycle';await active.agent.retire();await active.stopCallback;this.active.delete(record.uri);}finally{active.controlDepth--;}
   }
   async previewDeleteSession(session:string) {const record=await this.record(session);return this.lifecycleAgent(record,agent=>this.nativeLifecycle(agent,record,'delete.preview'));}
   private lifecycleArgs(operation:string,args:Json) {
@@ -1415,11 +1417,65 @@ export class AmplifierHost {
     if(operation==='legacyCopy.inventory')return this.inventoryRetiredCopies(session);if(operation==='legacyCopy.preview')return this.previewRetiredCopyPurge(session,args as any);if(operation==='legacyCopy.receipt')return this.retiredCopyPurgeReceipt(session,args.commandId);
     if(['fork','export','delete','restore','legacyCopy.purge'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
   }
+  private retirementFence(record:SessionRecord):Json|undefined {return record.state._meta?.['amplifier.dev/retirement'] as Json|undefined;}
+  private retirementFenceMatches(record:SessionRecord,active:Active,commandId?:string) {
+    const fence=this.retirementFence(record);
+    const receipt=typeof fence?.commandId==='string'?this.store.receipt(fence.commandId):undefined;
+    return fence?.version===1&&fence.commandId===active.retirementCommandId&&receipt?.clientId==='host:retirement'&&receipt.channel===record.uri&&['admitted','unknown'].includes(receipt.status)&&(!commandId||fence.commandId===commandId)&&fence.connectionId===active.agent.connectionId&&fence.nativeSessionId===active.agent.nativeId&&fence.nativeSessionId===record.nativeSessionId&&fence.engineId===record.engineId&&fence.engineId===active.agent.engine.id&&fence.workingDirectory===record.workingDirectory;
+  }
+  private guardRetirementRecord(record:SessionRecord) {
+    if(this.retirementFence(record)!==undefined)throw new RpcFault(-32011,'This chat is waiting for confirmation that its previous runtime stopped. Your new message was not sent.',{executed:false,replayed:false,outcome:'unknown'});
+  }
+  private saveRetirementFence(record:SessionRecord,active:Active,outcome:'pending'|'unknown'|'clear') {
+    const current=this.getRecord(record.uri)!;
+    const prior=this.retirementFence(current);
+    if(outcome==='pending') {
+      this.guardRetirementRecord(current);
+      const fence={version:1,outcome,commandId:'host-retirement:'+randomUUID(),connectionId:active.agent.connectionId,nativeSessionId:active.agent.nativeId,engineId:current.engineId,workingDirectory:current.workingDirectory};
+      active.retirementCommandId=fence.commandId;
+      current.state._meta={...current.state._meta,'amplifier.dev/retirement':fence};
+      this.store.transaction(()=>{this.store.admission(current.uri,{operation:'retire',fence},fence.commandId,'host:retirement',this.store.extensionSequence('host:retirement'));this.store.saveSessionMetadata(current);});
+    }else {
+      if(!this.retirementFenceMatches(current,active))return;
+      current.state._meta={...current.state._meta};
+      if(outcome==='clear')delete current.state._meta['amplifier.dev/retirement'];
+      else current.state._meta['amplifier.dev/retirement']={...prior,outcome};
+      this.store.transaction(()=>{this.store.finish(prior!.commandId,outcome==='unknown'?'unknown':active.agent.retirementOutcome==='retired'?'completed':'failed');this.store.saveSessionMetadata(current);});
+    }
+  }
+
+  private async retireActive(uri:string,active:Active,timeoutMs=10000) {
+    const record=this.getRecord(uri)!;
+    const retired=await active.agent.retireIfIdle(timeoutMs,()=>this.saveRetirementFence(record,active,'pending'));
+    this.saveRetirementFence(record,active,active.agent.retirementOutcome==='unknown'||active.agent.retirementOutcome==='pending'?'unknown':'clear');
+    return retired;
+  }
+  private async reconcileRetirementUnderLock(record:SessionRecord) {
+    const active=this.active.get(record.uri);
+    if(!active||active.agent.retirementOutcome!=='unknown'||active.agent.nativeId!==record.nativeSessionId||!this.retirementFenceMatches(record,active))return {retired:false,connectionClosed:false,workReplayed:false,reason:'not-fenced'};
+    const commandId=this.retirementFence(record)!.commandId;
+    const status=await active.agent.inspectRetirement();
+    if(!status.retired)return {retired:false,connectionClosed:false,workReplayed:false,reason:status.reason};
+    if(!this.retirementFenceMatches(this.getRecord(record.uri)!,active,commandId))return {retired:false,connectionClosed:false,workReplayed:false,reason:'changed-fence'};
+    this.saveRetirementFence(record,active,'clear');
+    // The negotiated native status owner proves the exact handle retired. A
+    // worker-closed notification or an absent reply never reaches this branch.
+    active.retireReason='idle-retired';await active.agent.retire();await active.stopCallback;
+    if(this.active.get(record.uri)===active)this.active.delete(record.uri);
+    return {retired:true,connectionClosed:true,workReplayed:false};
+  }
+  /** Trusted selected-session proof recheck. No input or retirement is replayed. */
+  async reconcileSessionRetirement(session:string) {
+    return this.intake.run(async()=>{const record=await this.record(session);return this.withLock(record.uri,()=>this.reconcileRetirementUnderLock(this.getRecord(record.uri)!));});
+  }
+  private guardRetirement(active:Active) {
+    if(['pending','unknown','retired'].includes(active.agent.retirementOutcome))throw new RpcFault(-32011,'This chat is waiting for confirmation that its previous runtime stopped. Your new message was not sent.',{executed:false,replayed:false,outcome:'unknown'});
+  }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
     return this.intake.run(async()=>{
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     this.guardSessionLifecycle(uri);
-    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
+    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing)this.guardRetirement(existing);this.guardRetirementRecord(await this.record(uri));if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
     const pending=(async()=>{
@@ -1763,8 +1819,10 @@ export class AmplifierHost {
     if(this.store.db.prepare("SELECT 1 FROM steering_intents WHERE chat=? AND status='dispatching' LIMIT 1").get(channel))throw new Error('A prior steering disposition is pending; wait for its receipt');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
+    if(special?.operation!=='observation.submit'&&this.active.get(record.uri)?.agent.retirementOutcome==='unknown')await this.reconcileRetirementUnderLock(record);
     const blocks=await this.prompt(action.message,record),active=special?.operation==='observation.submit'?this.active.get(record.uri):await this.ensureAgent(record.uri);
     if(!active||active.agent.closed||special?.operation==='observation.submit'&&active.stopNotified)throw new RpcFault(-32008,'waiting_worker',{executed:false});
+    this.guardRetirement(active);
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
@@ -2201,7 +2259,7 @@ export class AmplifierHost {
         if(this.active.get(uri)!==active||active.busy||active.controlDepth||this.starting.has(uri))return false;
         active.controlDepth=(active.controlDepth??0)+1;
         try {
-          if(!await active.agent.retireIfIdle())return false;
+          if(!await this.retireActive(uri,active))return false;
           active.retireReason='idle-retired';await active.agent.retire();await active.stopCallback;this.active.delete(uri);return true;
         }finally{active.controlDepth--;}
       });
@@ -2213,20 +2271,20 @@ export class AmplifierHost {
     return {counts:{shuttingDown:this.closing?1:0,startingAgents:this.starting.size,activeTurns:active.filter(a=>a.busy).length,finishingTurns:active.filter(a=>a.finishing).length,activeControls:active.reduce((n,a)=>n+(a.controlDepth??0),0),nativeUpdates:active.reduce((n,a)=>n+(a.updateCount??0)+(a.observationPending??0),0),permissions:active.reduce((n,a)=>n+a.permissions.size,0),clientTools:this.clientTools.size,settledCallbacks:this.settledCallbacks.size,stoppedCallbacks:this.stoppedCallbacks.size,steeringDispositions:this.steeringTimers.size,terminalJobs:Number(this.store.db.prepare("SELECT count(*) n FROM terminals WHERE lifecycle='running'").get()!.n),pendingQueue:Number(this.store.db.prepare("SELECT count(*) n FROM queue_intents WHERE status='pending'").get()!.n),pendingSteering:Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE status IN ('pending','dispatching')").get()!.n)},gaps:active.filter(a=>!a.agent.closed&&((a.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle?.gracefulRetire!==true)).length?['resident-agent-has-no-atomic-retirement']:[]};
   }
   private async quiesceAgents():Promise<{ready:boolean;reason?:string;unknown?:boolean}> {
+    if(this.store.db.prepare("SELECT 1 FROM receipts WHERE client_id='host:retirement' AND json_extract(payload,'$.status') IN ('admitted','unknown') LIMIT 1").get())return {ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
     for(const [session,active] of this.active){
       const result=await this.withLock(session,async()=>{
         if(this.active.get(session)!==active)return {ready:true};
         if(active.busy||active.finishing||active.controlDepth||this.starting.has(session)||active.permissions.size||active.observationPending)return {ready:false,reason:'native-work-became-active'};
+        if(this.retirementFence(this.getRecord(session)!)!==undefined||['pending','unknown'].includes(active.agent.retirementOutcome))return {ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
         if(active.agent.closed){this.active.delete(session);return {ready:true};}
         const lifecycle=(active.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle;
         if(lifecycle?.version!==1||lifecycle.gracefulRetire!==true||!active.agent.nativeId)return {ready:false,reason:'native-atomic-retirement-unavailable'};
-        active.controlDepth=(active.controlDepth??0)+1;let timer:ReturnType<typeof setTimeout>|undefined;
+        active.controlDepth=(active.controlDepth??0)+1;
         try{
-          const proof=await Promise.race([active.agent.client.extMethod('_amplifier/retire',{sessionId:active.agent.nativeId}),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('native-retirement-timeout')),this.config.quiescence?.timeoutMs??10000);timer.unref();})]);
-          if(proof.retired===false&&['owned_work','active_request'].includes(String(proof.reason)))return {ready:false,reason:'native-owned-work'};
-          if(proof.retired!==true)return {ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
+          if(!await this.retireActive(session,active,this.config.quiescence?.timeoutMs??10000))return active.agent.retirementOutcome==='refused'?{ready:false,reason:'native-owned-work'}:{ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
           active.retireReason='quiesced';await active.agent.retire();await active.stopCallback;this.active.delete(session);return {ready:true};
-        }catch{return {ready:false,unknown:true,reason:'native-retirement-transport-unknown'};}finally{clearTimeout(timer);active.controlDepth!--;}
+        }catch{return {ready:false,unknown:true,reason:'native-retirement-transport-unknown'};}finally{active.controlDepth!--;}
       });
       if(!result.ready)return result;
     }
@@ -2462,6 +2520,7 @@ export class AmplifierHost {
       const active=options.requireExisting?this.active.get(session):await this.ensureAgent(session);
       this.guardTransfer(session);
       if(!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32008,'No existing owned native runtime; no process was started');
+      this.guardRetirement(active);
       if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.version!==1)throw new RpcFault(-32601,'Native control extension not negotiated');
       if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
       if(['worker.stop','operations.cancel'].includes(operation))this.store.bump(session,'interruption');
