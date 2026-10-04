@@ -511,6 +511,13 @@ export class AmplifierHost {
       } while(next&&(limit===undefined||turns.length<limit));
       let nextCursor:string|undefined;
       if(next){nextCursor=randomUUID();this.nativeCursors.set(nextCursor,{chat:record.chat.resource,cursor:next,revision});if(this.nativeCursors.size>4096)this.nativeCursors.delete(this.nativeCursors.keys().next().value!);}
+      // A cold copied/imported chat can expose canonical message locators before
+      // any runtime is mounted. Retain the same negotiated ACP grant used by
+      // live sessions only after the selected passive read has succeeded.
+      const fresh=this.getRecord(record.uri);
+      if(fresh&&fresh.engineId===record.engineId&&fresh.nativeSessionId===record.nativeSessionId&&fresh.workingDirectory===record.workingDirectory&&JSON.stringify((fresh.state._meta?.['amplifier.dev/acp'] as Json|undefined)?.capabilities)!==JSON.stringify(init.agentCapabilities)) {
+        this.emit(record.uri,{type:'session/metaChanged',_meta:{...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:init.agentCapabilities}}} as StateAction);
+      }
       return {turns,nextCursor,revision,diagnostics};
     } finally {this.passiveReads--;await agent.retire();}
   }

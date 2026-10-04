@@ -80,3 +80,17 @@ test('queued next input defers settled refresh signal until an idle completed tu
   await f.host.submitTurn(f.session,{commandId:first,text:'slow',clientId:'marker-client'});await f.host.updatePendingQueue(f.session,{type:'chat/pendingMessageSet',kind:'queued',id:next,message:{text:'next ordinary',origin:{kind:'user'}}} as any,{clientId:'marker-client'});await wait(()=>markers.some(row=>row.id===next));assert.equal(f.host.store.receipt(first)?.status,'completed');assert.equal(f.host.store.receipt(next)?.status,'completed');assert.ok(markers.every(row=>!row.busy&&!row.finishing));assert.equal(markers.filter(row=>row.id===next).length,1);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,2);
  }finally{stop?.();await f.close();}
 });
+
+
+test('cold native selected history publishes negotiated message grants without mounting or replaying work',async()=>{
+ const f=await fixture({principal:'trusted',grant,history:true});let cold:any,client:any;
+ try{
+  const native=(await f.host.inspectSession(f.session)).nativeSessionId,id=randomUUID(),locator={...ref,sessionId:native};
+  await writeFile(join(f.dir,'history.json'),JSON.stringify([{id,state:'complete',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:'Retained cold history'},_meta:{'amplifier.dev/history':{messageId:locator.messageId,messageReference:locator}}}]}]));
+  const record=f.host.store.get(f.session)!;record.chat._meta={'amplifier.dev/history':{source:'native',available:true}};record.state._meta={'amplifier.dev/acp':{configOptions:[{id:'retained-option'}],lastSettledTurnId:'retained-marker'}};f.host.store.save(record);
+  const config=f.host.config;await f.client.shutdown();await f.host.close();cold=await createHost(config);client=new AhpClient(await WebSocketTransport.connect(cold.url));client.connect();await client.initialize({clientId:'cold-viewer',protocolVersions:['0.9.0']});
+  assert.equal(cold.store.get(f.session).state._meta['amplifier.dev/acp'].capabilities,undefined);
+  const snapshot=(await client.subscribe(f.chat,{view:{turns:1}})).result.snapshot!.state as any;assert.deepEqual(snapshot.turns[0].message._meta['amplifier.dev/history'].messageReference,locator);
+  const session=(await client.subscribe(f.session)).result.snapshot!.state as any;assert.deepEqual(session._meta['amplifier.dev/acp'].capabilities._meta['amplifier.dev/native'].messageInteractions,grant);assert.deepEqual(session._meta['amplifier.dev/acp'].configOptions,[{id:'retained-option'}]);assert.equal(session._meta['amplifier.dev/acp'].lastSettledTurnId,'retained-marker');assert.equal(cold.diagnostics().activeAgents,0);assert.equal((cold as any).starting.size,0);await assert.rejects(readFile(f.log),{code:'ENOENT'});
+ }finally{await client?.shutdown();await cold?.close();await rm(f.dir,{recursive:true,force:true});}
+});
