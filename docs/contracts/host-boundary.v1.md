@@ -271,3 +271,30 @@ seam from recovering the chat; separate authoritative recovery is required.
 Process exit alone is insufficient. These limits do not alter safe cold resume
 after definite refusal or confirmed retirement, or settle any prior unknown user
 input. See [durable causal checks](../../test/retirement-durable.test.ts).
+
+## Generic selected-session title metadata
+
+Optional per-engine `sessionMetadata` ports own canonical title persistence.
+Host selects the engine, session and canonical mapping; client metadata does not
+supply that authority. Reads and manual saves do not mount an execution runtime.
+The title revision is an opaque engine token. `readSessionTitle` and
+`commitSessionTitle` serialize on the existing selected-session lock; expected
+revision is checked before any persistence callback. Generation stays outside
+that lock, with engine candidate/policy checks owned upstream.
+
+Ordinary AHP manual title writes retain deterministic original action identity,
+persist engine metadata first and reread current canonical metadata before
+projection. Successful old receipts and stale ACP title streams cannot restore
+an older name. Unknown writes are not automatically replayed or optimistically
+projected. Policy-only results project opaque metadata under
+`amplifier.dev/sessionMetadata` using standard metadata events, with no title
+action or title revision increment. Metadata never overwrites Host-owned keys.
+
+External ACP without an adapter preserves standard title behavior, with a
+Host-only title revision in existing session metadata for generic CAS. No new
+store, Native policy parser or public naming wire operation is added. Adapter
+presence plus actual engine marker and complete trusted bridge ports are required
+at composition before an engine naming capability is advertised.
+[Focused causal checks](../../test/session-title-metadata.test.ts) use owned
+metadata fixtures and an independent ACP notification peer; source/package
+acceptance remains separate from Native, bridge and browser/account acceptance.

@@ -106,6 +106,32 @@ fixture mode does not provide external discovery or background workspace recheck
   never session/load just to browse. Unknown historical outcomes are represented
   visibly rather than inferred from a saved assistant message.
 
+Already-started agents use a bounded recent-agent cache: eight resident or
+admitted starting sessions by default. Selected session/chat subscriptions give
+retention priority without starting a cold agent. Unreferenced idle entries get
+fifteen minutes of grace; capacity pressure evicts safe unreferenced entries
+first, then safe selected entries, using real use/settlement LRU in each tier.
+Active work, approvals, unresolved outcomes and Native-owned work remain
+protected. If no safe slot exists, new startup is refused.
+
+Grace and use order renew at actual request dispatch and settlement, including
+standard/legacy configuration, clone snapshots, cancellation, steering and
+refused relocation. Startup renews after its initialization projections; turn
+settlement renews after the final catalog projection and update join. Validation
+failures, subscriptions, pings and known Native inspection/login-status polls
+do not renew use. Snapshot controls persist state and count as use; generic
+Native controls exclude exact known read contracts rather than guessed suffixes.
+Steering acceptance timeouts retain their unknown receipt and protect the
+underlying request until it settles, without replaying the input.
+
+Host requests connection-scoped lifetime ownership at ACP initialization. Only
+an exact negotiated acknowledgement suppresses Native's independent idle timer.
+Generic or unacknowledged peers keep their own lifetime behavior; retaining the
+ACP connection does not promise their inner runtime stays warm. Diagnostics
+report managed/unmanaged counts. See [runtime retention v1](docs/contracts/runtime-retention.v1.md)
+for negotiation, grace, pressure and validation boundaries. `idleAgentMs` remains
+a server-side override; there is no selection-triggered preparation or UI setting.
+
 Default limits: eight active agents, four concurrent passive history readers,
 128 connected clients, 64 subscriptions per client, 32 concurrent requests per
 client, 512 queued ACP updates / 8 MiB, 8 MiB of active-turn projection input,
@@ -326,6 +352,44 @@ preserves scheduled/question/voice provenance and the original admission client 
 status when present. Unadmitted projections default to `inputOrigin: 'unknown'`
 unless recorded provenance explicitly identifies another origin. Consumers must
 apply their own authenticated actor, timing and content policies to this evidence.
+
+## Generic canonical title metadata
+
+A configured engine may provide `sessionMetadata: {readTitle, writeTitle}`. These
+trusted ports receive the Host-selected session, engine, Native identity if mapped,
+and canonical history working directory. They read or persist metadata passively;
+they must not start an execution runtime or model. An adapter is authority for its
+opaque `titleRevision`; Host does not interpret engine naming policy. Native
+metadata persistence and original-command receipts remain with that engine.
+
+`readSessionTitle(session)` returns `{title,titleRevision,metadata?}` without
+mounting an agent. `commitSessionTitle(session,{commandId,expectedTitleRevision?},
+persistCallback)` checks that revision under the existing selected-session lock
+before calling trusted persistence. Generation belongs outside this lock. A stale
+revision returns `applied:false` without calling persistence. Callback context
+contains the selected mapping, current snapshot and original command identity.
+A confirmed callback returns `{applied,title?,metadata?}`.
+
+Ordinary AHP manual title actions use the same lock and pass a stable command ID
+derived from their original session/client/sequence to `writeTitle`. Persistence
+completes before AHP projection. Host rereads the current adapter snapshot after
+a write or callback so a historical successful receipt cannot restore an old
+title over a newer edit. Unknown writes do not emit optimistic success and are
+not automatically replayed. ACP title notifications reconcile this same current
+authority instead of projecting potentially stale stream values.
+
+Snapshot metadata projects under session `_meta['amplifier.dev/sessionMetadata']`
+via standard `session/metaChanged`; vendor keys cannot replace Host-owned metadata.
+A policy-only callback omits title and produces no title action or title revision
+increment. External ACP engines without an adapter retain standard title actions;
+a title-only counter in existing session metadata supports generic CAS without a
+new table. Titles are bounded to 1,000 characters, revision/command tokens to 200,
+and metadata to 64 KiB. Adapter owners may enforce stricter engine limits.
+
+These generic methods do not advertise naming. Composition must verify the actual
+selected engine adapter, genuine engine capability marker and complete trusted
+bridge ports before exposing an engine naming feature. Host fixtures qualify its
+source/package boundary; Native, bridge, browser and account acceptance are separate.
 
 ## Background work and runtime loss
 
