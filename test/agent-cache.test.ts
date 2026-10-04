@@ -160,3 +160,114 @@ test('failed native control settlement also renews grace without manufacturing s
   assert.equal(entry.controlDepth,0);assert.ok(entry.useOrder>before);assert.ok(performance.now()-entry.lastUsed<1000);await f.h.retireIdle();assert.equal(f.active(one.session),entry);
  }finally{release?.();await f.cleanup();}
 });
+
+function gate(){let release!:()=>void,entered!:()=>void;const started=new Promise<void>(r=>entered=r),done=new Promise<void>(r=>release=r);return {release,entered,started,done};}
+function age(entry:any){entry.lastUsed=performance.now()-900001;entry.uninterestedSince=entry.lastUsed;return entry.useOrder;}
+async function retainedAfterSettlement(f:any,session:string,entry:any,order:number){assert.ok(entry.useOrder>order);assert.ok(performance.now()-entry.lastUsed<1000);await f.h.retireIdle();assert.equal(f.active(session),entry);}
+for(const legacy of [false,true])for(const failure of [false,true])test(`class settlement: ${legacy?'legacy mode':'standard config'} actual RPC ${failure?'error':'success'} renews grace`,async()=>{
+ const f=await setup(),barrier=gate();try{
+  if(legacy)f.engine.env.FIXTURE_LEGACY='1';
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),method=legacy?'setSessionMode':'setSessionConfigOption',rpc=entry.agent.client[method].bind(entry.agent.client);
+  if(legacy)await new Promise(r=>setTimeout(r,60));
+  entry.agent.client[method]=async(params:any)=>{barrier.entered();await barrier.done;const result=await rpc(params);if(failure)throw Error('Original config reply lost');return result;};
+  client.dispatch(one.session,{type:'session/configChanged',config:{mode:'fast'}});await barrier.started;const order=age(entry);await f.h.retireIdle();assert.equal(f.active(one.session),entry);
+  barrier.release();await f.h.withLock(one.session,async()=>{});await retainedAfterSettlement(f,one.session,entry,order);
+  if(!failure)assert.equal(f.host.store.get(one.session)?.state.config?.values?.mode,'fast');
+ }finally{barrier.release();await f.cleanup();}
+});
+for(const legacy of [false,true])test(`class settlement: ${legacy?'legacy unknown mode':'standard nonstring selector'} validation never renews use`,async()=>{
+ const f=await setup();try{
+  if(legacy)f.engine.env.FIXTURE_LEGACY='1';const client=await f.connect(),one=await f.create(client),entry=f.active(one.session);if(legacy)await new Promise(r=>setTimeout(r,60));
+  const order=entry.useOrder,lastUsed=entry.lastUsed;client.dispatch(one.session,{type:'session/configChanged',config:{mode:legacy?'unknown':42}} as any);await new Promise(r=>setTimeout(r,30));await f.h.withLock(one.session,async()=>{});
+  assert.equal(entry.useOrder,order);assert.equal(entry.lastUsed,lastUsed);
+ }finally{await f.cleanup();}
+});
+for(const failure of [false,true])test(`class settlement: source clone snapshot ${failure?'error':'success'} renews source independently of target`,async()=>{
+ const f=await setup(),barrier=gate();let creation:Promise<any>|undefined;try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),before=await f.host.inspectSession(one.session),rpc=entry.agent.client.extMethod.bind(entry.agent.client);
+  entry.agent.client.extMethod=async(method:string,params:any)=>{if(params.operation==='configuration.snapshot'){barrier.entered();await barrier.done;const result=await rpc(method,params);if(failure)throw Error('Original clone reply lost');return result;}return rpc(method,params);};
+  creation=f.host.createSession({commandId:randomUUID(),idempotencyKey:randomUUID(),sourceSession:one.session,expectedConfigurationHash:before.configurationHash});void creation.catch(()=>{});
+  await barrier.started;const order=age(entry);await f.h.retireIdle();assert.equal(f.active(one.session),entry);barrier.release();if(failure)await assert.rejects(creation,/Original clone reply lost/);else assert.equal((await creation).creationConfirmed,true);
+  await retainedAfterSettlement(f,one.session,entry,order);
+ }finally{barrier.release();await creation?.catch(()=>{});await f.cleanup();}
+});
+test('class settlement: startup completion starts full grace after awaited catalog projection',async()=>{
+ const f=await setup(),barrier=gate();let creation:Promise<any>|undefined;try{
+  const client=await f.connect(),sync=f.h.syncCatalog.bind(f.h);let selected:string|undefined;
+  f.h.syncCatalog=async(record:any)=>{if(record.nativeSessionId&&!selected){selected=record.uri;barrier.entered();await barrier.done;}return sync(record);};
+  creation=f.create(client);await barrier.started;const entry=f.active(selected!),order=age(entry);await f.h.retireIdle();assert.equal(f.active(selected!),entry);barrier.release();const one=await creation;await retainedAfterSettlement(f,one.session,entry,order);
+ }finally{barrier.release();await creation?.catch(()=>{});await f.cleanup();}
+});
+test('class settlement: common run cleanup renews grace after final catalog and updates join',async()=>{
+ const f=await setup(),barrier=gate();let use:Promise<void>|undefined;try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),sync=f.h.syncCatalog.bind(f.h);
+  f.h.syncCatalog=async(record:any)=>{if(record.uri===one.session&&entry.finishing&&!entry.busy){barrier.entered();await barrier.done;}return sync(record);};
+  use=f.use(one.session);await barrier.started;const order=age(entry);await f.h.retireIdle();assert.equal(f.active(one.session),entry);barrier.release();await use;assert.equal(entry.finishing,false);await retainedAfterSettlement(f,one.session,entry,order);
+ }finally{barrier.release();await use?.catch(()=>{});await f.cleanup();}
+});
+test('class settlement: refused relocation actual peer response renews retained source',async()=>{
+ const f=await setup(),barrier=gate();let relocation:Promise<any>|undefined;try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),before=await f.host.inspectSession(one.session),rpc=entry.agent.client.extMethod.bind(entry.agent.client);
+  entry.agent.client.extMethod=async(method:string,params:any)=>{if(params.operation==='session.relocate'){barrier.entered();await barrier.done;return rpc(method,{...params,args:{...params.args,expectedExecutionRevision:params.args.expectedExecutionRevision+1}});}return rpc(method,params);};
+  relocation=f.host.relocateSession(one.session,{commandId:randomUUID(),target:f.dir,expectedExecutionRevision:before.executionRevision});await barrier.started;const order=age(entry);barrier.release();assert.equal((await relocation).applied,false);await retainedAfterSettlement(f,one.session,entry,order);
+ }finally{barrier.release();await relocation?.catch(()=>{});await f.cleanup();}
+});
+test('class settlement: matching cancellation RPC settling after parent turn renews grace',async()=>{
+ const f=await setup(),barrier=gate();let cancel:Promise<any>|undefined;try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),id=randomUUID();await f.host.submitTurn(one.session,{commandId:id,text:'slow',clientId:'owner'});await waitFor(()=>!!entry.generationId);
+  const rpc=entry.agent.client.cancel.bind(entry.agent.client);entry.agent.client.cancel=async(params:any)=>{await rpc(params);barrier.entered();await barrier.done;};
+  cancel=f.host.interruptSession(one.session,{commandId:randomUUID(),turnId:id,clientId:'owner'});await barrier.started;await entry.run;const order=age(entry);await f.h.retireIdle();assert.equal(f.active(one.session),entry);barrier.release();assert.equal((await cancel).delivery,'requested');await retainedAfterSettlement(f,one.session,entry,order);
+ }finally{barrier.release();await cancel?.catch(()=>{});await f.cleanup();}
+});
+test('class settlement: steering actual RPC completion renews use without a new prompt',async()=>{
+ const f=await setup(),barrier=gate();try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),id=randomUUID();await f.host.submitTurn(one.session,{commandId:id,text:'queue-hold',clientId:'owner'});await waitFor(()=>!!entry.generationId);
+  const rpc=entry.agent.client.extMethod.bind(entry.agent.client);entry.agent.client.extMethod=async(method:string,params:any)=>{if(params.operation==='steer.submit'){const result=await rpc(method,params);barrier.entered();await barrier.done;return result;}return rpc(method,params);};
+  const steering=randomUUID();await f.host.updatePendingQueue(one.session,{type:'chat/pendingMessageSet',kind:'steering',id:steering,message:{text:'held steering',origin:{kind:'user'}}} as any,{clientId:'owner'});
+  await barrier.started;const order=age(entry);barrier.release();await waitFor(()=>entry.steeringRuns.size===0);assert.equal(f.host.store.receipt(steering)?.status,'failed');assert.equal(entry.controlDepth,0);assert.ok(entry.useOrder>order);assert.ok(performance.now()-entry.lastUsed<1000);await entry.run;
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{barrier.release();await f.cleanup();}
+});
+test('class settlement: generation-bound late steering disposition renews grace; duplicate event is passive',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),id=randomUUID();await f.host.submitTurn(one.session,{commandId:id,text:'slow',clientId:'owner'});await waitFor(()=>!!entry.generationId);
+  const steering=randomUUID();await f.host.updatePendingQueue(one.session,{type:'chat/pendingMessageSet',kind:'steering',id:steering,message:{text:'after-turn steering',origin:{kind:'user'}}} as any,{clientId:'owner'});await entry.run;const order=age(entry);
+  await waitFor(()=>f.host.store.receipt(steering)?.status==='failed');await retainedAfterSettlement(f,one.session,entry,order);const settled=entry.useOrder;f.h.settleSteering(one.session,steering,'held','duplicate');assert.equal(entry.useOrder,settled);
+ }finally{await f.cleanup();}
+});
+test('class settlement: all known Native read and polling controls never renew existing cache use',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session);
+  const reads=['capabilities','configuration.inspect','configuration.exportResources','configuration.providers','configuration.providerModels','configuration.providerLoginStatus','catalog.inspect','usage.inspect','context.clear.review','goals.get','budget.get','mode.list','native.status','bundle.preview','capacity.get','task.get','task.receipt','task.history','session.relocation.inspect','runtime.inspect','workers.inspect'];
+  const order=age(entry),lastUsed=entry.lastUsed;
+  for(const requireExisting of [false,true])for(const op of reads){const result=requireExisting?await f.host.nativeControlExisting(one.session,op,{}):await f.host.nativeControl(one.session,op,{});assert.equal(result.passive,op);assert.equal(entry.useOrder,order,op);assert.equal(entry.lastUsed,lastUsed,op);}
+  await f.h.retireIdle();assert.equal(f.active(one.session),undefined);
+ }finally{await f.cleanup();}
+});
+for(const failure of [false,true])test(`class settlement: final update join ${failure?'failure':'success'} renews completed turn grace`,async()=>{
+ const f=await setup(),barrier=gate();let use:Promise<void>|undefined;try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),sync=f.h.syncCatalog.bind(f.h);let held=false;
+  f.h.syncCatalog=async(record:any)=>{if(record.uri===one.session&&entry.finishing&&!entry.busy&&!held){held=true;entry.updates=entry.updates.then(async()=>{barrier.entered();await barrier.done;if(failure)throw Error('Final update projection unavailable');});}return sync(record);};
+  use=f.use(one.session);await barrier.started;const order=age(entry);await f.h.retireIdle();assert.equal(f.active(one.session),entry);barrier.release();await use;assert.equal(entry.finishing,false);await retainedAfterSettlement(f,one.session,entry,order);
+ }finally{barrier.release();await use?.catch(()=>{});await f.cleanup();}
+});
+test('class settlement: failed passive polls and undispatched Native validation never renew use',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),rpc=entry.agent.client.extMethod.bind(entry.agent.client);
+  entry.agent.client.extMethod=async(method:string,params:any)=>{await rpc(method,params);throw Error('Passive reply lost');};
+  const order=entry.useOrder,lastUsed=entry.lastUsed;
+  for(const requireExisting of [false,true]){await assert.rejects(f.host.nativeControl(one.session,'configuration.providerLoginStatus',{}, {requireExisting}),/Passive reply lost/);assert.equal(entry.useOrder,order);assert.equal(entry.lastUsed,lastUsed);}
+  entry.agent.initialized.agentCapabilities._meta['amplifier.dev/native'].version=0;
+  await assert.rejects(f.host.nativeControl(one.session,'configuration.snapshot',{}),/not negotiated/);assert.equal(entry.useOrder,order);assert.equal(entry.lastUsed,lastUsed);
+ }finally{await f.cleanup();}
+});
+test('class settlement: steering acceptance timeout preserves underlying request depth and unknown receipt',async()=>{
+ const f=await setup({steeringOutcomeTimeoutMs:30}),barrier=gate();try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),id=randomUUID();await f.host.submitTurn(one.session,{commandId:id,text:'slow',clientId:'owner'});await waitFor(()=>!!entry.generationId);
+  const rpc=entry.agent.client.extMethod.bind(entry.agent.client);entry.agent.client.extMethod=async(method:string,params:any)=>{if(params.operation==='steer.submit'){barrier.entered();await barrier.done;}return rpc(method,params);};
+  const steering=randomUUID();await f.host.updatePendingQueue(one.session,{type:'chat/pendingMessageSet',kind:'steering',id:steering,message:{text:'held steering',origin:{kind:'user'}}} as any,{clientId:'owner'});await barrier.started;
+  await entry.run;const unknown=f.host.store.receipt(steering);assert.equal(unknown?.status,'unknown');assert.equal(entry.controlDepth,1);const order=age(entry);await f.h.retireIdle();assert.equal(f.active(one.session),entry);
+  barrier.release();await waitFor(()=>entry.controlDepth===0);assert.ok(entry.useOrder>order);assert.deepEqual(f.host.store.receipt(steering),unknown);await f.h.retireIdle();assert.equal(f.active(one.session),entry);
+  await assert.rejects(f.host.submitTurn(one.session,{commandId:randomUUID(),text:'do not replay',clientId:'owner'}),/unknown/);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{barrier.release();await f.cleanup();}
+});

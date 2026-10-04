@@ -338,6 +338,16 @@ export class AmplifierHost {
     active.interested=interested;
   }
   private touchAgent(active:Active){active.lastUsed=performance.now();active.useOrder=++this.agentUseOrder;}
+  /** Only an actual dispatched use renews LRU/grace; validation and passive polls do not. */
+  private async withAgentUse<T>(active:Active,request:()=>Promise<T>,use=true):Promise<T> {
+    active.controlDepth=(active.controlDepth??0)+1;
+    if(use)this.touchAgent(active);
+    try{return await request();}finally{active.controlDepth--;if(use)this.touchAgent(active);}
+  }
+  private nativeControlIsUse(operation:string) {
+    // Exact known read contracts, not suffix heuristics: snapshots persist state and are use.
+    return !new Set(['capabilities','configuration.inspect','configuration.exportResources','configuration.providers','configuration.providerModels','configuration.providerLoginStatus','catalog.inspect','usage.inspect','context.clear.review','goals.get','budget.get','mode.list','native.status','bundle.preview','capacity.get','task.get','task.receipt','task.history','session.relocation.inspect','runtime.inspect','workers.inspect']).has(operation);
+  }
   private withAgentCapacity<T>(work:()=>Promise<T>):Promise<T> {
     const next=this.agentCapacity.catch(()=>{}).then(work);this.agentCapacity=next;return next;
   }
@@ -1491,7 +1501,7 @@ export class AmplifierHost {
     return this.intake.run(async()=>{
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     this.guardSessionLifecycle(uri);
-    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing)this.guardRetirement(existing);this.guardRetirementRecord(await this.record(uri));if(existing&&!existing.agent.closed){this.touchAgent(existing);return existing;}
+    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing)this.guardRetirement(existing);this.guardRetirementRecord(await this.record(uri));if(existing&&!existing.agent.closed)return existing;
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
     const pending=(async()=>{
@@ -1541,7 +1551,7 @@ export class AmplifierHost {
           try{return await this.intake.continuation(()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params));}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}}
         }}:{}),
       });active.agent=agent;this.touchAgent(active);this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));this.touchAgent(active);return active;}
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);this.admittedStarts.delete(uri);}
       });
@@ -1698,13 +1708,13 @@ export class AmplifierHost {
     const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
     this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);});
     this.emit(record.chat.resource,{type:'chat/pendingMessageRemoved',kind:'steering',id} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(id);this.store.finish(id,'dispatching');
-    active.controlDepth=(active.controlDepth??0)+1;
     let acceptanceTimer:ReturnType<typeof setTimeout>|undefined;
-    const pending=Promise.race([active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text}}),new Promise<never>((_resolve,reject)=>{acceptanceTimer=setTimeout(()=>reject(new Error('Native steering acceptance deadline expired')),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));acceptanceTimer.unref();})]).then(result=>{
+    const request=this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text}}));
+    const pending=Promise.race([request,new Promise<never>((_resolve,reject)=>{acceptanceTimer=setTimeout(()=>reject(new Error('Native steering acceptance deadline expired')),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));acceptanceTimer.unref();})]).then(result=>{
       if(result.accepted===false&&result.executed===false){this.settleSteering(session,id,'held',String(result.reason??'Native steering refused before execution'));return;}
       if(result.accepted!==true||result.inputId!==id||result.activeInputId!==activeInputId||result.generationId!==generationId||!['queued','applied','held','unknown'].includes(String(result.disposition)))throw new Error('Invalid native steering disposition');
       if(result.disposition!=='queued')this.settleSteering(session,id,result.disposition as 'applied'|'held'|'unknown',String(result.reason??result.disposition));
-    }).catch(error=>this.settleSteering(session,id,'unknown',(error as Error).message)).finally(()=>{active.controlDepth!--;active.steeringRuns?.delete(pending);});
+    }).catch(error=>this.settleSteering(session,id,'unknown',(error as Error).message)).finally(()=>{clearTimeout(acceptanceTimer);active.steeringRuns?.delete(pending);});
     active.steeringRuns??=new Set();active.steeringRuns.add(pending);
   }
   private steeringEvent(session:string,active:Active,event:Json) {
@@ -1721,7 +1731,7 @@ export class AmplifierHost {
     const chat=chatURI(session),row=this.store.db.prepare('SELECT * FROM steering_intents WHERE id=? AND chat=?').get(id,chat);
     if(!row||row.status!=='dispatching')return;
     clearTimeout(this.steeringTimers.get(id));this.steeringTimers.delete(id);
-    const active=this.active.get(session);if(active?.turnId===row.active_turn_id)active.controlDepth=Math.max(0,(active.controlDepth??0)-1);
+    const active=this.active.get(session);if(active?.turnId===row.active_turn_id)this.touchAgent(active);
     this.store.transaction(()=>{this.store.db.prepare('UPDATE steering_intents SET status=?,held=1,reason=? WHERE id=?').run(disposition,reason.slice(0,1024),id);this.store.finish(id,disposition==='applied'?'completed':disposition==='held'?'failed':'unknown','steering:'+disposition+': '+reason.slice(0,512));});
     if(active&&!active.busy&&!active.cancel&&!active.controlDepth&&!this.closing&&this.store.receipt(active.turnId!)?.detail==='end_turn')void this.withLock(session,()=>this.drainQueue(session)).catch(()=>{});
     this.intake.workChanged();
@@ -1745,7 +1755,7 @@ export class AmplifierHost {
     if(active.cancel)throw new RpcFault(-32011,'Cancellation already requested',{executed:false});
     this.store.bump(record.uri,'interruption');this.holdQueue(record.chat.resource,'turn-cancelled');active.cancel={action,origin};
     for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();
-    await active.agent.client.cancel({sessionId:active.agent.nativeId!});
+    await this.withAgentUse(active,()=>active.agent.client.cancel({sessionId:active.agent.nativeId!}));
     // The standard cancellation action is emitted only when ACP settles.
   }
   async interruptSession(session:string,input:{commandId:string;turnId:string;clientId:string;origin?:'agent'|'ui'}) {
@@ -1818,9 +1828,9 @@ export class AmplifierHost {
           if(configId==='mode'&&(current.state._meta?.['amplifier.dev/acp'] as Json)?.configOptionsProtocol==='legacy-mode'){
             const modes=(current.state._meta!['amplifier.dev/acp'] as Json).legacyModes;
             if(!modes.availableModes.some((mode:Json)=>mode.id===value))throw new Error('Unknown ACP legacy mode');
-            await active.agent.client.setSessionMode({sessionId:active.agent.nativeId!,modeId:value});
+            await this.withAgentUse(active,()=>active.agent.client.setSessionMode({sessionId:active.agent.nativeId!,modeId:value}));
             this.configState(record.uri,this.legacyModeOptions({...modes,currentModeId:value}));
-          }else{const response=await active.agent.client.setSessionConfigOption({sessionId:active.agent.nativeId!,configId,value});this.configState(record.uri,response.configOptions);}
+          }else{const response=await this.withAgentUse(active,()=>active.agent.client.setSessionConfigOption({sessionId:active.agent.nativeId!,configId,value}));this.configState(record.uri,response.configOptions);}
           this.emit(p.channel,action,origin);return;
         }
         throw new Error(`Action is unsupported: ${action.type}`);
@@ -1861,7 +1871,7 @@ export class AmplifierHost {
     const historyPrefix=special?.operation==='history.revise'?await this.nativeHistory(record,50,undefined,{beforeTurnId:special.args.targetMessageId,expectedRevision:special.args.expectedHistoryRevision}):undefined;
     this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(special.args));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
-    active.busy=true;active.generationId=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
+    this.touchAgent(active);active.busy=true;active.generationId=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
     active.historyRevision=historyPrefix?{args:special!.args,prefix:historyPrefix,confirmed:false}:undefined;
     if(special?.operation==='history.revise')active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};
@@ -1899,7 +1909,7 @@ export class AmplifierHost {
       const active=await this.ensureAgent(source.uri);
       if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.configurationClone?.version!==1)throw new RpcFault(-32601,'Agent does not advertise exact configuration cloning');
       if(active.busy)throw new RpcFault(-32011,'Source must be idle while its configuration is captured');
-      const snapshot=await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'configuration.snapshot',args:{}});
+      const snapshot=await this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'configuration.snapshot',args:{}}));
       if(snapshot.version!==1||snapshot.sourceSessionId!==active.agent.nativeId||snapshot.sourceCwd!==source.workingDirectory||typeof snapshot.configurationHash!=='string'||Buffer.byteLength(JSON.stringify(snapshot))>65536)throw new RpcFault(-32000,'Invalid native configuration snapshot reference');
       if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed while preparing creation');
       this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);
@@ -2140,12 +2150,14 @@ export class AmplifierHost {
       for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
       if(active.historyRevision){const receipt=this.store.receipt(turnId)!;this.store.db.prepare('UPDATE history_edits SET status=? WHERE operation_id=?').run(receipt.status,active.historyRevision.args.operationId);}
       active.historyRevision=undefined;active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;
-      for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;this.touchAgent(active);
+      for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
-      await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
-      let updatesJoined=true;try{await active.updates;}catch{updatesJoined=false;}
-      active.finishing=false;this.intake.workChanged();
+      let updatesJoined=true;
+      try{
+        await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
+        try{await active.updates;}catch{updatesJoined=false;}
+      }finally{this.touchAgent(active);active.finishing=false;this.intake.workChanged();}
       if(updatesJoined&&!active.busy&&this.store.receipt(turnId)?.status==='completed'&&turnId.length<=512)this.acpMetadata(uri,{lastSettledTurnId:turnId});
     }
   }
@@ -2488,7 +2500,7 @@ export class AmplifierHost {
       admitted=true;this.store.finish(input.commandId,'dispatching');
       try {
         let result=native;
-        if(active){active.controlDepth=(active.controlDepth??0)+1;try{result=await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'session.relocate',args:{commandId:input.commandId,target,expectedExecutionRevision:native.executionRevision}});}finally{active.controlDepth--;}}
+        if(active)result=await this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'session.relocate',args:{commandId:input.commandId,target,expectedExecutionRevision:native.executionRevision}}));
         if(result.applied===false){this.store.transaction(()=>{this.store.finish(input.commandId,'failed',String(result.reason??'Native relocation refused'));this.store.db.prepare("UPDATE relocations SET status='rejected' WHERE command_id=?").run(input.commandId);});return {applied:false,executed:false,reason:String(result.reason??'Native relocation refused')};}
         if((!input.reconciles&&result.applied!==true)||result.blocked||result.historyCwd!==latest.workingDirectory||result.executionDirectory!==target||!Number.isSafeInteger(result.executionRevision))throw new Error('Native relocation did not prove the requested committed location');
         if(active){active.retireReason='relocated';await active.agent.retire();this.active.delete(record.uri);}
@@ -2569,8 +2581,7 @@ export class AmplifierHost {
       if((active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.version!==1)throw new RpcFault(-32601,'Native control extension not negotiated');
       if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
       if(['worker.stop','operations.cancel'].includes(operation))this.store.bump(session,'interruption');
-      active.controlDepth=(active.controlDepth??0)+1;
-      try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args,...(options.requireExisting?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})});}finally{active.controlDepth--;this.touchAgent(active);}
+      return this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args,...(options.requireExisting?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}),this.nativeControlIsUse(operation));
     };
     return ['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota','worker.stop','operations.cancel'].includes(operation)?this.withLock(session,execute):execute();
       });

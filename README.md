@@ -114,6 +114,16 @@ first, then safe selected entries, using real use/settlement LRU in each tier.
 Active work, approvals, unresolved outcomes and Native-owned work remain
 protected. If no safe slot exists, new startup is refused.
 
+Grace and use order renew at actual request dispatch and settlement, including
+standard/legacy configuration, clone snapshots, cancellation, steering and
+refused relocation. Startup renews after its initialization projections; turn
+settlement renews after the final catalog projection and update join. Validation
+failures, subscriptions, pings and known Native inspection/login-status polls
+do not renew use. Snapshot controls persist state and count as use; generic
+Native controls exclude exact known read contracts rather than guessed suffixes.
+Steering acceptance timeouts retain their unknown receipt and protect the
+underlying request until it settles, without replaying the input.
+
 Host requests connection-scoped lifetime ownership at ACP initialization. Only
 an exact negotiated acknowledgement suppresses Native's independent idle timer.
 Generic or unacknowledged peers keep their own lifetime behavior; retaining the
