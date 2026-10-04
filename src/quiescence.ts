@@ -65,7 +65,7 @@ export interface QuiescenceConfig {
  onMayBeIdle?:()=>void;
  timeoutMs?:number;
 }
-export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;admissionStage?:'participants'|'native-retirement'|'held';}
+export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;admissionStage?:'participants'|'native-retirement'|'owner-exclusion'|'held';}
 export interface WorkCounts {counts:Record<string,number>;gaps:string[];}
 export class QuiescenceError extends Error {
  readonly code=-32014;
@@ -86,7 +86,7 @@ export class QuiescenceGate {
  private changing=false;
  // A timeout is not cancellation: late owner work must settle before an abort can be admitted.
  private pending=new Set<Promise<unknown>>();
- constructor(private db:DatabaseSync,private config:QuiescenceConfig|undefined,private requirements:string[],private inspectWork:()=>WorkCounts,private retire:()=>Promise<{ready:boolean;reason?:string;unknown?:boolean}>) {
+ constructor(private db:DatabaseSync,private config:QuiescenceConfig|undefined,private requirements:string[],private inspectWork:()=>WorkCounts,private retire:()=>Promise<{ready:boolean;reason?:string;unknown?:boolean}>,private hasResidents:()=>boolean=()=>false) {
   if(config){
    token(config.instanceId,'launch identity');token(config.dataScope,'data scope');
    if(!Array.isArray(config.requiredOwners)||config.requiredOwners.length>128||!Array.isArray(config.participants)||config.participants.length>128)throw Error('Bounded quiescence owner declarations required');
@@ -166,6 +166,15 @@ export class QuiescenceGate {
   try{
    if(fence.purpose==='service-stop'){const missing=[...new Set([...this.config.requiredOwners,...this.requirements])].filter(id=>this.config!.participants.find(p=>p.id===id)?.serviceStop?.version!==1);if(missing.length)return await this.refuse(fence,'service-stop-coverage-unavailable',{counts:{},gaps:missing});}
    const before=this.work();if(before.gaps.length||Object.values(before.counts).some(n=>n>0))return await this.refuse(fence,'work-or-coverage-unavailable',before);
+   // Resident Native workers hold shared writer gates until their cleanup finishes.
+   // Their atomic retirement must precede external writer exclusion. A later lost
+   // owner acknowledgement is post-retirement and cannot use admissionAbort.
+   const retiredResidents=this.hasResidents();
+   if(retiredResidents){
+    fence.admissionStage='native-retirement';this.save(fence);
+    const native=await this.retire();if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
+    fence.admissionStage='owner-exclusion';this.save(fence);
+   }
    const owners=[...new Set([...this.config.requiredOwners,...this.requirements])];
    for(const ownerId of owners){
     const participant=this.config.participants.find(p=>p.id===ownerId);if(!participant)return await this.refuse(fence,'participant-unavailable:'+ownerId);
@@ -173,8 +182,10 @@ export class QuiescenceGate {
     const lease=await this.deadline(participant.acquire(fence).then(lease=>{if(lease){if(lease.ownerId!==ownerId||lease.fenceId!==fence.fenceId||typeof lease.release!=='function')throw Error('Participant lease is not bound to this fence');this.leases.set(ownerId,lease);}return lease;}));
     if(!lease){fence.owners.pop();this.save(fence);return await this.refuse(fence,'owner-busy:'+ownerId);}
    }
-   fence.admissionStage='native-retirement';this.save(fence);
-   const native=await this.retire();if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
+   if(!retiredResidents){
+    fence.admissionStage='native-retirement';this.save(fence);
+    const native=await this.retire();if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
+   }
    const after=this.work();if(after.gaps.length||Object.values(after.counts).some(n=>n>0))return await this.refuse(fence,'work-changed-during-quiescence',after);
    fence.phase='held';fence.admissionStage='held';fence.observedAt=Date.now();this.save(fence);
    const result={admitted:true,...(fence.purpose==='service-stop'?{intakeClosed:true}:{}),fenceId:fence.fenceId,commandId:fence.commandId,evidence:{activeWork:0,intakeClosed:true,instanceId:fence.instanceId,dataScope:fence.dataScope,observedAt:fence.observedAt}};this.result(fence.commandId,this.bindResult(fence,result));return this.bindResult(fence,result);

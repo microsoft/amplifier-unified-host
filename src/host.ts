@@ -172,7 +172,7 @@ export class AmplifierHost {
     }
     const coverage=config.quiescence?.coverage;
     const requirements=[...new Set(Object.entries(config.capabilities?.manifest.actions??{}).filter(([name])=>!config.capabilities?.quiescenceAccess?.[name]).map(([,action])=>coverage?.capabilities?.[action.topic]??'uncovered-capability:'+action.topic)),...(config.resourceProviders??[]).filter(provider=>provider.write).map(provider=>coverage?.resources?.[provider.scheme]??'uncovered-resource:'+provider.scheme),...(config.nativeHostRequest||config.nativeEvent?(coverage?.nativeHostOwners?.length?coverage.nativeHostOwners:[coverage?.nativeHost??'uncovered-native-host']):[])];
-    this.intake=new QuiescenceGate(this.store.db,config.quiescence,requirements,()=>this.quiescenceWork(),()=>this.quiesceAgents());
+    this.intake=new QuiescenceGate(this.store.db,config.quiescence,requirements,()=>this.quiescenceWork(),()=>this.quiesceAgents(),()=>this.active.size>0);
     if(config.conversationPresentation){
       const catalog=config.catalog!;
       this.presentation=new ConversationPresentation(this.store.db,{
