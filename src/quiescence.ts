@@ -30,6 +30,12 @@ export interface ServiceStopReleaseResult {
 }
 export type ServiceStopReceipt=ServiceStopAdmission|ServiceStopReleaseResult;
 export interface QuiescenceProof {verified:true;fenceId:string;commandId:string;outcome:'ready'|'unchanged';instanceId:string;dataScope:string;receiptId:string;}
+export interface AdmissionAbortBinding {commandId:string;fenceId:string;instanceId:string;dataScope:string;}
+export interface AdmissionAbortRequest extends AdmissionAbortBinding {evidence?:unknown;}
+export interface AdmissionAbortProof extends AdmissionAbortBinding {kind:'distribution-admission-abort';verified:true;purpose:'distribution-update';receiptId:string;}
+export interface AdmissionAbortOwnerReceipt extends AdmissionAbortBinding {ownerId:string;status:'released'|'not-acquired';receiptId:string;}
+export interface HostAdmissionAbortReceipt extends AdmissionAbortBinding {schema:'host-admission-abort-v1';status:'aborted';intakeClosed:false;receiptId:string;owners:AdmissionAbortOwnerReceipt[];}
+interface AdmissionAbortAttempt {kind:'admission-abort-v1';requestSignature:string;proofSignature:string;context:QuiescenceFence;proof:AdmissionAbortProof;owners:AdmissionAbortOwnerReceipt[];result?:HostAdmissionAbortReceipt;}
 export interface QuiescenceLease {ownerId:string;fenceId:string;release:(outcome:QuiescenceOutcome,proof?:QuiescenceProof|{kind:'admission-refused'})=>Promise<void>;}
 export interface QuiescenceParticipant {
  id:string;
@@ -41,6 +47,9 @@ export interface QuiescenceParticipant {
  acquire:(context:Readonly<QuiescenceContext>)=>Promise<QuiescenceLease|null>;
  /** Exact persisted owner fence reconciliation after process/supervisor replacement. */
  reconcileRelease?:(context:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';proof:QuiescenceProof})=>Promise<void>;
+ /** Authenticates this owner's original attempted acquisition and settles only that fence.
+  * Absence of a live lease is never proof of not-acquired. Exact retries must return the original receipt. */
+ abortAdmission?:(context:Readonly<QuiescenceContext>&{proof:AdmissionAbortProof})=>Promise<AdmissionAbortOwnerReceipt>;
 }
 export interface QuiescenceConfig {
  instanceId:string;dataScope:string;
@@ -50,11 +59,13 @@ export interface QuiescenceConfig {
  participants:QuiescenceParticipant[];
  /** Reads authenticated supervisor receipts; caller assertions never count as proof. */
  verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';evidence:unknown})=>Promise<QuiescenceProof>;
+ /** Distinct supervisor authority proving pre-retirement admission abort, not a running/release assertion. */
+ verifyAdmissionAbort?:(request:Readonly<QuiescenceContext>&{evidence?:unknown})=>Promise<AdmissionAbortProof>;
  serviceLifecycle?:ServiceLifecycleConfig;
  onMayBeIdle?:()=>void;
  timeoutMs?:number;
 }
-export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;}
+export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;admissionStage?:'participants'|'native-retirement'|'held';}
 export interface WorkCounts {counts:Record<string,number>;gaps:string[];}
 export class QuiescenceError extends Error {
  readonly code=-32014;
@@ -73,6 +84,8 @@ export class QuiescenceGate {
  private maintenance=0;
  private leases=new Map<string,QuiescenceLease>();
  private changing=false;
+ // A timeout is not cancellation: late owner work must settle before an abort can be admitted.
+ private pending=new Set<Promise<unknown>>();
  constructor(private db:DatabaseSync,private config:QuiescenceConfig|undefined,private requirements:string[],private inspectWork:()=>WorkCounts,private retire:()=>Promise<{ready:boolean;reason?:string;unknown?:boolean}>) {
   if(config){
    token(config.instanceId,'launch identity');token(config.dataScope,'data scope');
@@ -121,7 +134,7 @@ export class QuiescenceGate {
  workChanged(){this.maybeIdle();}
  private maybeIdle(){if(this.calls||this.continuations||this.fence())return;queueMicrotask(()=>{try{this.config?.onMayBeIdle?.();}catch{/* Advisory wakeup never changes operation truth. */}});}
  private work():WorkCounts{const work=this.inspectWork();return {counts:{...work.counts,admissions:this.calls,continuations:this.continuations},gaps:[...work.gaps,...this.requirements.filter(id=>id.startsWith('uncovered-')||!this.config?.participants.some(p=>p.id===id))]};}
- private async deadline<T>(promise:Promise<T>):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;try{return await Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('quiescence-observation-timeout')),this.config?.timeoutMs??10000);timer.unref();})]);}finally{clearTimeout(timer);}}
+ private async deadline<T>(promise:Promise<T>):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;this.pending.add(promise);void promise.then(()=>this.pending.delete(promise),()=>this.pending.delete(promise));try{return await Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('quiescence-observation-timeout')),this.config?.timeoutMs??10000);timer.unref();})]);}finally{clearTimeout(timer);}}
  private async refuse(fence:QuiescenceFence,reason:string,work?:WorkCounts){
   try{for(const owner of [...fence.owners].reverse()){const lease=this.leases.get(owner);if(!lease)throw Error('Participant acquisition is unconfirmed');await this.deadline(lease.release('unchanged',{kind:'admission-refused'}));this.leases.delete(owner);}const result={admitted:false,executed:false,intakeClosed:false,reason,...(work?{work}:{}),fenceId:fence.fenceId,commandId:fence.commandId};this.clear(fence,result);return this.bindResult(fence,result);}
   catch(error){return this.unknown(fence,String(error));}
@@ -147,7 +160,7 @@ export class QuiescenceGate {
   if(old){if(old.signature!==signature)throw new QuiescenceError('Quiescence identity has different arguments',{executed:false});const prior=JSON.parse(String(old.payload));retry=input.retryRefused===true&&prior.admitted===false&&prior.executed===false&&prior.intakeClosed===false&&!this.fence();if(!retry)return prior;}
   if(this.fence())throw new QuiescenceError('Existing quiescence fence requires authoritative reconciliation',{executed:false,...this.inspect()});
   this.changing=true;
-  const fence:QuiescenceFence={commandId:input.commandId,purpose:input.purpose,fenceId:randomUUID(),instanceId:this.config.instanceId,dataScope:this.config.dataScope,phase:'checking',owners:[],observedAt:Date.now(),...(input.serviceIdentity?{serviceIdentity:structuredClone(input.serviceIdentity)}:{})};
+  const fence:QuiescenceFence={commandId:input.commandId,purpose:input.purpose,fenceId:randomUUID(),instanceId:this.config.instanceId,dataScope:this.config.dataScope,phase:'checking',admissionStage:'participants',owners:[],observedAt:Date.now(),...(input.serviceIdentity?{serviceIdentity:structuredClone(input.serviceIdentity)}:{})};
   // Both command reservation and closed intake become durable before any await.
   this.db.exec('BEGIN IMMEDIATE');try{if(retry){this.db.prepare('INSERT INTO host_quiescence_attempts(command_id,payload) VALUES(?,?)').run(input.commandId,String(old!.payload));this.db.prepare('UPDATE host_quiescence_commands SET payload=? WHERE command_id=?').run('{}',input.commandId);}else this.db.prepare('INSERT INTO host_quiescence_commands VALUES(?,?,?)').run(input.commandId,signature,'{}');this.save(fence);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');this.changing=false;throw error;}
   try{
@@ -160,17 +173,66 @@ export class QuiescenceGate {
     const lease=await this.deadline(participant.acquire(fence).then(lease=>{if(lease){if(lease.ownerId!==ownerId||lease.fenceId!==fence.fenceId||typeof lease.release!=='function')throw Error('Participant lease is not bound to this fence');this.leases.set(ownerId,lease);}return lease;}));
     if(!lease){fence.owners.pop();this.save(fence);return await this.refuse(fence,'owner-busy:'+ownerId);}
    }
+   fence.admissionStage='native-retirement';this.save(fence);
    const native=await this.retire();if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
    const after=this.work();if(after.gaps.length||Object.values(after.counts).some(n=>n>0))return await this.refuse(fence,'work-changed-during-quiescence',after);
-   fence.phase='held';fence.observedAt=Date.now();this.save(fence);
+   fence.phase='held';fence.admissionStage='held';fence.observedAt=Date.now();this.save(fence);
    const result={admitted:true,...(fence.purpose==='service-stop'?{intakeClosed:true}:{}),fenceId:fence.fenceId,commandId:fence.commandId,evidence:{activeWork:0,intakeClosed:true,instanceId:fence.instanceId,dataScope:fence.dataScope,observedAt:fence.observedAt}};this.result(fence.commandId,this.bindResult(fence,result));return this.bindResult(fence,result);
-  }catch(error){return this.unknown(fence,error instanceof Error?error.message:String(error));}finally{this.changing=false;}
+ }catch(error){return this.unknown(fence,error instanceof Error?error.message:String(error));}finally{this.changing=false;}
+ }
+ private abortAttempt(commandId:string):{id:number;value:AdmissionAbortAttempt}|undefined {
+  const row=this.db.prepare('SELECT id,payload FROM host_quiescence_attempts WHERE command_id=? ORDER BY id DESC LIMIT 1').get(commandId);
+  if(!row)return undefined;const value=JSON.parse(String(row.payload));return value.kind==='admission-abort-v1'?{id:Number(row.id),value}:undefined;
+ }
+ /** Passive observation of the original completed abort; never repeats owner settlement. */
+ admissionAbortReceipt(commandId:string):HostAdmissionAbortReceipt|undefined {token(commandId,'command identity');return this.abortAttempt(commandId)?.value.result;}
+ /** This can settle only a provably pre-retirement admission attempt, never an update or maintenance effect. */
+ async abortAdmission(input:AdmissionAbortRequest):Promise<HostAdmissionAbortReceipt> {
+  for(const key of ['commandId','fenceId','instanceId','dataScope'] as const)token(input[key],key);
+  if(Object.keys(input).some(key=>!['commandId','fenceId','instanceId','dataScope','evidence'].includes(key)))throw new QuiescenceError('Unknown admission abort argument',{executed:false});
+  if(Buffer.byteLength(canonical(input.evidence??null))>32768)throw new QuiescenceError('Admission abort evidence exceeds32KiB',{executed:false});
+  if(this.changing||this.pending.size||this.maintenance||this.calls||this.continuations)throw new QuiescenceError('Admission work or settlement is still running',{executed:false});
+  const config=this.config,previous=this.abortAttempt(input.commandId),completed=previous?.value.result;
+  const current=this.fence(),fence=completed?previous!.value.context:current;
+  if(!config?.verifyAdmissionAbort||!fence||fence.purpose!=='distribution-update'||fence.admissionStage!=='participants'||(!completed&&fence.phase!=='unknown')||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||fence.instanceId!==input.instanceId||fence.dataScope!==input.dataScope||config.instanceId!==input.instanceId||config.dataScope!==input.dataScope)throw new QuiescenceError('Exact authenticated pre-retirement admission abort is unavailable',{executed:false});
+  const requestSignature=digest(input);
+  if(previous&&previous.value.requestSignature!==requestSignature)throw new QuiescenceError('Admission abort identity has different arguments',{executed:false});
+  if(!completed&&fence.owners.some(owner=>!config.participants.find(p=>p.id===owner)?.abortAdmission))throw new QuiescenceError('Admission abort owner receipt coverage is unavailable',{executed:false});
+  this.changing=true;
+  try {
+   const proof=await this.deadline(config.verifyAdmissionAbort({...structuredClone(fence),evidence:input.evidence}));
+   const bound=(value:AdmissionAbortBinding)=>value&&value.commandId===input.commandId&&value.fenceId===input.fenceId&&value.instanceId===input.instanceId&&value.dataScope===input.dataScope;
+   if(!bound(proof)||proof.kind!=='distribution-admission-abort'||proof.verified!==true||proof.purpose!=='distribution-update'||Object.keys(proof).sort().join(',')!=='commandId,dataScope,fenceId,instanceId,kind,purpose,receiptId,verified')throw Error('Supervisor admission abort proof does not bind the exact original attempt');
+   token(proof.receiptId,'admission abort proof receipt');
+   const proofSignature=digest(proof);
+   if(previous&&previous.value.proofSignature!==proofSignature)throw Error('Admission abort proof differs from its retained proof');
+   if(completed)return structuredClone(completed);
+   const attempt:AdmissionAbortAttempt=previous?.value??{kind:'admission-abort-v1',requestSignature,proofSignature,context:structuredClone(fence),proof:structuredClone(proof),owners:[]};
+   const id=previous?.id??Number(this.db.prepare('INSERT INTO host_quiescence_attempts(command_id,payload) VALUES(?,?)').run(input.commandId,JSON.stringify(attempt)).lastInsertRowid);
+   const save=()=>this.db.prepare('UPDATE host_quiescence_attempts SET payload=? WHERE id=?').run(JSON.stringify(attempt),id);
+   // The intent/proof is durable before the first owner callback. Resume only missing exact receipts.
+   for(const ownerId of [...fence.owners].reverse()) {
+    if(attempt.owners.some(receipt=>receipt.ownerId===ownerId))continue;
+    const participant=config.participants.find(p=>p.id===ownerId)!;
+    const receipt=await this.deadline(participant.abortAdmission!({...structuredClone(fence),proof:structuredClone(proof)}));
+    if(!bound(receipt)||receipt.ownerId!==ownerId||!['released','not-acquired'].includes(receipt.status)||Object.keys(receipt).sort().join(',')!=='commandId,dataScope,fenceId,instanceId,ownerId,receiptId,status'||(receipt.status==='not-acquired'&&this.leases.has(ownerId)))throw Error('Owner admission abort receipt is missing, uncertain or misbound');
+    token(receipt.receiptId,'owner admission abort receipt');
+    attempt.owners.push(structuredClone(receipt));save();this.leases.delete(ownerId);
+   }
+   const result:HostAdmissionAbortReceipt={schema:'host-admission-abort-v1',commandId:input.commandId,fenceId:input.fenceId,instanceId:input.instanceId,dataScope:input.dataScope,status:'aborted',intakeClosed:false,receiptId:proof.receiptId,owners:structuredClone(attempt.owners)};
+   attempt.result=result;
+   this.db.exec('BEGIN IMMEDIATE');try{save();this.result(fence.commandId,result);this.db.prepare('DELETE FROM host_quiescence_fence WHERE id=1').run();this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+   this.maybeIdle();return result;
+  } catch(error) {
+   if(!completed)this.unknown(fence,error instanceof Error?error.message:String(error));
+   throw new QuiescenceError(completed?'Admission abort retry differs from its retained proof':'Admission abort remains unknown; intake stays closed',{fenceId:fence.fenceId,outcome:'unknown'});
+  } finally {this.changing=false;}
  }
  /** Service release uses a distinct authenticated authority; a generic ready receipt cannot open it. */
  async releaseServiceStop(input:ServiceStopReleaseRequest):Promise<ServiceStopReceipt>{
   token(input.fenceId,'fence identity');token(input.commandId,'service stop identity');
   if(!['resumed','stop-refused','unknown'].includes(input.outcome))throw new QuiescenceError('Unknown service stop outcome',{executed:false});
-  if(this.changing||this.maintenance)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
+  if(this.changing||this.pending.size||this.maintenance)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
   const current=this.fence(),row=this.db.prepare('SELECT * FROM host_service_releases WHERE fence_id=?').get(input.fenceId);
   const exact=current?.fenceId===input.fenceId&&current.commandId===input.commandId;
   const completed=row?.state==='released'&&row.command_id===input.commandId;
@@ -224,8 +286,9 @@ export class QuiescenceGate {
  }
  async release(input:{fenceId:string;commandId:string;outcome:QuiescenceOutcome;evidence?:unknown}) {
   token(input.fenceId,'fence identity');token(input.commandId,'command identity');
-  if(this.changing||this.maintenance)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
+  if(this.changing||this.pending.size||this.maintenance)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
   const fence=this.fence();if(!fence||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId)throw new QuiescenceError('Exact current quiescence fence required',{executed:false});
+  if(this.abortAttempt(input.commandId))throw new QuiescenceError('Original admission abort requires its distinct settlement proof',{executed:false});
   if(fence.purpose==='service-stop')throw new QuiescenceError('Service stop requires its service-specific release proof',{executed:false});
   if(input.outcome==='unknown')return this.unknown(fence,'supervisor-outcome-unknown');
   if(!['ready','unchanged'].includes(input.outcome)||!this.config)throw new QuiescenceError('Authenticated supervisor reconciliation is required',{executed:false});

@@ -205,3 +205,25 @@ effects, grant retry eligibility, replay a queue, or reclassify any previously
 unknown command. The original input ID remains nonreplayable across restart.
 Missing, mismatched, nonterminal or unnegotiated proofs remain unknown. Explicit
 new corrected input is independent of the failed original input.
+
+
+## Additive pre-retirement admission abort
+
+An optional trusted supervisor/participant port can settle an exact unknown
+`distribution-update` admission before native retirement. It does not change
+execution or replacement authority. The Host requires its own durable stage,
+matching current launch/scope, no still-running transition, distinct authenticated
+abort proof, and a conclusive receipt from every attempted owner in reverse order.
+Legacy stage absence and any unknown owner result keep intake closed. Exact retries
+observe original settlement and never repeat admission or update work.
+
+The exported `AdmissionAbortBinding`, `AdmissionAbortRequest`,
+`AdmissionAbortProof`, `AdmissionAbortOwnerReceipt`, and
+`HostAdmissionAbortReceipt` are defined in [quiescence.ts](../../src/quiescence.ts).
+The completed wire receipt is `host-admission-abort-v1`; integration obligations
+and passive reads are documented in the [README](../../README.md#pre-retirement-admission-abort-optional).
+[Focused acceptance](../../test/admission-abort.test.ts) falsifies late-timeout
+races, wrong identity/proof, missing owner coverage, retirement/legacy fences,
+changed retries, and owner-commit/lost-reply recovery through the public Host.
+This is source/API coverage, not authority to hot-patch or reopen an older deployed
+unknown fence.

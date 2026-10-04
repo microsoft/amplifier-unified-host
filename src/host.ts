@@ -4,7 +4,7 @@ import type {ConversationPresentationConfig,PresentationActor,PresentationPrepar
 import {ManagedFilesJournal,type ManagedFilesProtection,type ManagedFilesApply,type ManagedFilesActor} from './managed-files.js';
 import {ManagedAllocations,managedHash,type ManagedSessionCreate,type ManagedLocation} from './managed.js';
 import {Retention,type RetentionProtection,type RetentionPreviewRequest,type RetentionApplyRequest} from './retention.js';
-import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest} from './quiescence.js';
+import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest,type AdmissionAbortRequest} from './quiescence.js';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -2271,6 +2271,8 @@ export class AmplifierHost {
   releaseServiceStop(input:ServiceStopReleaseRequest) {return this.intake.releaseServiceStop(input);}
   inspectQuiescence() {return this.intake.inspect();}
   quiescenceReceipt(commandId:string) {return this.intake.receipt(commandId);}
+  quiescenceAdmissionAbortReceipt(commandId:string) {return this.intake.admissionAbortReceipt(commandId);}
+  abortQuiescenceAdmission(input:AdmissionAbortRequest) {return this.intake.abortAdmission(input);}
   releaseQuiescence(input:{fenceId:string;commandId:string;outcome:QuiescenceOutcome;evidence?:unknown}) {return this.intake.release(input);}
   /** Trusted recovery owner only. This does not permit ordinary nested host mutations. */
   withQuiescenceMaintenance<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T> {return this.intake.maintain(input,work);}

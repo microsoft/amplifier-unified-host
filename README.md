@@ -818,6 +818,46 @@ reconciliation case. Acquisition/release callbacks have a
 bounded `timeoutMs` (25–30,000; default 10,000). The public gate API does not invent
 release version/digest, account readiness, or complete owner coverage.
 
+### Pre-retirement admission abort (optional)
+
+`abortQuiescenceAdmission({commandId,fenceId,instanceId,dataScope,evidence?})`
+settles an original distribution-update admission that is unknown **before native
+retirement**. It does not abort an update effect or claim a running replacement.
+The trusted configuration must supply `verifyAdmissionAbort`, returning the exact
+`AdmissionAbortProof` with `kind:'distribution-admission-abort'`,
+`purpose:'distribution-update'`, `verified:true`, the four request identity fields,
+and a durable `receiptId`. The supervisor is responsible for authenticating the
+original admission-requested command, unchanged owned runtime, and absence of a
+new-instance start. Caller evidence alone grants nothing.
+
+Every attempted participant needs `abortAdmission(contextWithProof)` returning an
+exact `AdmissionAbortOwnerReceipt`: `ownerId`, the four bound identity fields,
+`status:'released'|'not-acquired'`, and `receiptId`. The owner must authenticate its
+original attempted acquisition and return durable idempotent settlement evidence.
+A missing in-memory lease, a generic unchanged proof, or a void release result is
+not such evidence. Retrying a lost owner reply may observe/settle only that exact
+original fence; it must not reacquire or redispatch the update.
+
+The Host journals the request/proof before callbacks, visits attempted owners in
+reverse acquisition order, and persists each conclusive receipt. Any missing,
+uncertain, changed, or misbound result retains closed intake. Completion atomically
+stores `HostAdmissionAbortReceipt` (`schema:'host-admission-abort-v1'`,
+`status:'aborted'`, `intakeClosed:false`, the bound identity, supervisor `receiptId`,
+and ordered `owners`) and removes the fence. `quiescenceAdmissionAbortReceipt(id)`
+is passive and returns only a completed abort, or `undefined`; the original
+`quiescenceReceipt(id)` remains unknown until completion and then returns the same
+abort receipt. An exact completed retry cannot repeat owner effects or start a new
+admission, even with `retryRefused:true`.
+
+New fences persist an admission stage before native retirement begins. Legacy
+fences lacking this stage, retirement/held fences, other purposes, a replacement
+Host instance, and still-running acquisition/release/verification calls refuse
+abort. A timeout does not cancel those calls. Restart preserves the intent and
+owner receipts; reopening with a different launch identity cannot use this abort
+path. This additive API requires actual participant and supervisor support and
+does not authorize repair of older unknown fences. Causal coverage:
+[test/admission-abort.test.ts](test/admission-abort.test.ts).
+
 ### Persistent service stop and explicit resume
 
 Service lifecycle is optional trusted composition, distinct from distribution
