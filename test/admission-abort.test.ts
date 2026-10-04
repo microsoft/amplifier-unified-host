@@ -106,3 +106,35 @@ test('public Host recovers a durable participant abort receipt after owner commi
   await host.close();host=await createHost(settings);assert.deepEqual(host.quiescenceAdmissionAbortReceipt(input.commandId),completed);assert.deepEqual(await host.abortQuiescenceAdmission(input),completed);assert.equal(effects,1);
  }finally{await host.close();db.close();await rm(directory,{recursive:true,force:true});}
 });
+
+test('strict abort callbacks receive only canonical context while durable full fence survives lost reply and restart',async()=>{
+ const contextKeys=['commandId','dataScope','fenceId','instanceId','purpose'];
+ let acquired=0,settled=0,reads=0,lose=true;const durable=new Map<string,AdmissionAbortOwnerReceipt>();
+ const p=owner('strict',{acquire:async()=>{acquired++;throw Error('Acknowledgement lost after ownership');},abortAdmission:async c=>{
+  assert.deepEqual(Object.keys(c).sort(),[...contextKeys,'proof'].sort());assert.equal(c.purpose,'distribution-update');assert.deepEqual(c.proof,proof(c));
+  const old=durable.get(c.fenceId);if(old){reads++;return old;}
+  const result=receipt('strict',c);durable.set(c.fenceId,result);settled++;if(lose){lose=false;throw Error('Lost exact abort receipt after effect');}return result;
+ }});
+ const f=await fixture([p],{verifyAdmissionAbort:async c=>{assert.deepEqual(Object.keys(c).sort(),[...contextKeys,'evidence'].sort());return proof(c);}});
+ try{
+  const input=await failAdmission(f),original=f.gate.inspect().fence!;assert.equal(original.phase,'unknown');assert.equal(original.admissionStage,'participants');assert.deepEqual(original.owners,['strict']);assert.equal(typeof original.observedAt,'number');
+  await assert.rejects(f.gate.abortAdmission(input),/remains unknown/);assert.equal(f.gate.inspect().intakeClosed,true);
+  const attempt=JSON.parse(String(f.db.prepare('SELECT payload FROM host_quiescence_attempts ORDER BY id DESC LIMIT 1').get()!.payload));assert.deepEqual(attempt.context,original);assert.deepEqual(attempt.proof,proof(original));assert.equal(typeof attempt.proofSignature,'string');
+  f.restart();const result=await f.gate.abortAdmission(input);assert.equal(result.status,'aborted');assert.equal(acquired,1);assert.equal(settled,1);assert.equal(reads,1);assert.equal(f.retired,0);
+  f.restart();assert.deepEqual(await f.gate.abortAdmission(input),result);assert.equal(reads,1);
+  const newer=await failAdmission(f,'new-original-update');const held=f.gate.inspect().fence!;assert.deepEqual(await f.gate.abortAdmission(input),result);assert.deepEqual(f.gate.inspect().fence,held);assert.notEqual(newer.fenceId,input.fenceId);
+  f.configuration.verifyAdmissionAbort=async c=>({...proof(c),receiptId:'changed-proof'});await assert.rejects(f.gate.abortAdmission(input),/retained proof/);assert.deepEqual(f.gate.inspect().fence,held);
+ }finally{await f.close();}
+});
+
+test('strict abort callback refusal retains full fence and only missing original receipts resume',async()=>{
+ const order:string[]=[];let refuse=true;
+ const strict=(id:string)=>owner(id,{acquire:async c=>{if(id==='second')throw Error('Lost acquisition');return {ownerId:id,fenceId:c.fenceId,release:async()=>{}};},abortAdmission:async c=>{
+  assert.deepEqual(Object.keys(c).sort(),['commandId','dataScope','fenceId','instanceId','proof','purpose']);order.push(id);if(id==='first'&&refuse)throw Error('Strict owner work remains active');return receipt(id,c);
+ }});
+ const f=await fixture([strict('first'),strict('second')]);try{
+  const input=await failAdmission(f);await assert.rejects(f.gate.abortAdmission(input),/remains unknown/);assert.deepEqual(order,['second','first']);const retained=f.gate.inspect().fence!;assert.equal(retained.admissionStage,'participants');assert.deepEqual(retained.owners,['first','second']);assert.equal(retained.phase,'unknown');
+  const attempt=JSON.parse(String(f.db.prepare('SELECT payload FROM host_quiescence_attempts ORDER BY id DESC LIMIT 1').get()!.payload));assert.deepEqual(attempt.owners.map((r:any)=>r.ownerId),['second']);assert.deepEqual(attempt.context.owners,['first','second']);
+  refuse=false;f.restart();await f.gate.abortAdmission(input);assert.deepEqual(order,['second','first','first']);assert.equal(f.retired,0);
+ }finally{await f.close();}
+});
