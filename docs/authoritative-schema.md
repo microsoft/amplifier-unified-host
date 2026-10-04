@@ -25,7 +25,11 @@ crash: closing a writable preflight connection could checkpoint and alter a
 retained WAL even when validation failed. Owned-file refusal leaves main/WAL
 bytes unchanged; SHM is derived coordination state and is not included in that
 byte-equality claim. The separate OS lifetime lease is still acquired normally.
-Shared-connection initializers validate again before their DDL.
+Shared-connection initializers validate again before their DDL. Admission reads
+only schema metadata for the fixed owned table names and their columns. It does
+not scan, hash or copy production database contents, add a persistent mirror, or
+run during ordinary incremental updates. Whole-file hashes are test-only checks
+on small owned fault fixtures.
 
 `PRAGMA user_version` stores schema-admission version `0x41480100` plus fixed
 namespace bits (Store 1, quiescence 2, managed-files 4, retention 8, presentation

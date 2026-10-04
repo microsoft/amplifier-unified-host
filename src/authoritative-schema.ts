@@ -60,6 +60,7 @@ const tables = {
 } satisfies Record<string,Tables>;
 type Owner=keyof typeof tables;
 const owners=Object.keys(tables) as Owner[];
+const ownedTables=owners.flatMap(owner=>Object.keys(tables[owner]));
 // AH schema admission v1. Low six bits record initialized namespaces, including
 // optional profiles. The header survives loss of an entire component's tables.
 const marker=0x41480100, mask=0x3f;
@@ -95,7 +96,7 @@ const fail=(detail:string):never=>{throw new AuthoritativeSchemaError(detail);};
 function inspect(db:DatabaseSync){
  const version=Number(db.prepare('PRAGMA user_version').get()!.user_version);
  if(version!==0&&((version&~mask)!==marker||(version&mask)===0))fail('unsupported schema version');
- const objects=new Map(db.prepare("SELECT name,type FROM sqlite_schema WHERE type IN ('table','view')").all().map(row=>[String(row.name),String(row.type)]));
+ const objects=new Map(db.prepare(`SELECT name,type FROM sqlite_schema WHERE type IN ('table','view') AND name IN (${ownedTables.map(()=>'?').join(',')})`).all(...ownedTables).map(row=>[String(row.name),String(row.type)]));
  let presentBits=version===0?0:version&mask;
  for(const owner of owners){
   const spec:Tables=tables[owner],expected=Object.keys(spec),present=expected.filter(name=>objects.has(name)),marked=!!(presentBits&bits(owner));
