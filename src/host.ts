@@ -493,6 +493,7 @@ export class AmplifierHost {
         if(result.nextCursor&&(!result.turnGroups.length||result.nextCursor===next))throw new RpcFault(-32013,'Native history cursor did not advance');
         revision=result.revision;diagnostics.push(...(result.diagnostics??[]));const page:Turn[]=[];
         for(const group of result.turnGroups) {
+          for(const update of group.updates as Json[])if(update._meta?.['amplifier.dev/history']!==undefined)update._meta={...update._meta,'amplifier.dev/history':this.nativeMessageHistory(record,update._meta['amplifier.dev/history'])};
           const inputs=(group.updates as Json[]).filter(update=>update.sessionUpdate==='user_message_chunk').map(update=>update.content);
           const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
           const inputHistory=(group.updates as Json[]).find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
@@ -1111,7 +1112,8 @@ export class AmplifierHost {
           // live host remains authority for admission outcome and input provenance.
           const responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
           const boundary=canonical.message._meta?.['amplifier.dev/history'] as Json|undefined;
-          this.store.saveTurn(record.chat.resource,{...live,responseParts,message:{...live.message,_meta:{...live.message._meta,'amplifier.dev/history':{...(live.message._meta?.['amplifier.dev/history'] as Json),messageId:boundary?.messageId,turnId:canonical.id,boundaryRevision:page.revision}}}});refreshedTurns++;
+          const {messageReference:_oldReference,replyTo:_oldQuote,...liveBoundary}=(live.message._meta?.['amplifier.dev/history'] as Json)??{};
+          this.store.saveTurn(record.chat.resource,{...live,responseParts,message:{...live.message,_meta:{...live.message._meta,'amplifier.dev/history':{...liveBoundary,messageId:boundary?.messageId,turnId:canonical.id,boundaryRevision:page.revision,...(boundary?.messageReference?{messageReference:boundary.messageReference}:{}),...(boundary?.replyTo?{replyTo:boundary.replyTo}:{})}}}});refreshedTurns++;
         }
         record.chat._meta={...record.chat._meta,'amplifier.dev/history':{source:'native',available:true,revision:page.revision,diagnostics:page.diagnostics}};this.store.save(record);
       });
@@ -1743,6 +1745,11 @@ export class AmplifierHost {
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
+    const reply=this.messageReply(action.message);
+    if(reply){
+      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.messageInteractions;
+      if(special||active.agent.engine.messagePrincipal===undefined||native?.version!==1||capability?.version!==1||capability.quoteMeta!=='amplifier.dev/messageReply'||!record.nativeSessionId||active.agent.nativeId!==record.nativeSessionId)throw new RpcFault(-32601,'Configured engine does not support quoted message inputs',{executed:false,replayed:false});
+    }
     if(special){
       const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':special.operation==='question.submit'?'questionTurns':special.operation==='history.revise'?'historyEdits':'observationTurns'];
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
@@ -1929,7 +1936,33 @@ export class AmplifierHost {
     const observer={session:record.uri,chat:record.chat.resource,queue:[] as ActionEnvelope[],bytes:0,running:false,closed:false,listener,onError};if(this.presentationSelections.has(record.uri))await this.withLock(record.uri,async()=>{this.observers.add(observer);});else this.observers.add(observer);
     return ()=>{observer.closed=true;observer.queue=[];this.observers.delete(observer);};
   }
+  /** Only bounded native locators and frozen quotes cross into selectable history metadata. */
+  private nativeMessageHistory(record:SessionRecord,value:Json|undefined):Json|undefined {
+    if(value===undefined)return;
+    const fail=()=>{throw new RpcFault(-32000,'Native message quote metadata is invalid or exceeds its bound');};
+    if(!value||typeof value!=='object'||Array.isArray(value)||Buffer.byteLength(JSON.stringify(value))>32768)return fail();
+    const result={...value};delete result.messageReference;delete result.replyTo;
+    if(value.messageReference!==undefined&&!value.historicalOnly){
+      const locator=value.messageReference;if(!locator||typeof locator!=='object'||Array.isArray(locator)||locator.sessionId!==record.nativeSessionId||locator.messageId!==value.messageId||typeof locator.sourceDigest!=='string')return fail();
+      const {sessionId,...reference}=locator;
+      try{result.messageReference={sessionId,...this.messageReply({_meta:{'amplifier.dev/messageReply':reference}})};}catch{return fail();}
+    }
+    if(value.replyTo!==undefined){
+      const quote=value.replyTo,token=(item:unknown)=>typeof item==='string'&&item.length>0&&[...item].length<=200&&!/[\x00-\x1f]/.test(item),hex=(item:unknown)=>typeof item==='string'&&/^[a-f0-9]{64}$/.test(item);
+      if(!quote||typeof quote!=='object'||Array.isArray(quote)||Object.keys(quote).sort().join(',')!=='excerpt,historyEpoch,id,inputId,messageId,role,sessionId,sourceDigest,truncated'||!hex(quote.id)||!token(quote.sessionId)||!token(quote.messageId)||!['user','assistant'].includes(quote.role)||!hex(quote.sourceDigest)||(quote.historyEpoch!==null&&!token(quote.historyEpoch))||!token(quote.inputId)||typeof quote.excerpt!=='string'||[...quote.excerpt].length>4000||typeof quote.truncated!=='boolean')return fail();
+      result.replyTo=structuredClone(quote);
+    }
+    return result;
+  }
+  /** Browser references locate native public text; they never supply quote or actor authority. */
+  private messageReply(message:Pick<Message,'_meta'>):Json|undefined {
+    const value=message._meta?.['amplifier.dev/messageReply'] as Json|undefined;if(value===undefined)return;
+    const validToken=(item:unknown)=>typeof item==='string'&&item.length>0&&[...item].length<=200&&!/[\x00-\x1f]/.test(item);
+    if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['messageId','position','historyEpoch','sourceDigest'].includes(key))||!['messageId','position','historyEpoch'].every(key=>Object.hasOwn(value,key))||!validToken(value.messageId)||!Number.isSafeInteger(value.position)||Number(value.position)<0||(value.historyEpoch!==null&&!validToken(value.historyEpoch))||(Object.hasOwn(value,'sourceDigest')&&(typeof value.sourceDigest!=='string'||!/[a-f0-9]{64}/.test(value.sourceDigest)||value.sourceDigest.length!==64))||Buffer.byteLength(JSON.stringify(value))>2048)throw new RpcFault(-32602,'Exact bounded native message reply reference required',{executed:false,replayed:false});
+    return structuredClone(value);
+  }
   private async prompt(message:Message,record:SessionRecord,resolveReferences=true):Promise<ContentBlock[]> {
+    this.messageReply(message);
     if(message.model||message.agent)throw new Error('Per-message model/custom-agent selection is not advertised; use session configuration');
     const blocks:ContentBlock[]=[{type:'text',text:message.text}];
     if((message.attachments?.length??0)>16)throw new RpcFault(-32602,'At most sixteen attachments per input');
@@ -1962,7 +1995,8 @@ export class AmplifierHost {
     const message=(active.pendingTurn?.action.message??this.getRecord(uri)!.chat.activeTurn!.message),meta=message._meta as Json|undefined;
     const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':special?.operation==='history.revise'?'history-edit':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
-      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},...(special.operation==='observation.submit'?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{})}});
+      const reply=this.messageReply(message);
+      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},...(special.operation==='observation.submit'?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{}),...(reply?{'amplifier.dev/messageReply':{...reply,sessionId:this.getRecord(uri)!.nativeSessionId}}:{})}});
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
         await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
@@ -1999,7 +2033,9 @@ export class AmplifierHost {
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
       await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
+      let updatesJoined=true;try{await active.updates;}catch{updatesJoined=false;}
       active.finishing=false;this.intake.workChanged();
+      if(updatesJoined&&!active.busy&&this.store.receipt(turnId)?.status==='completed'&&turnId.length<=512)this.acpMetadata(uri,{lastSettledTurnId:turnId});
     }
   }
   private legacyModeOptions(modes?:Json):any[] {return modes?.availableModes?[{id:'mode',name:'Mode',type:'select',currentValue:modes.currentModeId,options:modes.availableModes.map((mode:Json)=>({value:mode.id,name:mode.name,description:mode.description}))}]:[];}

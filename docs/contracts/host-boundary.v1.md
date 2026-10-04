@@ -142,3 +142,35 @@ receipts and record new source/package/runtime adoption separately.
 [cb]: https://github.com/microsoft/amplifier-unified/blob/main/contracts/component-boundaries.v1.md
 [ap]: https://github.com/microsoft/amplifier-unified/blob/main/contracts/agent-protocol.v1.md
 [ma]: https://github.com/microsoft/amplifier-unified/blob/main/contracts/maintenance.v1.md
+
+
+## Trusted message quote forwarding
+
+The optional server-only engine principal is asserted exactly at
+`initialize.params.clientCapabilities._meta['amplifier.dev/messagePrincipal']`
+with `{version:1,account}`, alongside the native v1 negotiation. It comes from
+trusted composition, never a browser body, client identity, per-action actor or
+path. Ordinary quoted inputs require the actual peer's messageInteractions v1
+quoteMeta grant. The host validates the bounded exact reference and binds its
+native session identity at prompt dispatch, preserving the original input command.
+Native authority freezes canonical public text and validates stale epochs/digests.
+Unknown quoted deliveries are retained without replay; unsupported queued inputs
+retain their drafts and identities. Local selection and passive reaction authority
+are outside this forwarding seam. Acceptance: [protocol regressions](../../test/message-reply.test.ts)
+and [installed full-native quoted execution](../../test/message-reply.integration.test.ts).
+
+
+The existing initialized ACP capability projection is the quote availability
+marker. Bounded selected history reconstruction validates canonical locator and
+frozen quote metadata before copying it into user/assistant overlays, removes
+obsolete or historical-only selectable references, and preserves original host
+receipts and admission provenance. A completed turn does not trigger a host-side
+eager whole-history scan; a client requests the bounded selected refresh.
+
+
+The post-settlement selected-chat refresh trigger is the new
+`session/metaChanged` value at ACP `lastSettledTurnId`, after joined updates and
+idle finishing cleanup with a completed original receipt. It is advisory, bounded,
+and has no execution/history-read effect. Clients process each new value once and
+defer while another turn is busy. Protocol tests cover the early turnComplete
+race and queued next input.

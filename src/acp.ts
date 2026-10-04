@@ -5,7 +5,7 @@ import { dirname, resolve, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ClientSideConnection, RequestError, ndJsonStream, type InitializeResponse, type Client, type SessionNotification, type RequestPermissionRequest, type RequestPermissionResponse } from '@agentclientprotocol/sdk';
 
-export interface EngineConfig { id: string; label: string; command: string; args?: string[]; env?: Record<string,string>; }
+export interface EngineConfig { id: string; label: string; command: string; args?: string[]; env?: Record<string,string>; /** Server-only authenticated account assertion for native message adjuncts. */ messagePrincipal?:string; }
 export interface AgentHandlers {
   update(params: SessionNotification): Promise<void>;
   permission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
@@ -37,6 +37,7 @@ export class AcpProcess {
   private retirement?:Promise<void>;
   private stderr = '';
   constructor(readonly engine: EngineConfig, readonly cwd: string, readonly handlers: AgentHandlers) {
+    if(engine.messagePrincipal!==undefined&&(typeof engine.messagePrincipal!=='string'||!engine.messagePrincipal.trim()||[...engine.messagePrincipal].length>200||/[\x00-\x1f]/.test(engine.messagePrincipal)))throw Error('Server message principal must be a bounded nonempty account string');
     this.process = spawn(engine.command, engine.args ?? [], {cwd, env: {...process.env,...engine.env}, stdio:'pipe'});
     this.process.stderr.on('data', data => {this.stderr=(this.stderr+data.toString()).slice(-8192);});
     let lineBytes = 0;
@@ -116,7 +117,7 @@ export class AcpProcess {
     return canonical;
   }
   async initialize() {
-    this.initialized=await this.client.initialize({protocolVersion:1,clientInfo:{name:'amplifier-unified-host',version:'0.1.0'},clientCapabilities:{fs:{readTextFile:true,writeTextFile:true},terminal:true,_meta:{'amplifier.dev/native':{version:1},...(this.handlers.hostRequest?{'amplifier.dev/host':{...this.handlers.hostCapabilities,version:1}}:{})}}});
+    this.initialized=await this.client.initialize({protocolVersion:1,clientInfo:{name:'amplifier-unified-host',version:'0.1.0'},clientCapabilities:{fs:{readTextFile:true,writeTextFile:true},terminal:true,_meta:{'amplifier.dev/native':{version:1},...(this.engine.messagePrincipal!==undefined?{'amplifier.dev/messagePrincipal':{version:1,account:this.engine.messagePrincipal}}:{}),...(this.handlers.hostRequest?{'amplifier.dev/host':{...this.handlers.hostCapabilities,version:1}}:{})}}});
     if(this.initialized.protocolVersion!==1)throw new Error('Agent did not negotiate stable ACP version 1');
     return this.initialized;
   }

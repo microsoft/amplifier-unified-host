@@ -1243,3 +1243,50 @@ maintenance dependency or client-asserted authority. Exact DTOs, limits,
 catalog reconstruction obligations and remaining recovery boundaries are in
 [conversation-presentation.v1](docs/contracts/conversation-presentation.v1.md).
 The feature is unavailable without the configured indexed catalog projection. Removing that configuration cannot bypass retained authority.
+
+
+### Quoted ordinary inputs
+
+A trusted server composition may set `EngineConfig.messagePrincipal` to its
+verified account string (1–200 characters, no control characters). The host
+asserts it once at ACP initialize
+`params.clientCapabilities._meta['amplifier.dev/messagePrincipal'] = {version:1,account}`,
+alongside the native v1 grant. Browser account fields, `clientId`, and per-message
+actor metadata never supply that principal.
+
+An ordinary AHP input may carry
+`message._meta['amplifier.dev/messageReply'] = {messageId,position,historyEpoch,sourceDigest?}`.
+The exact reference is bounded to 2048 bytes: message/epoch tokens at most 200
+characters, a nonnegative safe integer position, a nullable epoch, and an optional
+64-character lowercase public-text SHA256 digest. Extra excerpts, paths, actors,
+and session selectors refuse before prompt admission. The configured peer must
+advertise native v1 and `messageInteractions:{version:1,quoteMeta:'amplifier.dev/messageReply'}`.
+Unnegotiated queued inputs stay held with their original draft and identity.
+
+The host forwards that reference to ordinary ACP prompt metadata, supplies
+`sessionId` from its retained native mapping, and keeps the original
+`amplifier.dev/command.commandId` equal to the turn identity. Native authority
+resolves the canonical public text, freezes its bounded quote, and decides stale
+reference or history-epoch validity. The host does not resolve excerpts or add a
+selection RPC. A lost quoted input keeps its original unknown receipt and is not
+retried. Reply selection/clear and passive reactions remain with their respective
+client/native owners.
+
+
+Actual quote availability is retained at the existing session metadata path
+`_meta['amplifier.dev/acp'].capabilities._meta['amplifier.dev/native'].messageInteractions`.
+After a settled live turn, a client may request a bounded selected history refresh
+and a fresh snapshot. The refresh preserves validated canonical
+`amplifier.dev/history.messageReference` and `replyTo` on user and assistant
+metadata, without replacing host admission provenance. Historical-only rows gain
+no selectable locator; missing canonical locators remove obsolete user overlays.
+No whole-history eager read or quote text supplied by a client is introduced.
+
+
+`session/metaChanged` publishes
+`_meta['amplifier.dev/acp'].lastSettledTurnId` only after joined update/cleanup work
+has finished and the agent is idle with a completed original receipt. Clients
+coalesce one bounded refresh for each new marker value; an unchanged value in a
+later full metadata update is not a new settlement. A queued next turn can defer
+the marker until that turn settles. The prompt path performs no eager history
+read or retry for this notification.
