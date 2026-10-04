@@ -7,7 +7,7 @@ import {fileURLToPath,pathToFileURL} from 'node:url';
 import {randomUUID} from 'node:crypto';
 import {AhpClient} from '@microsoft/agent-host-protocol/client';
 import {WebSocketTransport} from '@microsoft/agent-host-protocol/ws';
-import {createHost} from '../src/host.js';
+const {createHost}=await import(process.env.CACHE_TEST_HOST_MODULE??'../src/host.js');
 import {AcpProcess} from '../src/acp.js';
 const ack={version:1,owner:'host',lifetime:'connection',standaloneIdleSeconds:60};
 async function setup(options:any={}) {
@@ -132,4 +132,31 @@ test('viewer interest arriving while an earlier Native candidate refuses is rech
   const agent=f.active(one.session).agent,retire=agent.retireIfIdle.bind(agent);agent.retireIfIdle=async(...args:any[])=>{await client.subscribe(two.chat);return retire(...args);};
   await f.create(client);assert.ok(f.active(one.session));assert.ok(f.active(two.session));assert.equal(f.active(three.session),undefined);
  }finally{await f.cleanup();}
+});
+
+test('long native control settlement renews grace and LRU for both existing and warming control paths',async()=>{
+ for(const requireExisting of [true,false]){
+  const f=await setup({maxActiveAgents:2});let release!:()=>void;
+  try{
+   const client=await f.connect(),one=await f.create(client),two=await f.create(client),entry=f.active(one.session),agent=entry.agent;
+   let entered!:()=>void;const started=new Promise<void>(r=>entered=r),done=new Promise<void>(r=>release=r),rpc=agent.client.extMethod.bind(agent.client);
+   agent.client.extMethod=async(method:string,params:any)=>{if(method==='_amplifier/native'&&params.operation==='configuration.snapshot'){entered();await done;}return rpc(method,params);};
+   const control=requireExisting?f.host.nativeControlExisting(one.session,'configuration.snapshot',{}):f.host.nativeControl(one.session,'configuration.snapshot',{});
+   await started;const before=entry.useOrder;entry.lastUsed=performance.now()-900001;entry.uninterestedSince=entry.lastUsed;
+   await f.h.retireIdle();assert.equal(f.active(one.session),entry);assert.equal(entry.controlDepth,1);
+   await f.use(two.session);release();const result=await control;assert.equal(result.configurationHash,'fixture-native-config');assert.equal(entry.controlDepth,0);assert.ok(entry.useOrder>before);assert.ok(performance.now()-entry.lastUsed<1000);
+   await f.h.retireIdle();assert.equal(f.active(one.session),entry);
+   await f.create(client);assert.equal(f.active(one.session),entry);assert.equal(f.active(two.session),undefined);
+  }finally{release?.();await f.cleanup();}
+ }
+});
+
+test('failed native control settlement also renews grace without manufacturing successful effect',async()=>{
+ const f=await setup();let release!:()=>void;try{
+  const client=await f.connect(),one=await f.create(client),entry=f.active(one.session),before=entry.useOrder;
+  let entered!:()=>void;const started=new Promise<void>(r=>entered=r),done=new Promise<void>(r=>release=r);
+  entry.agent.client.extMethod=async()=>{entered();await done;throw Error('Original control result unknown');};
+  const control=f.host.nativeControlExisting(one.session,'configuration.snapshot',{});await started;entry.lastUsed=performance.now()-900001;entry.uninterestedSince=entry.lastUsed;release();await assert.rejects(control,/Original control result unknown/);
+  assert.equal(entry.controlDepth,0);assert.ok(entry.useOrder>before);assert.ok(performance.now()-entry.lastUsed<1000);await f.h.retireIdle();assert.equal(f.active(one.session),entry);
+ }finally{release?.();await f.cleanup();}
 });

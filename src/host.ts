@@ -2570,7 +2570,7 @@ export class AmplifierHost {
       if(['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota'].includes(operation))this.store.bump(session,'configuration');
       if(['worker.stop','operations.cancel'].includes(operation))this.store.bump(session,'interruption');
       active.controlDepth=(active.controlDepth??0)+1;
-      try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args,...(options.requireExisting?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})});}finally{active.controlDepth--;}
+      try{return await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation,args,...(options.requireExisting?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})});}finally{active.controlDepth--;this.touchAgent(active);}
     };
     return ['configuration.apply','configuration.toggle','bundle.switch','provider.select','provider.reset','mode.set','mode.clear','budget.set','capacity.set','capacity.quota','worker.stop','operations.cancel'].includes(operation)?this.withLock(session,execute):execute();
       });
