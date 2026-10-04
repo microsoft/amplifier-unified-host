@@ -1290,3 +1290,11 @@ coalesce one bounded refresh for each new marker value; an unchanged value in a
 later full metadata update is not a new settlement. A queued next turn can defer
 the marker until that turn settles. The prompt path performs no eager history
 read or retry for this notification.
+
+### Existing authoritative database schema
+
+Startup refuses missing or incompatible authoritative tables before recreating
+state or normalizing interrupted commands. Genuine new stores, documented legacy
+migrations and never-initialized optional owners remain supported. Preserve a
+refused database and its WAL for inspection or exact backup restoration; do not
+clear it to retry. See [schema admission and its limits](docs/authoritative-schema.md).

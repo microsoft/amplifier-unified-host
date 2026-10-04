@@ -1,3 +1,4 @@
+import {initializeAuthority,preflightAuthorityFile} from './authoritative-schema.js';
 import {DatabaseSync} from 'node:sqlite';
 import {createHash} from 'node:crypto';
 import {constants,lstatSync,mkdirSync,realpathSync} from 'node:fs';
@@ -18,9 +19,9 @@ export class ManagedAllocations {
   if(!isAbsolute(root))throw fault('Managed allocation root must be absolute');
   for(let part=root;;part=dirname(part)){try{if(lstatSync(part).isSymbolicLink())throw fault('Managed root cannot traverse symlinks');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}if(dirname(part)===part)break;}
   mkdirSync(root,{recursive:true,mode:0o700});this.root=realpathSync(root);const rootStat=lstatSync(this.root,{bigint:true});this.rootIdentity={dev:String(rootStat.dev),ino:String(rootStat.ino)};for(const name of ['host-owner-lock.sqlite','managed-allocations.sqlite','managed-allocations.sqlite-wal','managed-allocations.sqlite-shm']){try{const item=lstatSync(join(this.root,name));if(!item.isFile()||item.nlink!==1)throw fault('Managed owner ledger is not a private regular file');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}}this.lease=new OwnerLease(this.root);
-  try{this.db=new DatabaseSync(join(this.root,'managed-allocations.sqlite'));this.db.exec(`PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;
+  try{const path=join(this.root,'managed-allocations.sqlite'),existingFile=preflightAuthorityFile(path,'managed');this.db=new DatabaseSync(path);initializeAuthority(this.db,'managed',()=>{this.db.exec(`
    CREATE TABLE IF NOT EXISTS allocations(command_id TEXT PRIMARY KEY,session TEXT UNIQUE NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL,request TEXT NOT NULL,marker TEXT NOT NULL,result TEXT,identity TEXT);
-   UPDATE allocations SET state='unknown' WHERE state IN ('reserved','allocated','dispatching');`);if(!this.db.prepare('PRAGMA table_info(allocations)').all().some(row=>row.name==='copy_source'))this.db.exec('ALTER TABLE allocations ADD COLUMN copy_source TEXT');}catch(error){this.db?.close();this.lease.close();throw error;}
+   UPDATE allocations SET state='unknown' WHERE state IN ('reserved','allocated','dispatching');`);if(!this.db.prepare('PRAGMA table_info(allocations)').all().some(row=>row.name==='copy_source'))this.db.exec('ALTER TABLE allocations ADD COLUMN copy_source TEXT');},{existingFile,configure:'PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;'});}catch(error){this.db?.close();this.lease.close();throw error;}
  }
  validate(input:ManagedSessionCreate){
   if(!input||Object.keys(input).some(k=>!['session','commandId','provider','title','bundle','bundleRevision','selection'].includes(k))||typeof input.session!=='string'||!input.session.startsWith('ahp-session:/')||!uuid.test(input.session.slice(13))||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>200||typeof input.provider!=='string'||!input.provider||input.provider.length>200)throw fault('Exact managed creation identity and configured provider required');

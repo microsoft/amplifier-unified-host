@@ -1,3 +1,4 @@
+import {initializeAuthority} from './authoritative-schema.js';
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
 import type {CatalogRecord} from './host.js';
@@ -12,11 +13,11 @@ function identity(value:unknown){if(typeof value!=='string'||!value||value.lengt
 function sessions(value:unknown,max=200){if(!Array.isArray(value)||value.length>max||value.some(x=>typeof x!=='string'||!/^ahp-session:\/.{1,480}$/.test(x))||new Set(value).size!==value.length)throw fault('Bounded distinct session identities required');return value as string[];}
 /** Bounded disk reviews and per-item outcome journal. Native state never lives here. */
 export class Retention {
- constructor(private db:DatabaseSync,private ports:RetentionPorts){db.exec(`CREATE TABLE IF NOT EXISTS retention_reviews(id TEXT PRIMARY KEY,hash TEXT NOT NULL,expires INTEGER NOT NULL,payload TEXT NOT NULL);CREATE INDEX IF NOT EXISTS retention_reviews_expiry ON retention_reviews(expires);
+ constructor(private db:DatabaseSync,private ports:RetentionPorts){initializeAuthority(db,'retention',()=>{db.exec(`CREATE TABLE IF NOT EXISTS retention_reviews(id TEXT PRIMARY KEY,hash TEXT NOT NULL,expires INTEGER NOT NULL,payload TEXT NOT NULL);CREATE INDEX IF NOT EXISTS retention_reviews_expiry ON retention_reviews(expires);
  CREATE TABLE IF NOT EXISTS retention_items(command_id TEXT PRIMARY KEY,batch_id TEXT NOT NULL,session TEXT NOT NULL,payload TEXT NOT NULL);CREATE INDEX IF NOT EXISTS retention_items_batch ON retention_items(batch_id);
  CREATE TABLE IF NOT EXISTS retention_commands(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,status TEXT NOT NULL,payload TEXT NOT NULL,result TEXT NOT NULL);
  UPDATE retention_commands SET status='unknown' WHERE status='applying';
- UPDATE retention_items SET payload=json_set(payload,'$.status',CASE json_extract(payload,'$.status') WHEN 'dispatching' THEN 'unknown' ELSE 'not-attempted' END) WHERE batch_id IN(SELECT command_id FROM retention_commands WHERE status='unknown') AND json_extract(payload,'$.status') IN('pending','dispatching');`);}
+ UPDATE retention_items SET payload=json_set(payload,'$.status',CASE json_extract(payload,'$.status') WHEN 'dispatching' THEN 'unknown' ELSE 'not-attempted' END) WHERE batch_id IN(SELECT command_id FROM retention_commands WHERE status='unknown') AND json_extract(payload,'$.status') IN('pending','dispatching');`);});}
  async preview(input:RetentionPreviewRequest){
   if(!input||Object.keys(input).some(k=>!['connectionId','modifiedBefore','limit','cursor','workingDirectory','protectSessionIds'].includes(k))||!Number.isFinite(input.modifiedBefore)||input.modifiedBefore<=0||input.modifiedBefore>=Date.now()/1000)throw fault('Explicit past cutoff required');identity(input.connectionId);
   const limit=input.limit??50;if(!Number.isInteger(limit)||limit<1||limit>50)throw fault('Retention pages are limited to50 entries');const protect=sessions(input.protectSessionIds??[]);

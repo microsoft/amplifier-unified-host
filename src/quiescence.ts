@@ -1,3 +1,4 @@
+import {initializeAuthority} from './authoritative-schema.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
@@ -83,9 +84,10 @@ export class QuiescenceGate {
    if(typeof config.verifyRelease!=='function')throw Error('Authenticated quiescence reconciliation required');
    if(config.serviceLifecycle){const service=identity(config.serviceLifecycle.identity);if(service.instanceId!==config.instanceId||service.dataScope!==config.dataScope||typeof config.serviceLifecycle.verifyRelease!=='function')throw Error('Service lifecycle identity must match the trusted running host and data scope');}
   }
-  db.exec("CREATE TABLE IF NOT EXISTS host_quiescence_fence(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_commands(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,command_id TEXT NOT NULL,payload TEXT NOT NULL)");
+  initializeAuthority(db,'quiescence',()=>{db.exec("CREATE TABLE IF NOT EXISTS host_quiescence_fence(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_commands(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,command_id TEXT NOT NULL,payload TEXT NOT NULL)");
   db.exec("CREATE TABLE IF NOT EXISTS host_service_releases(fence_id TEXT PRIMARY KEY,command_id TEXT NOT NULL,request_signature TEXT NOT NULL,proof_signature TEXT NOT NULL,fence TEXT NOT NULL,proof TEXT NOT NULL,state TEXT NOT NULL,result TEXT)");
   const old=this.fence();if(old){old.phase='unknown';old.reason='host-restarted';this.save(old);}
+  });
  }
  private fence():QuiescenceFence|undefined {const row=this.db.prepare('SELECT payload FROM host_quiescence_fence WHERE id=1').get();return row?JSON.parse(String(row.payload)):undefined;}
  private save(fence:QuiescenceFence){this.db.prepare('INSERT INTO host_quiescence_fence VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(JSON.stringify(fence));this.result(fence.commandId,this.bindResult(fence,{admitted:fence.phase==='held',fence:structuredClone(fence),intakeClosed:true}));}
