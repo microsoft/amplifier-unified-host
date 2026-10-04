@@ -120,6 +120,17 @@ retained storage paths before requesting a new scan. Await the new scan's runId
 completing with zero issues, not a previous scan's complete status. Automatic
 scans/hints must not race seeding; later maintenance needs its own ordered owner.
 
+A scan enumerates existing directories; it cannot reobserve a retained home that
+has disappeared. After the scheduler returns, the host pages the captured
+manifest (at most 100 rows per page) and reobserves each exact known storage path
+through the same durable discovery attempt boundary described below. The hint
+must identify that retained URI with no unresolved issues before freshness,
+identity and visibility verification can open listing. Native absence remains a
+derived presence observation, independent of product hiding and native deletion.
+Pathless historical mappings retain their existing identity checks. A known path
+without a hint owner keeps reconstruction unavailable. This adds no filesystem
+inventory, history-body reads, native commands, or public wire fields.
+
 Native `history.persisted` hints and hints buffered during session creation use
 one durable host outbox. It coalesces at most 512 native directory paths, each at
 most 8 KiB. A presentation transaction pauses discovery dispatch synchronously

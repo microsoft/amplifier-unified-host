@@ -132,3 +132,41 @@ test('failed reconstruction blocks selected-family writers across restart until 
   f.ports.reconstructMetadata=reconstruct;assert.equal((await f.host.rebuild({commandId:'exact-reconstruction',expectedRevision:0},actor)).status,'completed');assert.equal(await f.host.discoverFamily('ahp-session:/0000',async()=>{discoveries++;return 'complete';}),'complete');assert.equal(discoveries,1);
  }finally{await f.close();}
 });
+
+for(const unsupported of [false,true])test('retained source observation must succeed before rebuilt readiness'+(unsupported?' without a hint port':''),async()=>{
+ const f=await fixture(2);try{
+  for(const row of f.rows.values())row.storagePath='/native/'+row.nativeSessionId;
+  const original=await f.apply(await f.review());f.clearCatalog();let calls=0;
+  if(!unsupported)f.ports.hint=async(path,context)=>{calls++;assert.ok(context.attemptId);return {uri:'ahp-session:/0000',issues:['Selected source changed']};};
+  const failed=await f.host.rebuild({commandId:'failed-presence',expectedRevision:1},actor);
+  assert.equal(failed.status,'unknown');assert.equal(f.host.inspect().ready,false);assert.equal(f.host.hintDiagnostics().unsettled,false);assert.equal(calls,unsupported?0:1);
+  assert.deepEqual(f.host.effect('reset'),original.effect);
+  f.ports.hint=async path=>({uri:[...f.rows.values()].find(row=>row.storagePath===path).uri,changed:false});
+  assert.equal((await f.host.rebuild({commandId:'reobserved',expectedRevision:1},actor)).status,'completed');assert.deepEqual(f.host.effect('reset'),original.effect);
+ }finally{await f.close();}
+});
+
+test('retained source reobservation pages105 mappings and joins each settled writer before projection',async()=>{
+ const f=await fixture(105);try{
+  for(const row of f.rows.values())row.storagePath='/native/'+row.nativeSessionId;
+  const effect=await f.apply(await f.review());f.clearCatalog();const paths:string[]=[],attempts=new Set<string>();let active=0;
+  f.ports.hint=async(path,context)=>{assert.equal(++active,1);assert.equal(f.host.inspect().ready,false);assert.equal(f.host.hintDiagnostics().unsettled,true);assert.ok(!attempts.has(context.attemptId));attempts.add(context.attemptId);paths.push(path);await Promise.resolve();active--;return {uri:[...f.rows.values()].find(row=>row.storagePath===path).uri,issues:[]};};
+  const repaired=await f.host.rebuild({commandId:'all-known-paths',expectedRevision:1},actor);assert.equal(repaired.status,'completed');assert.equal(paths.length,105);assert.equal(new Set(paths).size,105);assert.equal(f.host.hintDiagnostics().unsettled,false);assert.deepEqual(f.host.effect('reset'),effect.effect);
+ }finally{await f.close();}
+});
+
+test('interrupted retained source reobservation survives restart and refuses new writers until exact settlement',async()=>{
+ const f=await fixture(1),gate=pause();let late:Promise<void>|undefined,finished=false,originalAttempt:string|undefined,hints=0;
+ try{
+  f.rows.get('ahp-session:/0000').storagePath='/native/native-0';const original=await f.apply(await f.review());f.clearCatalog();
+  f.ports.hint=async(_path,context)=>{hints++;originalAttempt=context.attemptId;late=gate.promise.then(()=>{finished=true;});throw Error('Lost response while original source reader can still publish');};
+  const failed=await f.host.rebuild({commandId:'interrupted-presence',expectedRevision:1},actor);assert.equal(failed.status,'unknown');assert.equal(f.host.hintDiagnostics().unsettled,true);f.restart();
+  assert.equal((await f.host.rebuild({commandId:'still-unknown',expectedRevision:1},actor)).status,'unknown');assert.equal(hints,1);
+  // Ports are installed when a host opens; no timeout/restart is settlement evidence.
+  f.ports.settleDiscovery=async attempt=>{assert.equal(attempt.attemptId,originalAttempt);if(!finished)throw Error('Original writer still runs');return {attemptId:attempt.attemptId,evidence:'response-settled',ownerReceipt:'fixture:original-writer-response'};};f.restart();
+  assert.equal((await f.host.rebuild({commandId:'before-original-response',expectedRevision:1},actor)).status,'unknown');assert.equal(hints,1);
+  gate.release();await late;f.ports.hint=async()=>{hints++;return {uri:'ahp-session:/0000',issues:[]};};
+  assert.equal((await f.host.rebuild({commandId:'settled-presence',expectedRevision:1},actor)).status,'completed');assert.equal(hints,2);assert.equal(f.host.hintDiagnostics().unsettled,false);assert.deepEqual(f.host.effect('reset'),original.effect);
+  assert.deepEqual(await f.host.rebuild({commandId:'interrupted-presence',expectedRevision:1},actor),failed);
+ }finally{gate.release();await late;await f.close();}
+});

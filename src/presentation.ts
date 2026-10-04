@@ -230,6 +230,21 @@ export class ConversationPresentation {
    payload.manifestHash=digest.digest('hex');payload.phase='metadata';save();
    const hintBoundary=this.hints.scanBoundary();
    await this.ports.reconstructMetadata?.({commandId:input.commandId,source:state.source!,readMappings:cursor=>this.mappingPage(input.commandId,cursor)});
+   // Present-directory scans cannot rediscover absent retained homes after index loss.
+   // Reobserve only this immutable manifest, under the same durable writer boundary.
+   for(let after=-1;;){
+    const rows=this.db.prepare('SELECT ordinal,metadata FROM presentation_rebuild_rows WHERE command_id=? AND ordinal>? ORDER BY ordinal LIMIT 100').all(input.commandId,after);if(!rows.length)break;
+    for(const row of rows){
+     const record=JSON.parse(String(row.metadata));if(record.storagePath===undefined||record.storagePath===null)continue;
+     if(typeof record.storagePath!=='string'||Buffer.byteLength(record.storagePath)>8192||!this.ports.hint)throw Error('Exact retained source reobservation is unavailable');
+     const attempt={attemptId:randomUUID(),sessionDirectory:record.storagePath};
+     await this.hints.discover(attempt,async()=>{
+      const observed=await this.ports.hint!(record.storagePath,{attemptId:attempt.attemptId}) as Json;
+      if(!observed||observed.uri!==record.uri||observed.issues!==undefined&&(!Array.isArray(observed.issues)||observed.issues.length))throw Object.assign(Error('Retained source reobservation is incomplete'),{catalogDiscoverySettled:true});
+     });
+    }
+    after=Number(rows.at(-1)!.ordinal);
+   }
    if(this.ports.reconstructMetadata)this.hints.scanned(hintBoundary);
    const fresh=await this.ports.catalogFreshness();if(fresh.phase!=='complete'||fresh.issues!==0)throw Error('Metadata discovery is incomplete');
    for(let after=-1;;){const rows=this.db.prepare('SELECT * FROM presentation_rebuild_rows WHERE command_id=? AND ordinal>? ORDER BY ordinal LIMIT 100').all(input.commandId,after);if(!rows.length)break;for(const row of rows){const expected=JSON.parse(String(row.metadata)),current=await this.ports.catalogGet(String(row.session));for(const key of ['uri','engineId','nativeSessionId','workingDirectory'])if(!current||current[key]!==expected[key])throw Error('Metadata reconstruction identity differs');if(expected.storagePath&&current!.storagePath!==expected.storagePath)throw Error('Native home mapping differs');}after=Number(rows.at(-1)!.ordinal);}
