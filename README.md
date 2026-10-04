@@ -753,6 +753,12 @@ stop callbacks before acquiring external writer exclusions. Public intake stays
 closed throughout; cleanup/result continuations gain no general mutation admission.
 The final held receipt follows a fresh work check with every required owner held.
 With no resident, the existing pre-retirement owner acquisition path remains.
+Retirement also uses the configured quiescence observation deadline. If process
+stdio or its callbacks remain open, admission returns an unknown closed fence;
+the deadline never proves process completion. Late close does not promote that
+original admission or authorize another retirement. Exact retries inspect its
+receipt. Settling such a fence requires separately reviewed maintenance recovery;
+Host storage remains open until shutdown callbacks actually finish.
 Configuration includes the actual launch `instanceId`, exact `dataScope`,
 `requiredOwners`, `coverage`, `participants`, and authenticated `verifyRelease`.
 

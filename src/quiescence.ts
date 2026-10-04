@@ -172,7 +172,7 @@ export class QuiescenceGate {
    const retiredResidents=this.hasResidents();
    if(retiredResidents){
     fence.admissionStage='native-retirement';this.save(fence);
-    const native=await this.retire();if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
+    const native=await this.deadline(this.retire());if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
     fence.admissionStage='owner-exclusion';this.save(fence);
    }
    const owners=[...new Set([...this.config.requiredOwners,...this.requirements])];
@@ -184,7 +184,7 @@ export class QuiescenceGate {
    }
    if(!retiredResidents){
     fence.admissionStage='native-retirement';this.save(fence);
-    const native=await this.retire();if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
+    const native=await this.deadline(this.retire());if(!native.ready){if(native.unknown)return this.unknown(fence,native.reason??'native-quiescence-unknown');return await this.refuse(fence,native.reason??'native-owned-work');}
    }
    const after=this.work();if(after.gaps.length||Object.values(after.counts).some(n=>n>0))return await this.refuse(fence,'work-changed-during-quiescence',after);
    fence.phase='held';fence.admissionStage='held';fence.observedAt=Date.now();this.save(fence);
