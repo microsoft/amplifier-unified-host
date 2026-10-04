@@ -174,3 +174,13 @@ idle finishing cleanup with a completed original receipt. It is advisory, bounde
 and has no execution/history-read effect. Clients process each new value once and
 defer while another turn is busy. Protocol tests cover the early turnComplete
 race and queued next input.
+
+### Cold selected message capability projection
+
+A successful selected passive native history read retains its negotiated ACP
+capabilities in the existing session metadata path. This allows canonical reply
+and reaction references in copied or transferred chats to be used before any
+runtime is mounted. It preserves config options, command receipts and settlement
+markers; it does not infer effective bundle/provider configuration, load a
+session, resume a worker or replay an input. Native history remains the owner of
+canonical locators and annotation copying.
