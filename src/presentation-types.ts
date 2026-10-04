@@ -38,12 +38,12 @@ export interface PresentationReadiness {
 export interface PresentationRebuild {commandId:string;expectedRevision:number;}
 /** Private metadata only; never includes native transcript/event bodies. */
 export interface PresentationMappingPage {items:ReadonlyArray<Record<string,unknown>>;count:number;manifestHash:string;nextCursor:string|null;}
-/** Private callback context: a derived hint, never a native execution command. */
-export interface CatalogDiscoveryAttempt {attemptId:string;sessionDirectory:string;}
+/** Private callback context: a derived hint or selected-family writer, never a native execution command. */
+export type CatalogDiscoveryAttempt = {attemptId:string;sessionDirectory:string} | {attemptId:string;method:'reconcileFamily';parentUri:string};
 /** Trusted catalog owner must retain real response/exit evidence for this exact attempt. */
 export interface CatalogDiscoverySettlement {attemptId:string;evidence:'response-settled'|'process-exited';ownerReceipt:string;}
 export interface ConversationPresentationConfig {
- /** Optional recovery for a hint interrupted by host loss or an unclassified adapter failure.
+ /** Optional recovery for discovery interrupted by host loss or an unclassified adapter failure.
   * A new catalog process alone does not prove the old writer stopped. No wire caller supplies this proof. */
  settleDiscovery?:(attempt:CatalogDiscoveryAttempt)=>Promise<CatalogDiscoverySettlement>;
  /** Owns scan/hint scheduling. Seed exact mappings BEFORE explicit complete native discovery. */

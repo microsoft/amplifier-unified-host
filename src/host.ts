@@ -20,7 +20,8 @@ import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
 export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;productHidden?:boolean;storagePath?:string;isArchived?:boolean;location?:ManagedLocation;}
-export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};}
+export interface CatalogFamilyDiscovery {version:1;scope:'selected-native-project-namespaces';phase:'complete'|'refused';issues:string[];maxEntries:number;metadataByteLimit:number;metadataFileLimit:number;indexRevision:string;verificationToken:string;inventoryHash:string;entriesExamined:number;metadataReads:number;metadataBytesAdmitted:number;namespaces:string[];completedAt:string;externalWriterCoverage:false;transcriptBodiesRead:false;nativeOwnershipVerified:false;}
+export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};familyDiscovery?:CatalogFamilyDiscovery;}
 export interface Catalog {
   list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];allowedManagedRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
   projectSessionVisibility?:(params:VisibilityProjectionRequest)=>Promise<VisibilityProjectionReceipt>;
@@ -36,6 +37,8 @@ export interface Catalog {
   setVisibility?(params:{uri:string;nativeSessionId:string;workingDirectory:string;deleted:boolean;commandId:string;evidence:"native-completed-receipt"}):Promise<unknown>;
   retentionCandidates?(params:RetentionPreviewRequest&{allowedWorkspaceRoots:string[]}):Promise<Json>;
   descendants?(params:{parentUri:string;limit:number}):Promise<CatalogFamily>;
+  reconcileFamily?(params:{parentUri:string;limit:number;maxEntries:number}):Promise<CatalogFamily>;
+  verifyFamily?(params:{parentUri:string;verificationToken:string}):Promise<{version:1;scope:string;valid:boolean;parentUri:string;indexRevision?:string;inventoryHash?:string;issues:string[];completedAt:string;externalWriterCoverage:false;nativeOwnershipVerified:false;transcriptBodiesRead:false}>;
   close?():Promise<void>;
 }
 export type MessageUnavailableReason='not-indexed'|'not-user'|'oversized'|'invalid-provenance';
@@ -490,6 +493,7 @@ export class AmplifierHost {
         if(result.nextCursor&&(!result.turnGroups.length||result.nextCursor===next))throw new RpcFault(-32013,'Native history cursor did not advance');
         revision=result.revision;diagnostics.push(...(result.diagnostics??[]));const page:Turn[]=[];
         for(const group of result.turnGroups) {
+          for(const update of group.updates as Json[])if(update._meta?.['amplifier.dev/history']!==undefined)update._meta={...update._meta,'amplifier.dev/history':this.nativeMessageHistory(record,update._meta['amplifier.dev/history'])};
           const inputs=(group.updates as Json[]).filter(update=>update.sessionUpdate==='user_message_chunk').map(update=>update.content);
           const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
           const inputHistory=(group.updates as Json[]).find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
@@ -1108,7 +1112,8 @@ export class AmplifierHost {
           // live host remains authority for admission outcome and input provenance.
           const responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
           const boundary=canonical.message._meta?.['amplifier.dev/history'] as Json|undefined;
-          this.store.saveTurn(record.chat.resource,{...live,responseParts,message:{...live.message,_meta:{...live.message._meta,'amplifier.dev/history':{...(live.message._meta?.['amplifier.dev/history'] as Json),messageId:boundary?.messageId,turnId:canonical.id,boundaryRevision:page.revision}}}});refreshedTurns++;
+          const {messageReference:_oldReference,replyTo:_oldQuote,...liveBoundary}=(live.message._meta?.['amplifier.dev/history'] as Json)??{};
+          this.store.saveTurn(record.chat.resource,{...live,responseParts,message:{...live.message,_meta:{...live.message._meta,'amplifier.dev/history':{...liveBoundary,messageId:boundary?.messageId,turnId:canonical.id,boundaryRevision:page.revision,...(boundary?.messageReference?{messageReference:boundary.messageReference}:{}),...(boundary?.replyTo?{replyTo:boundary.replyTo}:{})}}}});refreshedTurns++;
         }
         record.chat._meta={...record.chat._meta,'amplifier.dev/history':{source:'native',available:true,revision:page.revision,diagnostics:page.diagnostics}};this.store.save(record);
       });
@@ -1185,8 +1190,16 @@ export class AmplifierHost {
     const catalog=this.config.catalog;
     if(!catalog){if(required)throw new RpcFault(-32601,'Recovery and bundle copies require indexed family coverage',{executed:false});return work([],[]);}
     if(!catalog.descendants)throw new RpcFault(-32601,'Catalog cannot provide bounded descendant coverage',{executed:false});
-    const family=await catalog.descendants({parentUri:record.uri,limit:100}),fresh=family.freshness,age=Date.now()-Date.parse(fresh?.completedAt??'');
-    if(!family.rootKnown||!family.completeIndexedCoverage||family.truncated||family.issues?.length||family.excludedKinds?.length||family.coverage!=='indexed-native-history'||family.root?.nativeSessionId!==record.nativeSessionId||family.root?.engineId!==record.engineId||family.root?.workingDirectory!==record.workingDirectory||!Array.isArray(family.items)||family.items.length>100||fresh?.phase!=='complete'||fresh.issues!==0||!Number.isFinite(age)||age<0||age>600000)throw new RpcFault(-32011,'Indexed family coverage is incomplete or stale; copy was not executed',{executed:false});
+    let family:CatalogFamily|undefined,scoped=false;
+    if(catalog.reconcileFamily){
+      try{const discover=()=>catalog.reconcileFamily!({parentUri:record.uri,limit:100,maxEntries:512});family=await (this.presentation?this.presentation.discoverFamily(record.uri,discover):discover());scoped=true;}
+      catch(error){if((error as {code?:number}).code!==-32601)throw new RpcFault(-32011,'Selected family discovery could not be confirmed; copy was not executed',{executed:false});}
+    }
+    family??=await catalog.descendants({parentUri:record.uri,limit:100});
+    const proof=family.familyDiscovery,fresh=family.freshness,age=Date.now()-Date.parse((scoped?proof?.completedAt:fresh?.completedAt)??'');
+    const bounded=(value:unknown,max:number)=>Number.isSafeInteger(value)&&Number(value)>=0&&Number(value)<=max;
+    const discoveryValid=scoped?!!proof&&proof.version===1&&proof.scope==='selected-native-project-namespaces'&&proof.phase==='complete'&&Array.isArray(proof.issues)&&proof.issues.length===0&&proof.indexRevision===family.revision&&proof.maxEntries===512&&proof.metadataByteLimit===8388608&&proof.metadataFileLimit===2048&&typeof proof.verificationToken==='string'&&proof.verificationToken.length>0&&proof.verificationToken.length<=2048&&typeof proof.inventoryHash==='string'&&/^[a-f0-9]{64}$/.test(proof.inventoryHash)&&!!catalog.verifyFamily&&bounded(proof.entriesExamined,512)&&bounded(proof.metadataReads,2048)&&bounded(proof.metadataBytesAdmitted,8388608)&&Array.isArray(proof.namespaces)&&proof.namespaces.length>0&&proof.namespaces.length<=101&&proof.namespaces.every(path=>typeof path==='string'&&path.length>0)&&new Set(proof.namespaces).size===proof.namespaces.length&&proof.externalWriterCoverage===false&&proof.transcriptBodiesRead===false&&proof.nativeOwnershipVerified===false:fresh?.phase==='complete'&&fresh.issues===0;
+    if(family.parentUri!==record.uri||family.root?.uri!==record.uri||family.rootKnown!==true||family.completeIndexedCoverage!==true||family.truncated!==false||!Array.isArray(family.issues)||family.issues.length||!Array.isArray(family.excludedKinds)||family.excludedKinds.length||family.coverage!=='indexed-native-history'||family.root?.nativeSessionId!==record.nativeSessionId||family.root?.engineId!==record.engineId||family.root?.workingDirectory!==record.workingDirectory||!Array.isArray(family.items)||family.items.length>100||!discoveryValid||family.externalWriterCoverage!==false||typeof family.revision!=='string'||!family.revision||!Number.isFinite(age)||age<0||age>600000)throw new RpcFault(-32011,'Indexed family coverage is incomplete or stale; copy was not executed',{executed:false});
     const rows=new Map<string,CatalogRecord>([[record.uri,family.root],...family.items.map(row=>[row.uri,row] as [string,CatalogRecord])]);
     if(rows.size!==family.items.length+1)throw new RpcFault(-32011,'Indexed family contains conflicting identities',{executed:false});
     const descendants:Json[]=[];
@@ -1201,6 +1214,13 @@ export class AmplifierHost {
     const lock=async(index:number):Promise<T>=>{
       if(index<family.items.length)return this.withLock(family.items[index].uri,()=>lock(index+1));
       for(const row of family.items){validate?.(row);const child=this.getRecord(row.uri);if(child&&(child.engineId!==row.engineId||child.nativeSessionId!==row.nativeSessionId||child.workingDirectory!==row.workingDirectory))throw new RpcFault(-32011,'Indexed descendant differs from its admitted identity',{executed:false});this.guardSessionLifecycle(row.uri);if(this.store.unknown(chatURI(row.uri))||child?.chat.activeTurn||this.relocationFence(row.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle({uri:row.uri});}
+      if(scoped){
+        let checked:Awaited<ReturnType<NonNullable<Catalog['verifyFamily']>>>;
+        try{checked=await catalog.verifyFamily!({parentUri:record.uri,verificationToken:proof!.verificationToken});}
+        catch{throw new RpcFault(-32011,'Selected family discovery could not be revalidated; copy was not executed',{executed:false});}
+        const checkedAge=Date.now()-Date.parse(checked?.completedAt??'');
+        if(checked?.version!==1||checked.scope!=='selected-native-project-namespaces'||checked.valid!==true||checked.parentUri!==record.uri||checked.indexRevision!==family.revision||checked.inventoryHash!==proof!.inventoryHash||!Array.isArray(checked.issues)||checked.issues.length||checked.externalWriterCoverage!==false||checked.nativeOwnershipVerified!==false||checked.transcriptBodiesRead!==false||!Number.isFinite(checkedAge)||checkedAge<0||checkedAge>600000)throw new RpcFault(-32011,'Selected family changed while acquiring ownership; copy was not executed',{executed:false});
+      }
       if((await catalog.descendants!({parentUri:record.uri,limit:100})).revision!==family.revision)throw new RpcFault(-32011,'Indexed family changed while acquiring ownership',{executed:false});
       return work(descendants,family.items.map(row=>row.uri));
     };
@@ -1725,6 +1745,11 @@ export class AmplifierHost {
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
     this.checkContentCapabilities(active,blocks);
+    const reply=this.messageReply(action.message);
+    if(reply){
+      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.messageInteractions;
+      if(special||active.agent.engine.messagePrincipal===undefined||native?.version!==1||capability?.version!==1||capability.quoteMeta!=='amplifier.dev/messageReply'||!record.nativeSessionId||active.agent.nativeId!==record.nativeSessionId)throw new RpcFault(-32601,'Configured engine does not support quoted message inputs',{executed:false,replayed:false});
+    }
     if(special){
       const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':special.operation==='question.submit'?'questionTurns':special.operation==='history.revise'?'historyEdits':'observationTurns'];
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
@@ -1911,7 +1936,33 @@ export class AmplifierHost {
     const observer={session:record.uri,chat:record.chat.resource,queue:[] as ActionEnvelope[],bytes:0,running:false,closed:false,listener,onError};if(this.presentationSelections.has(record.uri))await this.withLock(record.uri,async()=>{this.observers.add(observer);});else this.observers.add(observer);
     return ()=>{observer.closed=true;observer.queue=[];this.observers.delete(observer);};
   }
+  /** Only bounded native locators and frozen quotes cross into selectable history metadata. */
+  private nativeMessageHistory(record:SessionRecord,value:Json|undefined):Json|undefined {
+    if(value===undefined)return;
+    const fail=()=>{throw new RpcFault(-32000,'Native message quote metadata is invalid or exceeds its bound');};
+    if(!value||typeof value!=='object'||Array.isArray(value)||Buffer.byteLength(JSON.stringify(value))>32768)return fail();
+    const result={...value};delete result.messageReference;delete result.replyTo;
+    if(value.messageReference!==undefined&&!value.historicalOnly){
+      const locator=value.messageReference;if(!locator||typeof locator!=='object'||Array.isArray(locator)||locator.sessionId!==record.nativeSessionId||locator.messageId!==value.messageId||typeof locator.sourceDigest!=='string')return fail();
+      const {sessionId,...reference}=locator;
+      try{result.messageReference={sessionId,...this.messageReply({_meta:{'amplifier.dev/messageReply':reference}})};}catch{return fail();}
+    }
+    if(value.replyTo!==undefined){
+      const quote=value.replyTo,token=(item:unknown)=>typeof item==='string'&&item.length>0&&[...item].length<=200&&!/[\x00-\x1f]/.test(item),hex=(item:unknown)=>typeof item==='string'&&/^[a-f0-9]{64}$/.test(item);
+      if(!quote||typeof quote!=='object'||Array.isArray(quote)||Object.keys(quote).sort().join(',')!=='excerpt,historyEpoch,id,inputId,messageId,role,sessionId,sourceDigest,truncated'||!hex(quote.id)||!token(quote.sessionId)||!token(quote.messageId)||!['user','assistant'].includes(quote.role)||!hex(quote.sourceDigest)||(quote.historyEpoch!==null&&!token(quote.historyEpoch))||!token(quote.inputId)||typeof quote.excerpt!=='string'||[...quote.excerpt].length>4000||typeof quote.truncated!=='boolean')return fail();
+      result.replyTo=structuredClone(quote);
+    }
+    return result;
+  }
+  /** Browser references locate native public text; they never supply quote or actor authority. */
+  private messageReply(message:Pick<Message,'_meta'>):Json|undefined {
+    const value=message._meta?.['amplifier.dev/messageReply'] as Json|undefined;if(value===undefined)return;
+    const validToken=(item:unknown)=>typeof item==='string'&&item.length>0&&[...item].length<=200&&!/[\x00-\x1f]/.test(item);
+    if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['messageId','position','historyEpoch','sourceDigest'].includes(key))||!['messageId','position','historyEpoch'].every(key=>Object.hasOwn(value,key))||!validToken(value.messageId)||!Number.isSafeInteger(value.position)||Number(value.position)<0||(value.historyEpoch!==null&&!validToken(value.historyEpoch))||(Object.hasOwn(value,'sourceDigest')&&(typeof value.sourceDigest!=='string'||!/[a-f0-9]{64}/.test(value.sourceDigest)||value.sourceDigest.length!==64))||Buffer.byteLength(JSON.stringify(value))>2048)throw new RpcFault(-32602,'Exact bounded native message reply reference required',{executed:false,replayed:false});
+    return structuredClone(value);
+  }
   private async prompt(message:Message,record:SessionRecord,resolveReferences=true):Promise<ContentBlock[]> {
+    this.messageReply(message);
     if(message.model||message.agent)throw new Error('Per-message model/custom-agent selection is not advertised; use session configuration');
     const blocks:ContentBlock[]=[{type:'text',text:message.text}];
     if((message.attachments?.length??0)>16)throw new RpcFault(-32602,'At most sixteen attachments per input');
@@ -1944,7 +1995,8 @@ export class AmplifierHost {
     const message=(active.pendingTurn?.action.message??this.getRecord(uri)!.chat.activeTurn!.message),meta=message._meta as Json|undefined;
     const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':special?.operation==='history.revise'?'history-edit':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
-      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},...(special.operation==='observation.submit'?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{})}});
+      const reply=this.messageReply(message);
+      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},...(special.operation==='observation.submit'?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{}),...(reply?{'amplifier.dev/messageReply':{...reply,sessionId:this.getRecord(uri)!.nativeSessionId}}:{})}});
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
         await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
@@ -1981,7 +2033,9 @@ export class AmplifierHost {
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
       await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
+      let updatesJoined=true;try{await active.updates;}catch{updatesJoined=false;}
       active.finishing=false;this.intake.workChanged();
+      if(updatesJoined&&!active.busy&&this.store.receipt(turnId)?.status==='completed'&&turnId.length<=512)this.acpMetadata(uri,{lastSettledTurnId:turnId});
     }
   }
   private legacyModeOptions(modes?:Json):any[] {return modes?.availableModes?[{id:'mode',name:'Mode',type:'select',currentValue:modes.currentModeId,options:modes.availableModes.map((mode:Json)=>({value:mode.id,name:mode.name,description:mode.description}))}]:[];}

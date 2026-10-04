@@ -33,6 +33,18 @@ export class CatalogHints {
   // Owner evidence may establish writer quiet, but does not claim its metadata effect succeeded.
   this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO presentation_hint_settlements VALUES(?,?,?)').run(attempt.attemptId,String(saved),JSON.stringify(result));this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1 AND attempt=?').run(String(saved));this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
  }
+ async discover<T>(attempt:CatalogDiscoveryAttempt,work:()=>Promise<T>):Promise<T>{
+  if(this.closed||this.active||this.state().attempt||!this.paused)throw Error('Catalog discovery requires its exclusive settled presentation boundary');
+  this.db.prepare('UPDATE presentation_hint_state SET attempt=? WHERE id=1').run(JSON.stringify(attempt));
+  const result=Promise.resolve().then(work).then(value=>{this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1').run();return value;},error=>{
+   if((error as any)?.catalogDiscoverySettled===true)this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1').run();
+   else this.ports.blocked('catalog-discovery-unconfirmed');
+   throw error;
+  });
+  // quiet joins writer completion; unknown failures retain the exact durable attempt.
+  this.active=result.then(()=>{},()=>{});
+  try{return await result;}finally{this.active=undefined;}
+ }
  scanBoundary(){return Number(this.state().generation);}
  scanned(through:number){this.db.prepare('UPDATE presentation_hint_state SET overflow=0 WHERE id=1 AND overflow<=?').run(through);}
  assertComplete(){if(this.state().overflow)throw Error('Discovery hint overflow requires another complete metadata reconstruction');if(this.state().attempt)throw Error('Catalog discovery writer is unsettled');}
@@ -43,7 +55,7 @@ export class CatalogHints {
    const row=this.db.prepare('SELECT path,generation FROM presentation_hints ORDER BY generation LIMIT 1').get();if(!row)return;
    const attempt:CatalogDiscoveryAttempt={attemptId:randomUUID(),sessionDirectory:String(row.path)};
    this.db.prepare('UPDATE presentation_hint_state SET attempt=? WHERE id=1').run(JSON.stringify(attempt));
-   try{await this.ports.hint(attempt.sessionDirectory,{attemptId:attempt.attemptId});this.db.prepare('DELETE FROM presentation_hints WHERE path=? AND generation=?').run(row.path,row.generation);this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1').run();}
+   try{await this.ports.hint(String(row.path),{attemptId:attempt.attemptId});this.db.prepare('DELETE FROM presentation_hints WHERE path=? AND generation=?').run(row.path,row.generation);this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1').run();}
    catch(error){if((error as any)?.catalogDiscoverySettled===true)this.db.prepare('UPDATE presentation_hint_state SET attempt=NULL WHERE id=1').run();this.ports.blocked('catalog-discovery-unconfirmed');return;}
   }};
   this.active=Promise.resolve().then(work).catch(()=>this.ports.blocked('catalog-discovery-unconfirmed')).finally(()=>{this.active=undefined;});

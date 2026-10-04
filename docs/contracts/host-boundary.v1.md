@@ -82,6 +82,27 @@ alone grants none of those authorities. New reversible product-visibility/reset
 semantics under development remain a separately reviewed producer/consumer seam;
 this packet does not claim they are implemented or replace the current contract.
 
+Copy consumers use the catalog's trusted, bounded `reconcileFamily` and
+`verifyFamily` seams when supported. Initial selected namespace discovery supplies
+an exact scoped inventory/revision proof; under admitted child locks the host
+revalidates that physical inventory and then the pure indexed revision before
+native dispatch. Cache freshness alone cannot account for a child created after
+discovery. Incomplete coverage, source changes and unavailable verification refuse
+without copying or replaying; native parent checks and actual writer leases still
+own execution safety. Metadata discovery never reads canonical body files or
+claims exclusion of noncooperating external writers. Legacy peers retain their
+existing complete global-freshness requirement; a supported refusal does not
+permit downgrade. Acceptance: [focused family integration](../../test/family-refresh.integration.test.ts)
+and the selected-family/legacy/unknown regressions in [host tests](../../test/host.test.ts).
+Selected-family reconciliation joins the presentation owner's exclusive discovery
+boundary. Metadata reconstruction pauses and joins that writer; an unknown reply
+retains the exact durable `reconcileFamily` attempt and blocks rebuilding until
+trusted response or actual process-exit evidence settles it. The owned stdio
+adapter joins the original process exit after a discovery timeout. Revalidation
+is read-only and does not join the derived-index writer queue.
+
+These are public catalog seams, not private SQL contracts or new AHP fields.
+
 Upstream omitted-view semantics remain authoritative: omitting `view.turns` can
 request all retained turns. Normal clients request bounded windows, but the host
 must not silently truncate required state to claim a universal memory bound.
@@ -121,3 +142,35 @@ receipts and record new source/package/runtime adoption separately.
 [cb]: https://github.com/microsoft/amplifier-unified/blob/main/contracts/component-boundaries.v1.md
 [ap]: https://github.com/microsoft/amplifier-unified/blob/main/contracts/agent-protocol.v1.md
 [ma]: https://github.com/microsoft/amplifier-unified/blob/main/contracts/maintenance.v1.md
+
+
+## Trusted message quote forwarding
+
+The optional server-only engine principal is asserted exactly at
+`initialize.params.clientCapabilities._meta['amplifier.dev/messagePrincipal']`
+with `{version:1,account}`, alongside the native v1 negotiation. It comes from
+trusted composition, never a browser body, client identity, per-action actor or
+path. Ordinary quoted inputs require the actual peer's messageInteractions v1
+quoteMeta grant. The host validates the bounded exact reference and binds its
+native session identity at prompt dispatch, preserving the original input command.
+Native authority freezes canonical public text and validates stale epochs/digests.
+Unknown quoted deliveries are retained without replay; unsupported queued inputs
+retain their drafts and identities. Local selection and passive reaction authority
+are outside this forwarding seam. Acceptance: [protocol regressions](../../test/message-reply.test.ts)
+and [installed full-native quoted execution](../../test/message-reply.integration.test.ts).
+
+
+The existing initialized ACP capability projection is the quote availability
+marker. Bounded selected history reconstruction validates canonical locator and
+frozen quote metadata before copying it into user/assistant overlays, removes
+obsolete or historical-only selectable references, and preserves original host
+receipts and admission provenance. A completed turn does not trigger a host-side
+eager whole-history scan; a client requests the bounded selected refresh.
+
+
+The post-settlement selected-chat refresh trigger is the new
+`session/metaChanged` value at ACP `lastSettledTurnId`, after joined updates and
+idle finishing cleanup with a completed original receipt. It is advisory, bounded,
+and has no execution/history-read effect. Clients process each new value once and
+defer while another turn is busy. Protocol tests cover the early turnComplete
+race and queued next input.

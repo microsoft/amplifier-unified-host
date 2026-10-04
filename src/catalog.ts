@@ -52,8 +52,11 @@ export class StdioCatalog implements Catalog {
   setVisibility(params:Parameters<NonNullable<Catalog['setVisibility']>>[0]){return this.request('setVisibility',params);}
   retentionCandidates(params:Parameters<NonNullable<Catalog['retentionCandidates']>>[0]){const {protectSessionIds,...query}=params;return this.request('retentionCandidates',query);}
   descendants(params:{parentUri:string;limit:number}){return this.request('descendants',params);}
+  reconcileFamily(params:{parentUri:string;limit:number;maxEntries:number}){return this.discovery('reconcileFamily',params);}
+  verifyFamily(params:{parentUri:string;verificationToken:string}){return this.request('verifyFamily',params);}
   directoryInUse(path:string){return this.request('directoryInUse',{path});}
-  async hint(sessionDirectory:string,_context?:{attemptId:string}){try{return await this.request('hint',{sessionDirectory});}catch(error){
+  hint(sessionDirectory:string,_context?:{attemptId:string}){return this.discovery('hint',{sessionDirectory});}
+  private async discovery(method:string,params:Record<string,unknown>){try{return await this.request(method,params);}catch(error){
     // A timed-out RPC can still be writing. Join this owned process's actual exit
     // before claiming discovery is quiet; a kill signal or new PID is not proof.
     if(!(error as any)?.catalogResponseSettled)await this.close();throw Object.assign(error instanceof Error?error:new Error(String(error)),{catalogDiscoverySettled:true});
