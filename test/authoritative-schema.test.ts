@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {DatabaseSync} from 'node:sqlite';
-import {mkdtempSync,readFileSync,rmSync,writeFileSync,existsSync,realpathSync} from 'node:fs';
+import {mkdtempSync,readFileSync,rmSync,writeFileSync,existsSync,realpathSync,renameSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createHash} from 'node:crypto';
@@ -61,6 +61,10 @@ test('existing empty file is not a genuinely new database',()=>{
  const directory=fixture();try{writeFileSync(join(directory,'host.sqlite'),'');withoutWrites(directory,()=>new Store(directory));}finally{rmSync(directory,{recursive:true,force:true});}
 });
 
+for(const sidecar of ['-wal','-shm','-journal'])test(`absent main with retained ${sidecar} is never a fresh authoritative store`,()=>{
+ for(const managed of [false,true]){const directory=fixture(),path=join(directory,managed?'managed-allocations.sqlite':'host.sqlite');try{writeFileSync(path+sidecar,'');const before=hash(path+sidecar);assert.throws(()=>managed?new ManagedAllocations(directory):new Store(directory),refused);assert.equal(existsSync(path),false);assert.equal(hash(path+sidecar),before);}finally{rmSync(directory,{recursive:true,force:true});}}
+});
+
 test('genuinely new, partial optional profiles and derived indexes remain supported',()=>{
  const directory=fixture();try{let store=new Store(directory);admit(store);store.close();store=new Store(directory);assert.equal(store.receipt('original-input')!.status,'unknown');assert.equal(absent(store.db,'presentation_state'),true);
   new ManagedFilesJournal(store.db);new Retention(store.db,{} as any);gate(store.db);new ConversationPresentation(store.db,{} as any);const presentation=String(store.db.prepare('SELECT payload FROM presentation_state').get()!.payload);store.close();
@@ -94,6 +98,7 @@ test('crash-left WAL evidence is unchanged when missing schema rejects startup',
   const script=`const {DatabaseSync}=require('node:sqlite');const db=new DatabaseSync(process.argv[1]);db.exec('PRAGMA wal_autocheckpoint=0; DROP TABLE lifecycle_commands');console.log('committed');setInterval(()=>{},1000);`;
   child=spawn(process.execPath,['-e',script,path],{stdio:['ignore','pipe','pipe']});let errors='';child.stderr!.on('data',chunk=>errors+=String(chunk));const exit=once(child,'exit');const data=await Promise.race([once(child.stdout!,'data'),exit.then(()=>{throw Error('fixture exited: '+errors);})]);assert.match(String(data[0]),/committed/);child.kill('SIGKILL');await exit;
   assert.equal(existsSync(path+'-wal'),true);const before={main:hash(path),wal:hash(path+'-wal')};assert.throws(()=>new Store(directory),refused);assert.deepEqual({main:hash(path),wal:hash(path+'-wal')},before);assert.throws(()=>new Store(directory),refused);assert.deepEqual({main:hash(path),wal:hash(path+'-wal')},before);
+  renameSync(path,path+'.retained');assert.throws(()=>new Store(directory),refused);assert.equal(existsSync(path),false);assert.equal(hash(path+'-wal'),before.wal);renameSync(path+'.retained',path);
   if(process.env.HOST_SCHEMA_WAL_EVIDENCE)writeFileSync(join(directory,'receipt.json'),JSON.stringify({case:'crash-left-wal-refused-before-writable-open',before,after:{main:hash(path),wal:hash(path+'-wal')},noRecreatedTable:true},null,2)+'\n');
  }finally{if(child?.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await once(child,'exit');}if(!process.env.HOST_SCHEMA_WAL_EVIDENCE)rmSync(directory,{recursive:true,force:true});}
 });

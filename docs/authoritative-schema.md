@@ -23,7 +23,8 @@ not just the configured optional owner, before its own restart writes. Existing
 file owners first use a **read-only SQLite connection**. This matters after a
 crash: closing a writable preflight connection could checkpoint and alter a
 retained WAL even when validation failed. Owned-file refusal leaves main/WAL
-bytes unchanged; the separate OS lifetime lease is still acquired normally.
+bytes unchanged; SHM is derived coordination state and is not included in that
+byte-equality claim. The separate OS lifetime lease is still acquired normally.
 Shared-connection initializers validate again before their DDL.
 
 `PRAGMA user_version` stores schema-admission version `0x41480100` plus fixed
@@ -33,7 +34,9 @@ and expected column names/types. Unsupported versions refuse. Creation,
 recognized migrations, restart normalization and the marker commit in one SQLite
 savepoint. A failed first initialization cannot publish half a namespace.
 
-An absent file is eligible for first creation. An existing empty or unrelated
+First creation requires the main file and every `-wal`, `-shm` and `-journal`
+sidecar to be absent. Even an empty surviving sidecar causes refusal before
+SQLite is opened; an orphan WAL must not be consumed as fresh state. An existing empty or unrelated
 file is not treated as a new Host/managed allocation store. A never-initialized
 optional namespace can be added later; independent in-memory component profiles
 remain supported. Non-authoritative indexes and `archive_projection_pending`
@@ -51,7 +54,8 @@ namespaces are recognized and marked on admission; arbitrary partial namespaces
 refuse without recreation.
 
 The guard is **schema admission**, not a complete corruption detector. It cannot
-detect deletion of valid rows, a coherent whole-database replacement, or removal
+detect deletion of valid rows, a coherent whole-database replacement, deletion
+of the database and all its sidecars, or removal
 of an entire unversioned namespace that is indistinguishable from a release
 which never initialized it. Similarly, an unversioned schema deliberately made
 identical to an older complete profile cannot be distinguished from that release.

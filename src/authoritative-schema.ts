@@ -1,5 +1,5 @@
 import {DatabaseSync} from 'node:sqlite';
-import {existsSync} from 'node:fs';
+import {lstatSync} from 'node:fs';
 
 /** Host-local schema admission, not a row-integrity or backup authority. */
 type Tables=Record<string,Record<string,string>>;
@@ -121,8 +121,13 @@ function inspect(db:DatabaseSync){
  * An existing file owned by Store/ManagedAllocations cannot become a fresh DB.
  * A never-initialized optional namespace can be added on a later composition.
  */
+function pathExists(path:string){try{lstatSync(path);return true;}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return false;throw error;}}
 export function preflightAuthorityFile(path:string,owner:Owner):boolean {
- if(!existsSync(path))return false;
+ if(!pathExists(path)){
+  // Even an empty/dangling sidecar is evidence of a prior database lifetime.
+  if(['-wal','-shm','-journal'].some(suffix=>pathExists(path+suffix)))fail(`${owner} main database missing with retained sidecar`);
+  return false;
+ }
  // Closing a writable SQLite handle can checkpoint a crash-left WAL, even when
  // validation fails. Read-only preflight preserves that evidence before opening
  // the owner's ordinary writable connection.
