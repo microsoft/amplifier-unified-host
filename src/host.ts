@@ -346,7 +346,7 @@ export class AmplifierHost {
   }
   private nativeControlIsUse(operation:string) {
     // Exact known read contracts, not suffix heuristics: snapshots persist state and are use.
-    return !new Set(['capabilities','configuration.inspect','configuration.exportResources','configuration.providers','configuration.providerModels','configuration.providerLoginStatus','catalog.inspect','usage.inspect','context.clear.review','goals.get','budget.get','mode.list','native.status','bundle.preview','capacity.get','task.get','task.receipt','task.history','session.relocation.inspect','runtime.inspect','workers.inspect']).has(operation);
+    return !new Set(['capabilities','configuration.inspect','configuration.exportResources','configuration.providers','configuration.providerModels','configuration.providerLoginStatus','catalog.inspect','usage.inspect','context.clear.review','goals.get','budget.get','mode.list','native.status','bundle.preview','capacity.get','capacity.quota','task.get','task.receipt','task.history','session.relocation.inspect','runtime.inspect','workers.inspect']).has(operation);
   }
   private withAgentCapacity<T>(work:()=>Promise<T>):Promise<T> {
     const next=this.agentCapacity.catch(()=>{}).then(work);this.agentCapacity=next;return next;

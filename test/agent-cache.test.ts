@@ -238,7 +238,7 @@ test('class settlement: generation-bound late steering disposition renews grace;
 test('class settlement: all known Native read and polling controls never renew existing cache use',async()=>{
  const f=await setup();try{
   const client=await f.connect(),one=await f.create(client),entry=f.active(one.session);
-  const reads=['capabilities','configuration.inspect','configuration.exportResources','configuration.providers','configuration.providerModels','configuration.providerLoginStatus','catalog.inspect','usage.inspect','context.clear.review','goals.get','budget.get','mode.list','native.status','bundle.preview','capacity.get','task.get','task.receipt','task.history','session.relocation.inspect','runtime.inspect','workers.inspect'];
+  const reads=['capabilities','configuration.inspect','configuration.exportResources','configuration.providers','configuration.providerModels','configuration.providerLoginStatus','catalog.inspect','usage.inspect','context.clear.review','goals.get','budget.get','mode.list','native.status','bundle.preview','capacity.get','capacity.quota','task.get','task.receipt','task.history','session.relocation.inspect','runtime.inspect','workers.inspect'];
   const order=age(entry),lastUsed=entry.lastUsed;
   for(const requireExisting of [false,true])for(const op of reads){const result=requireExisting?await f.host.nativeControlExisting(one.session,op,{}):await f.host.nativeControl(one.session,op,{});assert.equal(result.passive,op);assert.equal(entry.useOrder,order,op);assert.equal(entry.lastUsed,lastUsed,op);}
   await f.h.retireIdle();assert.equal(f.active(one.session),undefined);
