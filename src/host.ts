@@ -1455,11 +1455,11 @@ export class AmplifierHost {
   }
   /** Trusted persistence callback runs only after the selected title CAS passes. */
   async commitSessionTitle(session:string,expected:{commandId:string;expectedTitleRevision?:string},persist:(context:Readonly<SessionTitleCommitContext>)=>Promise<SessionTitleCommitResult>):Promise<SessionTitleCommitResult> {
-    this.titleToken(expected?.commandId,'original command identity');if(expected.expectedTitleRevision!==undefined)this.titleToken(expected.expectedTitleRevision,'expected title revision');if(typeof persist!=='function')throw new RpcFault(-32602,'Trusted title persistence callback required');
+    const commandId=expected?.commandId,expectedTitleRevision=expected?.expectedTitleRevision;this.titleToken(commandId,'original command identity');if(expectedTitleRevision!==undefined)this.titleToken(expectedTitleRevision,'expected title revision');if(typeof persist!=='function')throw new RpcFault(-32602,'Trusted title persistence callback required');
     return this.intake.run(async()=>{const record=await this.record(session);return this.withLock(record.uri,async()=>{
       const current=this.getRecord(record.uri)!,before=await this.titleSnapshot(current);
-      if(expected.expectedTitleRevision!==undefined&&before.titleRevision!==expected.expectedTitleRevision)return {applied:false,...before};
-      const result=await persist(Object.freeze({...this.titleContext(current),...structuredClone(before),commandId:expected.commandId}));
+      if(expectedTitleRevision!==undefined&&before.titleRevision!==expectedTitleRevision)return {applied:false,...before};
+      const result=await persist(Object.freeze({...this.titleContext(current),...structuredClone(before),commandId}));
       if(typeof result?.applied!=='boolean')throw new RpcFault(-32000,'Title persistence did not return a confirmed outcome');
       if(result.title!==undefined)this.titleValue(result.title);const metadata=this.titleMetadata(result.metadata);
       if(this.titleAdapter(current)){
