@@ -26,3 +26,21 @@ for(const mode of ['natural','force'])test('Host storage survives parent exit un
   assert.equal(stopJoined,true);assert.equal(agent.closed,true);
  }finally{await writeFile(release,'release');await (closing??host.close());await delay(50);await rm(dir,{recursive:true,force:true});}
 });
+
+test('public quiescence deadline preserves unknown intake while inherited ACP stdio still owns callbacks',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'host-acp-quiescence-')),marker=join(dir,'stdio-owner'),release=join(dir,'stdio-release');let stopJoined=false;
+ const host=await createHost({stateDirectory:join(dir,'host'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',command:process.execPath,args:[fileURLToPath(new URL('../fixtures/acp-stdio-close.mjs',import.meta.url))],env:{FIXTURE_STDIO_MARKER:marker,FIXTURE_STDIO_RELEASE:release,FIXTURE_PARENT_MODE:'force'}}],
+ quiescence:{instanceId:'stdio-launch',dataScope:'stdio-owned',requiredOwners:[],participants:[],coverage:{},timeoutMs:50,verifyRelease:async r=>({verified:true,fenceId:r.fenceId,commandId:r.commandId,instanceId:r.instanceId,dataScope:r.dataScope,outcome:r.outcome,receiptId:'trusted'})},
+ agentStopped:async()=>{host.store.db.prepare('SELECT count(*) FROM steering_intents').get();stopJoined=true;}});
+ try{
+  const session='ahp-session:/'+randomUUID();await host.createSessionResource({channel:session,provider:'fixture',workingDirectories:[pathToFileURL(dir).href]});
+  const request={commandId:'stdio-pause',purpose:'recovery' as const},admission=host.admitQuiescence(request);
+  const result=await Promise.race([admission,delay(300).then(()=>undefined)]);assert.ok(result,'public admission waited past its configured deadline');
+  assert.equal(result.fence.phase,'unknown');assert.equal(result.intakeClosed,true);assert.match(result.fence.reason,/timeout/);
+  assert.equal(stopJoined,false);host.store.db.prepare('SELECT count(*) FROM steering_intents').get();
+  assert.deepEqual(await host.admitQuiescence({...request,retryRefused:true}),result);
+  await assert.rejects(host.releaseQuiescence({fenceId:result.fence.fenceId,commandId:request.commandId,outcome:'unchanged'}),/still running/);
+  await writeFile(release,'release');await until(()=>stopJoined);
+  assert.equal(host.inspectQuiescence().fence?.phase,'unknown');assert.deepEqual(host.quiescenceReceipt(request.commandId),result);
+ }finally{await writeFile(release,'release');await host.close();assert.equal(stopJoined,true);await rm(dir,{recursive:true,force:true});}
+});

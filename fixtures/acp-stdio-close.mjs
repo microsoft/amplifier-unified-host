@@ -13,7 +13,8 @@ if(process.env.FIXTURE_PARENT_MODE==='force')process.on('SIGTERM',()=>{});
 const reply=(id,result)=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id,result})+'\n');
 createInterface({input:process.stdin}).on('line',line=>{
  const p=JSON.parse(line);if(p.id===undefined)return;
- if(p.method==='initialize')reply(p.id,{protocolVersion:1,agentCapabilities:{loadSession:false,sessionCapabilities:{close:false}}});
+ if(p.method==='initialize')reply(p.id,{protocolVersion:1,agentCapabilities:{loadSession:false,sessionCapabilities:{close:false},_meta:{'amplifier.dev/native':{version:1,lifecycle:{version:1,gracefulRetire:true}}}}});
  else if(p.method==='session/new'){reply(p.id,{sessionId:'stdio-owned'});retain();if(process.env.FIXTURE_PARENT_MODE==='natural')setTimeout(()=>process.exit(0),20);}
+ else if(p.method==='_amplifier/retire')reply(p.id,{retired:true});
  else reply(p.id,{});
 });
