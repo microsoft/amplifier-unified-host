@@ -196,3 +196,20 @@ test('composite native callback coverage holds actual owners without inventing a
  const missing=await fixture({nativeEvent:async()=>{},quiescence:configuration({coverage:{nativeHostOwners:['resources']}})});
  try{const result=await missing.host.admitQuiescence({commandId:'missing-native-authority',purpose:'recovery'});assert.equal(result.admitted,false);assert.deepEqual(result.work.gaps,['resources']);}finally{await missing.close();}
 });
+
+test('public Host retires the resident and joins stop callbacks before acquiring external writer owners',async()=>{
+ let host:any,stopJoined=false,acquired=0;
+ const p=participant('resident-writer',{acquire:async c=>{
+  acquired++;assert.equal(host.inspectQuiescence().intakeClosed,true);
+  if(host.diagnostics().activeAgents||!stopJoined)return null;
+  return {ownerId:'resident-writer',fenceId:c.fenceId,release:async()=>{}};
+ }});
+ const f=await fixture({agentStopped:async()=>{await new Promise(r=>setImmediate(r));stopJoined=true;},
+  quiescence:configuration({requiredOwners:['resident-writer'],participants:[p]})});host=f.host;
+ try{
+  await f.create(await f.connect());assert.equal(host.diagnostics().activeAgents,1);
+  const result=await host.admitQuiescence({commandId:'resident-writer-order',purpose:'distribution-update'});
+  assert.equal(result.admitted,true);assert.equal(acquired,1);assert.equal(stopJoined,true);assert.equal(host.diagnostics().activeAgents,0);
+  assert.deepEqual(await host.admitQuiescence({commandId:'resident-writer-order',purpose:'distribution-update'}),result);assert.equal(acquired,1);
+ }finally{await f.close();}
+});

@@ -748,6 +748,11 @@ their respective owners.
 
 An optional trusted `HostConfig.quiescence` closes execution intake before checking
 work. It is a supervisor/library API, not a browser-provided readiness claim.
+With resident agents, Host confirms their atomic retirement and joins existing
+stop callbacks before acquiring external writer exclusions. Public intake stays
+closed throughout; cleanup/result continuations gain no general mutation admission.
+The final held receipt follows a fresh work check with every required owner held.
+With no resident, the existing pre-retirement owner acquisition path remains.
 Configuration includes the actual launch `instanceId`, exact `dataScope`,
 `requiredOwners`, `coverage`, `participants`, and authenticated `verifyRelease`.
 
@@ -880,7 +885,8 @@ abort receipt. An exact completed retry cannot repeat owner effects or start a n
 admission, even with `retryRefused:true`.
 
 New fences persist an admission stage before native retirement begins. Legacy
-fences lacking this stage, retirement/held fences, other purposes, a replacement
+fences lacking this stage, retirement/held fences, post-retirement
+`owner-exclusion` fences, other purposes, a replacement
 Host instance, and still-running acquisition/release/verification calls refuse
 abort. A timeout does not cancel those calls. Restart preserves the intent and
 owner receipts; reopening with a different launch identity cannot use this abort
