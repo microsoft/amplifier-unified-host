@@ -16,3 +16,6 @@ export type {ManagedFilesProtection,ManagedFilesActor,ManagedFilesApply} from '.
 
 export type * from './presentation-types.js';
 export {PRESENTATION_LIMITS} from './presentation.js';
+
+export type {SessionMetadataAdapter,SessionMetadataContext,SessionTitleSnapshot,SessionTitleCommitContext,SessionTitleWriteContext,SessionTitleCommitResult} from './session-metadata.js';
+export {SESSION_METADATA_KEY} from './session-metadata.js';

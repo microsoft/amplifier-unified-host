@@ -1,3 +1,4 @@
+import type {SessionMetadataAdapter} from './session-metadata.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable, Transform } from 'node:stream';
 import { readFile, writeFile, realpath, stat } from 'node:fs/promises';
@@ -5,7 +6,7 @@ import { dirname, resolve, relative, isAbsolute } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ClientSideConnection, RequestError, ndJsonStream, type InitializeResponse, type Client, type SessionNotification, type RequestPermissionRequest, type RequestPermissionResponse } from '@agentclientprotocol/sdk';
 
-export interface EngineConfig { id: string; label: string; command: string; args?: string[]; env?: Record<string,string>; /** Server-only authenticated account assertion for native message adjuncts. */ messagePrincipal?:string; }
+export interface EngineConfig { id: string; label: string; command: string; args?: string[]; env?: Record<string,string>; /** Server-only authenticated account assertion for native message adjuncts. */ messagePrincipal?:string; sessionMetadata?:SessionMetadataAdapter; }
 export interface AgentHandlers {
   update(params: SessionNotification): Promise<void>;
   permission(params: RequestPermissionRequest): Promise<RequestPermissionResponse>;
