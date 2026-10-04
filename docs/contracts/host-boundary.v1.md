@@ -227,3 +227,28 @@ races, wrong identity/proof, missing owner coverage, retirement/legacy fences,
 changed retries, and owner-commit/lost-reply recovery through the public Host.
 This is source/API coverage, not authority to hot-patch or reopen an older deployed
 unknown fence.
+
+## Passive retirement proof reconciliation
+
+Idle worker `runtime.closed` is not session-handle retirement authority. Host
+retirement retains uncertain connections and refuses new input before admission.
+Only explicit `retired:false` with `owned_work` or `active_request` preserves a
+usable handle. Missing, malformed or other outcomes fence it without repeating
+retirement or terminating uncertain work. Idle, lifecycle and quiescence paths
+share this classification.
+
+A negotiated optional `lifecycle.retirementStatus` version 1 marker names
+`_amplifier/retire/status` and declares `passive:true`. One bounded selected-session
+read sends `{sessionId}` on the same connection; a response must bind that exact
+session and attest `retired:true` from an exact literal worker retirement acknowledgement
+and the same captured worker clean exit 0. Native owns that proof. The status method must not issue
+a worker retirement command, start/close workers, mutate history or execute input.
+
+Host accepts no authority from a worker-closed notification alone. Unsupported,
+false, malformed, lost or mismatched status keeps the fence. Confirmed status
+allows Host to close that bridge and load/resume the same identity for a NEW
+original input. `reconcileSessionRetirement` is a trusted explicit seam; new input
+also performs one bounded status read if fenced. Prior unknown input receipts
+remain unchanged and block admission until independently reconciled. See
+[causal fixtures](../../test/retirement-uncertainty.test.ts). Source/package
+fixtures are separate from actual Native worker proof and live account acceptance.

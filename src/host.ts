@@ -1415,8 +1415,23 @@ export class AmplifierHost {
     if(operation==='legacyCopy.inventory')return this.inventoryRetiredCopies(session);if(operation==='legacyCopy.preview')return this.previewRetiredCopyPurge(session,args as any);if(operation==='legacyCopy.receipt')return this.retiredCopyPurgeReceipt(session,args.commandId);
     if(['fork','export','delete','restore','legacyCopy.purge'].includes(operation))return this.mutateLifecycle(session,operation,args);throw new RpcFault(-32601,'Unsupported negotiated lifecycle operation');
   }
+  private async reconcileRetirementUnderLock(record:SessionRecord) {
+    const active=this.active.get(record.uri);
+    if(!active||active.agent.retirementOutcome!=='unknown'||active.agent.nativeId!==record.nativeSessionId)return {retired:false,connectionClosed:false,workReplayed:false,reason:'not-fenced'};
+    const status=await active.agent.inspectRetirement();
+    if(!status.retired)return {retired:false,connectionClosed:false,workReplayed:false,reason:status.reason};
+    // The negotiated native status owner proves the exact handle retired. A
+    // worker-closed notification or an absent reply never reaches this branch.
+    active.retireReason='idle-retired';await active.agent.retire();await active.stopCallback;
+    if(this.active.get(record.uri)===active)this.active.delete(record.uri);
+    return {retired:true,connectionClosed:true,workReplayed:false};
+  }
+  /** Trusted selected-session proof recheck. No input or retirement is replayed. */
+  async reconcileSessionRetirement(session:string) {
+    return this.intake.run(async()=>{const record=await this.record(session);return this.withLock(record.uri,()=>this.reconcileRetirementUnderLock(this.getRecord(record.uri)!));});
+  }
   private guardRetirement(active:Active) {
-    if(['pending','unknown','retired'].includes(active.agent.retirementOutcome))throw new RpcFault(-32011,'Native retirement outcome is unresolved; reconcile the original retirement without replay',{executed:false,replayed:false,outcome:'unknown'});
+    if(['pending','unknown','retired'].includes(active.agent.retirementOutcome))throw new RpcFault(-32011,'This chat is waiting for confirmation that its previous runtime stopped. Your new message was not sent.',{executed:false,replayed:false,outcome:'unknown'});
   }
   private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
     return this.intake.run(async()=>{
@@ -1766,6 +1781,7 @@ export class AmplifierHost {
     if(this.store.db.prepare("SELECT 1 FROM steering_intents WHERE chat=? AND status='dispatching' LIMIT 1").get(channel))throw new Error('A prior steering disposition is pending; wait for its receipt');
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
+    if(special?.operation!=='observation.submit'&&this.active.get(record.uri)?.agent.retirementOutcome==='unknown')await this.reconcileRetirementUnderLock(record);
     const blocks=await this.prompt(action.message,record),active=special?.operation==='observation.submit'?this.active.get(record.uri):await this.ensureAgent(record.uri);
     if(!active||active.agent.closed||special?.operation==='observation.submit'&&active.stopNotified)throw new RpcFault(-32008,'waiting_worker',{executed:false});
     this.guardRetirement(active);
