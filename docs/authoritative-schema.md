@@ -50,7 +50,9 @@ remain rebuildable from retained records.
 
 Public Host releases previously had no schema marker. Their exact table-set
 migration epochs are recorded in `test/fixtures/host-schema-history.json`, with
-source revisions and original DDL. The guard accepts those known complete
+source revisions, original DDL and completed ALTER migrations. Missing columns
+are permitted only in the exact earlier table/column profile that lacked them;
+newer coordination/import tables cannot excuse missing old location columns. The guard accepts those known complete
 profiles and documented additive column migrations, rather than accepting any
 subset of known tables. Quiescence's original two-table profile and later
 attempt/service-release additions are also supported. Current complete optional
@@ -63,7 +65,8 @@ of the database and all its sidecars, or removal
 of an entire unversioned namespace that is indistinguishable from a release
 which never initialized it. Similarly, an unversioned schema deliberately made
 identical to an older complete profile cannot be distinguished from that release.
-No native transcript scan, row census or inferred repair is introduced. A future
+PK/UNIQUE/NOT NULL constraints are not comprehensively validated by this schema
+admission check. No native transcript scan, row census or inferred repair is introduced. A future
 schema change must explicitly version/migrate this admission contract. An older
 Host without this guard does not acquire its protections by reading this marker.
 

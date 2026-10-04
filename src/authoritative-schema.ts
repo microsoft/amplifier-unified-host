@@ -81,12 +81,16 @@ const storeEpochs=[
  ['coordination_results'], // f55a2ff
  ['import_adoptions'], // f78d604
 ].map((_,i,all)=>all.slice(0,i+1).flat());
-const legacyProfiles:Partial<Record<Owner,string[][]>>={
- store:storeEpochs,
- quiescence:[['host_quiescence_fence','host_quiescence_commands'],['host_quiescence_fence','host_quiescence_commands','host_quiescence_attempts'],Object.keys(tables.quiescence)],
-};
-const legacyColumns:Record<string,string[]>={
- terminals:['lifecycle'],sessions:['execution_cwd','native_location_revision','hidden'],queue_intents:['projected'],allocations:['copy_source'],
+function profile(owner:Owner,names:string[],omit:Record<string,string[]>={}):Tables {
+ const spec:Tables=tables[owner];
+ return Object.fromEntries(names.map(name=>[name,Object.fromEntries(Object.entries(spec[name]!).filter(([column])=>!omit[name]?.includes(column)))]));
+}
+// These are completed initializer schemas, including ALTER migrations. Columns
+// are bound to their exact table epoch; newer tables cannot excuse lost columns.
+const legacyProfiles:Partial<Record<Owner,Tables[]>>={
+ store:storeEpochs.map((names,i)=>profile('store',names,{sessions:i<2?['execution_cwd','native_location_revision','hidden']:i<6?['hidden']:[]})),
+ quiescence:[profile('quiescence',['host_quiescence_fence','host_quiescence_commands']),profile('quiescence',['host_quiescence_fence','host_quiescence_commands','host_quiescence_attempts']),tables.quiescence],
+ managed:[profile('managed',['allocations'],{allocations:['copy_source']}),tables.managed],
 };
 export class AuthoritativeSchemaError extends Error {
  readonly code='HOST_AUTHORITATIVE_SCHEMA';
@@ -101,20 +105,17 @@ function inspect(db:DatabaseSync){
  for(const owner of owners){
   const spec:Tables=tables[owner],expected=Object.keys(spec),present=expected.filter(name=>objects.has(name)),marked=!!(presentBits&bits(owner));
   if(!marked&&!present.length)continue;
-  const profiles=marked?[expected]:(legacyProfiles[owner]??[expected]);
-  if(!profiles.some(profile=>profile.length===present.length&&profile.every(name=>present.includes(name))))fail(`${owner} table set`);
-  let current=present.length===expected.length;
+  const columns=new Map<string,Map<string,string>>();
   for(const name of present){
    if(objects.get(name)!=='table')fail(`${name} is not a table`);
-   const columns=new Map(db.prepare(`PRAGMA table_info("${name}")`).all().map(row=>[String(row.name),String(row.type).toUpperCase()]));
-   for(const [column,type] of Object.entries(spec[name]!)){
-    if(!columns.has(column)&&!marked&&legacyColumns[name]?.includes(column)){current=false;continue;}
-    if(columns.get(column)!==type)fail(`${name}.${column}`);
-   }
-   // execution_cwd and its revision were introduced in the same migration.
-   if(name==='sessions'&&columns.has('execution_cwd')!==columns.has('native_location_revision'))fail('sessions location migration');
+   columns.set(name,new Map(db.prepare(`PRAGMA table_info("${name}")`).all().map(row=>[String(row.name),String(row.type).toUpperCase()])));
   }
-  if(current)presentBits|=bits(owner);
+  const matches=(schema:Tables,exact:boolean)=>Object.keys(schema).length===present.length&&Object.entries(schema).every(([name,fields])=>{
+   const actual=columns.get(name);return !!actual&&(!exact||actual.size===Object.keys(fields).length)&&Object.entries(fields).every(([column,type])=>actual.get(column)===type);
+  });
+  const profiles=marked?[spec]:(legacyProfiles[owner]??[spec]);
+  if(!profiles.some(schema=>matches(schema,!marked)))fail(`${owner} table/column profile`);
+  if(matches(spec,false))presentBits|=bits(owner);
  }
  return {version,presentBits,objects};
 }

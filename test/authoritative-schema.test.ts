@@ -75,13 +75,22 @@ test('genuinely new, partial optional profiles and derived indexes remain suppor
 
 const history=JSON.parse(readFileSync(new URL('./fixtures/host-schema-history.json',import.meta.url),'utf8'));
 for(const epoch of history.epochs)test(`documented legacy schema ${epoch.source.slice(0,7)} migrates atomically`,()=>{
- const directory=fixture();try{const db=new DatabaseSync(join(directory,'host.sqlite'));for(const index of epoch.statements)db.exec(history.statements[index]);db.prepare('INSERT INTO meta VALUES(?,?)').run('seq',7);db.close();
+ const directory=fixture();try{const db=new DatabaseSync(join(directory,'host.sqlite'));for(const index of epoch.statements)db.exec(history.statements[index]);for(const index of epoch.migrations){const m=history.migrations[index];if(!db.prepare(`PRAGMA table_info(${m.table})`).all().some(row=>row.name===m.column))db.exec(m.sql);}db.prepare('INSERT INTO meta VALUES(?,?)').run('seq',7);db.close();
   const owner=new Store(directory);assert.equal(owner.seq,7);assert.ok(Number(owner.db.prepare('PRAGMA user_version').get()!.user_version)>0);assert.equal(absent(owner.db,'import_adoptions'),false);owner.close();
  }finally{rmSync(directory,{recursive:true,force:true});}
 });
 
 test('unversioned current damage is not an arbitrary legacy subset',()=>{
  const directory=fixture();try{new Store(directory).close();damage(directory,'PRAGMA user_version=0; DROP TABLE lifecycle_commands');withoutWrites(directory,()=>new Store(directory));}finally{rmSync(directory,{recursive:true,force:true});}
+});
+
+test('later unversioned tables cannot authorize reconstruction of columns from older epochs',()=>{
+ for(const sql of [
+  'DROP INDEX sessions_execution; ALTER TABLE sessions DROP COLUMN execution_cwd; ALTER TABLE sessions DROP COLUMN native_location_revision',
+  'DROP INDEX sessions_visible_order; ALTER TABLE sessions DROP COLUMN hidden',
+  'DROP INDEX terminals_lifecycle; ALTER TABLE terminals DROP COLUMN lifecycle',
+  'DROP INDEX queue_projection_pending; ALTER TABLE queue_intents DROP COLUMN projected',
+ ]){const directory=fixture();try{const store=new Store(directory);admit(store);store.close();damage(directory,'PRAGMA user_version=0; '+sql);withoutWrites(directory,()=>new Store(directory));const db=new DatabaseSync(join(directory,'host.sqlite'),{readOnly:true});try{assert.equal(JSON.parse(String(db.prepare('SELECT payload FROM receipts').get()!.payload)).status,'admitted');}finally{db.close();}}finally{rmSync(directory,{recursive:true,force:true});}}
 });
 
 test('legacy quiescence service migration and independently initialized namespace are valid',()=>{

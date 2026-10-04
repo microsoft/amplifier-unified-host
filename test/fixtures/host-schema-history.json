@@ -1,5 +1,5 @@
 {
-  "note": "Exact CREATE TABLE declarations from public Host src/store.ts, deduplicated; column ALTER migrations are exercised by current startup. No personal state.",
+  "note": "Exact public Host CREATE TABLE and ALTER ADD COLUMN declarations, deduplicated. Each source profile includes completed initializer migrations; no personal state.",
   "statements": [
     "CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);",
     "CREATE TABLE IF NOT EXISTS sessions(uri TEXT PRIMARY KEY,chat_uri TEXT UNIQUE NOT NULL,engine_id TEXT NOT NULL,native_id TEXT,cwd TEXT NOT NULL,modified TEXT NOT NULL,summary TEXT NOT NULL,state TEXT NOT NULL,chat TEXT NOT NULL);",
@@ -36,6 +36,9 @@
         4,
         5,
         6
+      ],
+      "migrations": [
+        0
       ]
     },
     {
@@ -50,6 +53,9 @@
         7,
         8,
         6
+      ],
+      "migrations": [
+        0
       ]
     },
     {
@@ -65,6 +71,11 @@
         9,
         8,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2
       ]
     },
     {
@@ -81,6 +92,12 @@
         8,
         10,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        3
       ]
     },
     {
@@ -98,6 +115,12 @@
         10,
         11,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        3
       ]
     },
     {
@@ -116,6 +139,12 @@
         10,
         11,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        3
       ]
     },
     {
@@ -139,6 +168,13 @@
         10,
         11,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        4,
+        3
       ]
     },
     {
@@ -164,6 +200,13 @@
         10,
         11,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        4,
+        3
       ]
     },
     {
@@ -190,6 +233,13 @@
         10,
         11,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        4,
+        3
       ]
     },
     {
@@ -218,7 +268,41 @@
         10,
         11,
         6
+      ],
+      "migrations": [
+        0,
+        1,
+        2,
+        4,
+        3
       ]
+    }
+  ],
+  "migrations": [
+    {
+      "table": "terminals",
+      "column": "lifecycle",
+      "sql": "ALTER TABLE terminals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'exited';"
+    },
+    {
+      "table": "sessions",
+      "column": "execution_cwd",
+      "sql": "ALTER TABLE sessions ADD COLUMN execution_cwd TEXT;"
+    },
+    {
+      "table": "sessions",
+      "column": "native_location_revision",
+      "sql": "ALTER TABLE sessions ADD COLUMN native_location_revision INTEGER NOT NULL DEFAULT 0;"
+    },
+    {
+      "table": "queue_intents",
+      "column": "projected",
+      "sql": "ALTER TABLE queue_intents ADD COLUMN projected INTEGER NOT NULL DEFAULT 1;"
+    },
+    {
+      "table": "sessions",
+      "column": "hidden",
+      "sql": "ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;"
     }
   ]
 }
