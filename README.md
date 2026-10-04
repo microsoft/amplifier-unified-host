@@ -1362,3 +1362,12 @@ state or normalizing interrupted commands. Genuine new stores, documented legacy
 migrations and never-initialized optional owners remain supported. Preserve a
 refused database and its WAL for inspection or exact backup restoration; do not
 clear it to retry. See [schema admission and its limits](docs/authoritative-schema.md).
+
+Unresolved retirement is journaled before its RPC in the existing Host receipts
+and selected session metadata. A closed ACP connection or Host restart cannot
+erase this fence. Only the matching original connection, mapping and retirement
+receipt may clear it on proof. If that connection is lost before proof arrives,
+this seam cannot recover it: the chat stays blocked until a separate authoritative
+recovery path resolves the original uncertainty. Process exit alone is not proof.
+Definitive refusal or confirmed retirement settles only the retirement receipt;
+ordinary cold resume remains available and user-input receipts are untouched.

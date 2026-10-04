@@ -252,3 +252,22 @@ also performs one bounded status read if fenced. Prior unknown input receipts
 remain unchanged and block admission until independently reconciled. See
 [causal fixtures](../../test/retirement-uncertainty.test.ts). Source/package
 fixtures are separate from actual Native worker proof and live account acceptance.
+
+### Connection loss and durable retirement uncertainty
+
+Before dispatch, Host stores a bounded retirement fence in existing selected
+session metadata and a session-scoped Host receipt. It binds the original
+connection, Native mapping and captured retirement command. Definite refusal
+or confirmed retirement settles only that receipt and clears its matching fence.
+Passive status proof must match both the captured in-memory command and its
+existing journal receipt; an older proof cannot clear a changed fence.
+
+Closing an ACP process, removing a viewer or restarting Host does not clear
+pending/unknown retirement. Execution, lifecycle and host quiescence retain that
+uncertainty. Quiescence checks the indexed retirement receipt namespace rather
+than loading session states globally. No new store or recovery subsystem is
+introduced. Losing the original connection prevents this same-connection status
+seam from recovering the chat; separate authoritative recovery is required.
+Process exit alone is insufficient. These limits do not alter safe cold resume
+after definite refusal or confirmed retirement, or settle any prior unknown user
+input. See [durable causal checks](../../test/retirement-durable.test.ts).

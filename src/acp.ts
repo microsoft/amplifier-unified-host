@@ -25,6 +25,7 @@ interface Terminal {
 /** One process per active agent session. Sessions are not tied to viewers. */
 export class AcpProcess {
   readonly process: ChildProcessWithoutNullStreams;
+  readonly connectionId = randomUUID();
   readonly client: ClientSideConnection;
   initialized!: InitializeResponse;
   nativeId?: string;
@@ -143,7 +144,7 @@ export class AcpProcess {
     } finally {this.loading=false;}
   }
   /** Native atomic graceful retirement; refusal/uncertainty never force-closes owned work. */
-  async retireIfIdle(timeoutMs=10000):Promise<boolean> {
+  async retireIfIdle(timeoutMs=10000,beforeDispatch?:()=>void):Promise<boolean> {
     if(this.retirementOutcome==='unknown'||this.retirementOutcome==='pending')return false;
     if(this.retirementOutcome==='retired')return true;
     if(this.terminalLifetimes.size)return false;
@@ -153,6 +154,7 @@ export class AcpProcess {
     let timer:ReturnType<typeof setTimeout>|undefined;
     this.retirementOutcome='pending';
     try {
+      beforeDispatch?.();
       const result=await Promise.race([this.client.extMethod('_amplifier/retire',{sessionId:this.nativeId}),new Promise<undefined>(resolve=>{timer=setTimeout(()=>resolve(undefined),timeoutMs);timer.unref();})]);
       if(result?.retired===true){this.retirementOutcome='retired';return true;}
       this.retirementOutcome=result?.retired===false&&['owned_work','active_request'].includes(String(result.reason))?'refused':'unknown';
