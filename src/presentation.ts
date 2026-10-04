@@ -61,7 +61,7 @@ export class ConversationPresentation {
  hidden(session:string){return !!this.db.prepare('SELECT 1 FROM presentation_markers WHERE session=? AND hidden=1').get(uri(session));}
  enqueueHint(path:string){if(this.ports.hint)this.hints.enqueue(path);}
  hintDiagnostics(){return this.hints.inspect();}
- async discoverFamily<T>(parentUri:string,work:()=>Promise<T>):Promise<T>{return this.serial(()=>this.hints.discover({attemptId:randomUUID(),method:'reconcileFamily',parentUri},work));}
+ async discoverFamily<T>(parentUri:string,work:()=>Promise<T>):Promise<T>{return this.serial(()=>{if(this.state()!.phase==='unknown')throw new PresentationError('Retained presentation outcome is unknown; reconstruct its exact authority before family discovery',{executed:false});return this.hints.discover({attemptId:randomUUID(),method:'reconcileFamily',parentUri},work);});}
  async close(){await this.hints.close();}
  async checkReady(wake=true){
   const state=this.state()!;if(!state.ready&&state.phase!=='checking')return this.inspect();
