@@ -52,6 +52,13 @@ Clients choose an advertised engine ID; they cannot provide arbitrary commands.
 Native engine authentication is configured in that engine's supported setup.
 This host does not equate ACP authentication-method selection with AHP OAuth.
 
+Standard ACP select configuration projects to the existing generic `enum` and
+`enumLabels` fields. Each schema property also retains the exact standard
+`options` array (including groups, group IDs and choice metadata), optional
+`category`, and nested option `_meta`. Rich clients can render those typed fields
+without interpreting display labels. Vendor metadata never replaces schema type,
+enum or mutability. Complete ACP option updates replace the prior selector list.
+
 Use the independent catalog for historical/scaled deployments. `StdioCatalog`
 owns one long-lived child process, never a process per query. It forwards scoped
 list/get/upsert/hint operations, correlates concurrent replies, and bounds pending
