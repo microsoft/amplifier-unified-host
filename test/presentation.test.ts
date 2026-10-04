@@ -122,3 +122,13 @@ test('unknown selected-family writer survives restart and blocks reconstruction 
   const rebuild=await f.host.rebuild({commandId:'unknown-family',expectedRevision:0},actor);assert.equal(rebuild.status,'unknown');assert.equal(reconstructions,0);assert.equal(f.host.hintDiagnostics().unsettled,true);assert.equal(f.host.inspect().ready,false);
  }finally{await f.close();}
 });
+
+test('failed reconstruction blocks selected-family writers across restart until exact reconstruction completes',async()=>{
+ const f=await fixture();let discoveries=0;const reconstruct=f.ports.reconstructMetadata!;
+ try{
+  f.ports.reconstructMetadata=async()=>{throw Error('Reconstruction result unavailable');};const failed=await f.host.rebuild({commandId:'failed-reconstruction',expectedRevision:0},actor);assert.equal(failed.status,'unknown');assert.equal(f.host.inspect().phase,'unknown');
+  await assert.rejects(f.host.discoverFamily('ahp-session:/0000',async()=>{discoveries++;}),/Retained presentation outcome is unknown/);assert.equal(discoveries,0);assert.equal(f.host.hintDiagnostics().unsettled,false);
+  f.restart();await assert.rejects(f.host.discoverFamily('ahp-session:/0000',async()=>{discoveries++;}),/Retained presentation outcome is unknown/);assert.equal(discoveries,0);
+  f.ports.reconstructMetadata=reconstruct;assert.equal((await f.host.rebuild({commandId:'exact-reconstruction',expectedRevision:0},actor)).status,'completed');assert.equal(await f.host.discoverFamily('ahp-session:/0000',async()=>{discoveries++;return 'complete';}),'complete');assert.equal(discoveries,1);
+ }finally{await f.close();}
+});
