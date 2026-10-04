@@ -1,3 +1,4 @@
+import {nativeFailedInput} from './input-outcome.js';
 import {ConversationPresentation,type PresentationMetadata} from './presentation.js';
 import type {ConversationPresentationConfig,PresentationActor,PresentationPrepare,PresentationApply,PresentationRebuild,PresentationIdentity,VisibilityProjectionRequest,VisibilityProjectionReceipt} from './presentation-types.js';
 import {ManagedFilesJournal,type ManagedFilesProtection,type ManagedFilesApply,type ManagedFilesActor} from './managed-files.js';
@@ -2021,6 +2022,14 @@ export class AmplifierHost {
       if(special?.operation==='observation.submit'&&active.pendingTurn&&(error as Json).code===-32008&&(error as Json).data?.executed===false){
         this.store.finish(turnId,'failed','waiting_worker');this.store.annotateReceipt(turnId,{retryEligibility:'waiting_worker'});
         if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'WAITING_WORKER',message:'Observation was not executed; its original native worker is unavailable.'}}} as StateAction);
+        return;
+      }
+      const failed=!special&&nativeFailedInput(error,active.agent.initialized.agentCapabilities,active.agent.nativeId,turnId);
+      let failureUpdatesJoined=false;if(failed)try{await active.updates;failureUpdatesJoined=true;}catch{}
+      if(failed&&failureUpdatesJoined){
+        this.store.transaction(()=>{this.store.finish(turnId,'failed',failed.error.message);this.store.annotateReceipt(turnId,{nativeInputOutcome:failed});});
+        this.projectPendingTurn(uri,active);
+        if(this.getRecord(uri)!.chat.activeTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'NATIVE_INPUT_FAILED',message:failed.error.message,_meta:{'amplifier.dev/inputOutcome':failed}}}} as StateAction);
         return;
       }
       this.store.finish(turnId,'unknown',(error as Error).message);if(!active.historyRevision||active.historyRevision.confirmed)this.projectPendingTurn(uri,active);

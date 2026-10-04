@@ -1,3 +1,4 @@
+import type {NativeFailedInput} from './input-outcome.js';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { OwnerLease } from './owner-lease.js';
@@ -12,7 +13,7 @@ export interface SessionRecord {
 export interface Receipt {
   commandId: string; channel: string; clientId: string; clientSeq: number;
   status: 'admitted' | 'dispatching' | 'completed' | 'failed' | 'cancelled' | 'unknown';
-  fingerprint: string; createdAt: string; updatedAt: string; detail?: string;requestSignature?:string;retryEligibility?:'waiting_worker';observationAdmission?:Record<string,unknown>;
+  fingerprint: string; createdAt: string; updatedAt: string; detail?: string;requestSignature?:string;retryEligibility?:'waiting_worker';observationAdmission?:Record<string,unknown>;nativeInputOutcome?:NativeFailedInput;
 }
 
 /** Host projections and admission only. Native agent history is never rewritten here. */
@@ -196,7 +197,7 @@ export class Store {
     if (!receipt) throw new Error('Unknown command identity');
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,status,detail,updatedAt:new Date().toISOString()}),commandId);
   }
-  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'>) {
+  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'|'nativeInputOutcome'>) {
     const receipt=this.receipt(commandId);if(!receipt)throw new Error('Unknown command identity');
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,...values}),commandId);
   }

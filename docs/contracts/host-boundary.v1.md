@@ -184,3 +184,24 @@ runtime is mounted. It preserves config options, command receipts and settlement
 markers; it does not infer effective bundle/provider configuration, load a
 session, resume a worker or replay an input. Native history remains the owner of
 canonical locators and annotation copying.
+
+### Negotiated durable terminal input failure
+
+An ordinary prompt error is unknown unless the configured native peer advertises
+`inputOutcome:{version:1,method:"_amplifier/input/receipt",passive:true,durable:true}`
+and the same dispatch returns an exact bounded `data["amplifier.dev/inputOutcome"]`
+receipt. The receipt must bind the original native `sessionId` and admitted AHP
+`inputId`, with `version:1,status:"failed",terminal:true,noReplay:true,
+inputPersisted:true`. `effectBoundary` is one of `unknown`, `input-persisted`,
+`provider-request`, `model-output`, or `tool-effects`; `error` contains only bounded
+`type` and safe public `message`. Unknown fields, including `executed:false`, are
+not terminal proof. The native owner must durably write the receipt before sending
+it; the host does not reconstruct one from an exception class or a last-failure
+sidecar.
+
+After joining update projection, the host records the original admission as
+failed and retains the native proof in its receipt. This does not roll back
+effects, grant retry eligibility, replay a queue, or reclassify any previously
+unknown command. The original input ID remains nonreplayable across restart.
+Missing, mismatched, nonterminal or unnegotiated proofs remain unknown. Explicit
+new corrected input is independent of the failed original input.
