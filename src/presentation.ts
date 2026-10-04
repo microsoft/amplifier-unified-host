@@ -1,3 +1,4 @@
+import {initializeAuthority} from './authoritative-schema.js';
 import {CatalogHints} from './catalog-hints.js';
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
@@ -38,7 +39,7 @@ export class ConversationPresentation {
  private working=false;
  private hints:CatalogHints;
  constructor(private db:DatabaseSync,private ports:PresentationPorts){
-  db.exec(`CREATE TABLE IF NOT EXISTS presentation_state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
+  initializeAuthority(db,'presentation',()=>{db.exec(`CREATE TABLE IF NOT EXISTS presentation_state(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS presentation_reviews(id TEXT PRIMARY KEY,command_id TEXT UNIQUE NOT NULL,signature TEXT NOT NULL,payload TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS presentation_review_rows(review_id TEXT NOT NULL,ordinal INTEGER NOT NULL,session TEXT NOT NULL,metadata TEXT NOT NULL,metadata_hash TEXT NOT NULL,before_hidden INTEGER NOT NULL,before_revision INTEGER NOT NULL,target_hidden INTEGER NOT NULL,PRIMARY KEY(review_id,ordinal),UNIQUE(review_id,session));
    CREATE TABLE IF NOT EXISTS presentation_markers(session TEXT PRIMARY KEY,hidden INTEGER NOT NULL,revision INTEGER NOT NULL,identity TEXT NOT NULL,metadata TEXT NOT NULL,command_id TEXT NOT NULL);
@@ -51,6 +52,7 @@ export class ConversationPresentation {
   const old=this.state();
   if(!old)this.save({enabled:true,ready:false,revision:0,source:'host:'+randomUUID()+':conversation-presentation-v1',projectionRevision:0,phase:'checking'});
   else this.save({...old,ready:false,phase:old.phase==='ready'?'checking':old.phase,reason:old.phase==='ready'?'confirm-catalog-checkpoint':'host-restarted'});
+  });
   this.hints=new CatalogHints(db,{hint:(path,context)=>this.ports.hint!(path,context),ready:async()=>{await this.checkReady(false);return this.inspect().ready;},blocked:reason=>this.save({...this.state()!,ready:false,phase:'unknown',reason}),settle:ports.settleDiscovery});
  }
  private state():PresentationReadiness|undefined{const row=this.db.prepare('SELECT payload FROM presentation_state WHERE id=1').get();return row?JSON.parse(String(row.payload)):undefined;}

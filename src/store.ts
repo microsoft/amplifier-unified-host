@@ -1,3 +1,4 @@
+import {initializeAuthority,preflightAuthorityFile} from './authoritative-schema.js';
 import type {NativeFailedInput} from './input-outcome.js';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
@@ -28,8 +29,10 @@ export class Store {
     this.lease=new OwnerLease(directory);
     let opened:DatabaseSync|undefined;
     try{
-    this.db = opened = new DatabaseSync(join(directory, 'host.sqlite'));
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+    const path=join(directory,'host.sqlite'),existingFile=preflightAuthorityFile(path,'store');
+    this.db = opened = new DatabaseSync(path);
+    initializeAuthority(this.db,'store',()=>{
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES('seq',0);
       CREATE TABLE IF NOT EXISTS sessions(uri TEXT PRIMARY KEY,chat_uri TEXT UNIQUE NOT NULL,engine_id TEXT NOT NULL,native_id TEXT,cwd TEXT NOT NULL,modified TEXT NOT NULL,summary TEXT NOT NULL,state TEXT NOT NULL,chat TEXT NOT NULL);
@@ -102,6 +105,7 @@ export class Store {
       const receipt = JSON.parse(row.payload as string) as Receipt;
       this.finish(receipt.commandId, 'unknown', 'Host restarted before a conclusive ACP outcome; reconcile native history before new work.');
     }
+    },{existingFile,configure:'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'});
     }catch(error){opened?.close();this.lease.close();throw error;}
   }
   get seq(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='seq'").get()!.value); }
