@@ -99,7 +99,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {retirementCommandId?:string;finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {retirementCommandId?:string;finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -138,6 +138,9 @@ export class AmplifierHost {
   private hotRecords=new Map<string,SessionRecord>();
   private clientTools=new Map<string,{session:string;chat:string;turnId:string;clientId:string;resolve:(result:Json)=>void;timer:ReturnType<typeof setTimeout>}>();
   private observers=new Set<{session:string;chat:string;queue:ActionEnvelope[];bytes:number;running:boolean;closed:boolean;listener:(event:ActionEnvelope)=>void|Promise<void>;onError?:(error:Error)=>void}>();
+  private agentUseOrder=0;
+  private admittedStarts=new Set<string>();
+  private agentCapacity:Promise<unknown>=Promise.resolve();
   private retireTimer:ReturnType<typeof setInterval>;
   private steeringTimers=new Map<string,ReturnType<typeof setTimeout>>();
   private stoppedCallbacks=new Set<Promise<void>>();
@@ -245,7 +248,7 @@ export class AmplifierHost {
   private accept(socket:WebSocket) {
     const peer:Peer={socket,connectionId:randomUUID(),handshakeQueued:false,initialized:false,ready:false,buffer:[],bufferBytes:0,cuts:new Map(),lastClientSeq:-1,seenClientSeq:new Set(),subscriptions:new Set(),pending:0,queue:Promise.resolve(),channels:new Map(),cursors:new Map()};this.peers.add(peer);
     socket.on('error',()=>{});
-    socket.on('close',()=>{this.peers.delete(peer);const subscriptions=[...peer.subscriptions];peer.subscriptions.clear();peer.cursors.clear();for(const uri of subscriptions){this.removeActiveClient(uri,peer.clientId);if(!this.hasSubscribers(uri)){this.loadedFloors.delete(uri);this.nativeWindows.delete(uri);}}for(const [uri,watch] of this.watches)if(watch.owner===peer&&!this.hasSubscribers(uri))this.watches.delete(uri);});
+    socket.on('close',()=>{this.peers.delete(peer);const subscriptions=[...peer.subscriptions];peer.subscriptions.clear();peer.cursors.clear();for(const uri of subscriptions){this.refreshAgentInterest(uri);this.removeActiveClient(uri,peer.clientId);if(!this.hasSubscribers(uri)){this.loadedFloors.delete(uri);this.nativeWindows.delete(uri);}}for(const [uri,watch] of this.watches)if(watch.owner===peer&&!this.hasSubscribers(uri))this.watches.delete(uri);});
     socket.on('message',data=>{
       let message:Json;try {message=JSON.parse(data.toString());if(message.jsonrpc!=='2.0'||typeof message.method!=='string')throw new Error();}catch {this.send(peer,{jsonrpc:'2.0',id:null,error:{code:-32700,message:'Invalid JSON-RPC request'}});return;}
       if(++peer.pending>(this.config.maxInFlightRequests??32)){socket.close(1013,'Inbound capacity exceeded');return;}
@@ -324,6 +327,19 @@ export class AmplifierHost {
     if(this.managed&&this.insideManaged(path))throw new RpcFault(-32009,'Managed chat files require a selected-session resource owner');
     if(!this.roots.some(root=>{const rel=relative(root,path);return !rel||rel!=='..'&&!rel.startsWith('../')&&!isAbsolute(rel);}))throw new RpcFault(-32009,'Resource outside allowed workspace roots');
     return path;
+  }
+  private agentInterested(session:string){return this.hasSubscribers(session)||this.hasSubscribers(chatURI(session));}
+  private refreshAgentInterest(channel:string) {
+    if(typeof channel!=='string'||!/^ahp-(session|chat):/.test(channel))return;
+    const session=channel.replace('ahp-chat:','ahp-session:'),active=this.active.get(session);
+    if(!active)return;
+    const interested=this.agentInterested(session);
+    if(active.interested===true&&!interested)active.uninterestedSince=performance.now();
+    active.interested=interested;
+  }
+  private touchAgent(active:Active){active.lastUsed=performance.now();active.useOrder=++this.agentUseOrder;}
+  private withAgentCapacity<T>(work:()=>Promise<T>):Promise<T> {
+    const next=this.agentCapacity.catch(()=>{}).then(work);this.agentCapacity=next;return next;
   }
   private hasSubscribers(uri:string){return [...this.peers].some(peer=>peer.subscriptions.has(uri));}
   private capability(uri:string) {
@@ -585,7 +601,7 @@ export class AmplifierHost {
   private async subscribe(peer:Peer,uri:string,turns?:number) {
     if(peer.subscriptions.size>=(this.config.maxSubscriptions??64)&&!peer.subscriptions.has(uri))throw new RpcFault(-32000,'Subscription capacity reached');
     if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');
-    const snapshot=await this.snapshot(uri,turns);const attach=async()=>{if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');peer.subscriptions.add(uri);return snapshot;};const session=uri.replace('ahp-chat:','ahp-session:');return this.presentationSelections.has(session)?this.withLock(session,attach):attach();
+    const snapshot=await this.snapshot(uri,turns);const attach=async()=>{if(this.retentionChanging.has(uri))throw new RpcFault(-32011,'Selected session has an admitted retention operation');peer.subscriptions.add(uri);this.refreshAgentInterest(uri);return snapshot;};const session=uri.replace('ahp-chat:','ahp-session:');return this.presentationSelections.has(session)?this.withLock(session,attach):attach();
   }
   private async route(peer:Peer,method:string,p:Json):Promise<unknown> {
     if(method==='ping')return null;
@@ -608,7 +624,7 @@ export class AmplifierHost {
       peer.clientId=p.clientId;peer.initialized=true;
       const missing:string[]=[];
       if(p.subscriptions.length>(this.config.maxSubscriptions??64))throw new RpcFault(-32000,'Subscription capacity reached');
-      for(const uri of p.subscriptions)try {if(this.retentionChanging.has(uri))throw new Error('Retention operation in progress');if(uri!==ROOT&&!this.watches.has(uri)&&!this.terminalState(uri))await this.record(uri);peer.subscriptions.add(uri);}catch{missing.push(uri);}
+      for(const uri of p.subscriptions)try {if(this.retentionChanging.has(uri))throw new Error('Retention operation in progress');if(uri!==ROOT&&!this.watches.has(uri)&&!this.terminalState(uri))await this.record(uri);peer.subscriptions.add(uri);this.refreshAgentInterest(uri);}catch{missing.push(uri);}
       const replay=this.store.replay(p.lastSeenServerSeq,peer.subscriptions);
       if(replay){peer.replayCut=this.store.seq;return {type:'replay',actions:replay,missing};}
       // Snapshot recovery has no view hint in AHP 0.9; return all retained turns as specified.
@@ -619,7 +635,7 @@ export class AmplifierHost {
     if(!peer.initialized)throw new RpcFault(-32600,'initialize must be the first request');
     switch(method) {
       case 'subscribe':return {snapshot:await this.subscribe(peer,p.channel,p.view?.turns===undefined?undefined:bounded(p.view.turns,50,10000))};
-      case 'unsubscribe':peer.subscriptions.delete(p.channel);this.removeActiveClient(p.channel,peer.clientId);if(!this.hasSubscribers(p.channel)){this.loadedFloors.delete(p.channel);this.nativeWindows.delete(p.channel);this.watches.delete(p.channel);}return null;
+      case 'unsubscribe':peer.subscriptions.delete(p.channel);this.refreshAgentInterest(p.channel);this.removeActiveClient(p.channel,peer.clientId);if(!this.hasSubscribers(p.channel)){this.loadedFloors.delete(p.channel);this.nativeWindows.delete(p.channel);this.watches.delete(p.channel);}return null;
       case 'listSessions': {
         const limit=bounded(p.limit,50,200);
         if(this.config.catalog) {const result=await this.withConversationCatalogRead(()=>this.config.catalog!.list({connectionId:peer.connectionId,limit,cursor:p.cursor,allowedWorkspaceRoots:this.roots,...(this.managed?{allowedManagedRoots:[this.managed.root]}:{})}));return {...result,items:result.items.filter(row=>!this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(row.uri)).map(row=>this.catalogSummary(row))};}
@@ -1475,20 +1491,26 @@ export class AmplifierHost {
     return this.intake.run(async()=>{
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     this.guardSessionLifecycle(uri);
-    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing)this.guardRetirement(existing);this.guardRetirementRecord(await this.record(uri));if(existing&&!existing.agent.closed){existing.lastUsed=Date.now();return existing;}
+    const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing)this.guardRetirement(existing);this.guardRetirementRecord(await this.record(uri));if(existing&&!existing.agent.closed){this.touchAgent(existing);return existing;}
     if(existing?.agent.closed)this.active.delete(uri);
     if(this.starting.has(uri))return this.starting.get(uri)!;
     const pending=(async()=>{
-      await Promise.resolve(); // Publish this reservation before checking concurrent startup capacity.
-      const count=()=>new Set([...this.active.keys(),...this.starting.keys()]).size;
-      if(count()>(this.config.maxActiveAgents??8))await this.retireIdle(true);
-      if(count()>(this.config.maxActiveAgents??8))throw new RpcFault(-32000,'Active agent capacity reached; no historical workers are prewarmed');
+      // Publish pending deduplication before admitting a process-start reservation.
+      await Promise.resolve();
+      await this.withAgentCapacity(async()=>{
+        const count=()=>new Set([...this.active.keys(),...this.admittedStarts]).size;
+        while(count()>=(this.config.maxActiveAgents??8)) {
+          if(!await this.retireIdleUnderCapacity(true))throw new RpcFault(-32000,'Active agent capacity reached; no safe cached agent can be retired');
+        }
+        this.admittedStarts.add(uri);
+      });
       const record=await this.record(uri),engine=this.config.engines.find(e=>e.id===record.engineId);
       if(!engine)throw new RpcFault(-32002,'Session engine is not configured');
       await this.selectedWorkspace(record,true);
-      const active:Active={agent:null as any,busy:false,lastUsed:Date.now(),tools:new Set(),permissions:new Map()};
+      const active:Active={agent:null as any,busy:false,lastUsed:performance.now(),uninterestedSince:performance.now(),interested:this.agentInterested(uri),tools:new Set(),permissions:new Map()};
       const agent=new AcpProcess(engine,record.executionDirectory??record.workingDirectory,{
         hostCapabilities:this.config.nativeHostCapabilities,
+        hostRuntimeRetention:true,
         admitEffect:work=>this.intake.run(work),
         update:params=>{
           const bytes=Buffer.byteLength(JSON.stringify(params));active.updateCount=(active.updateCount??0)+1;active.updateBytes=(active.updateBytes??0)+bytes;
@@ -1518,10 +1540,10 @@ export class AmplifierHost {
           if(observation){const args=params.args as Json|undefined;bytes=Buffer.byteLength(JSON.stringify(args??{}));if(typeof args?.runtimeSessionId!=='string'||!args.runtimeSessionId||args.runtimeSessionId.length>512||!args.event||typeof args.event!=='object'||Array.isArray(args.event)||bytes>256*1024||(active.observationPending??0)>=32||(active.observationBytes??0)+bytes>1024*1024)throw new Error('Owned operation observation exceeded its scoped callback bounds');active.observationPending=(active.observationPending??0)+1;active.observationBytes=(active.observationBytes??0)+bytes;}
           try{return await this.intake.continuation(()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params));}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}}
         }}:{}),
-      });active.agent=agent;this.active.set(uri,active);
+      });active.agent=agent;this.touchAgent(active);this.active.set(uri,active);
       try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));return active;}
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
-    })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);}
+    })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);this.admittedStarts.delete(uri);}
       });
   }
   private async catalogHint(path:string){if(this.presentation)this.presentation.enqueueHint(path);else await this.config.catalog?.hint?.(path);}
@@ -2118,7 +2140,7 @@ export class AmplifierHost {
       for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
       if(active.historyRevision){const receipt=this.store.receipt(turnId)!;this.store.db.prepare('UPDATE history_edits SET status=? WHERE operation_id=?').run(receipt.status,active.historyRevision.args.operationId);}
       active.historyRevision=undefined;active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;
-      for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.lastUsed=Date.now();
+      for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;this.touchAgent(active);
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
       await this.syncCatalog(this.getRecord(uri)!).catch(()=>{});
@@ -2250,21 +2272,44 @@ export class AmplifierHost {
     const event=Object.freeze({session,nativeSessionId:active.agent.nativeId,engineId:active.agent.engine.id,workingDirectory:active.agent.cwd,reason,...details});
     const pending=Promise.resolve().then(()=>this.config.agentStopped!(event)).catch(()=>{this.stoppedCallbackFailures++;}).finally(()=>{this.stoppedCallbacks.delete(pending);this.intake.workChanged();});this.stoppedCallbacks.add(pending);active.stopCallback=pending;
   }
+  private cachedAgentProtected(uri:string,active:Active,underSelectedLock=false) {
+    const chat=chatURI(uri);
+    if(['pending','unknown'].includes(active.agent.retirementOutcome)||active.busy||active.finishing||active.controlDepth||active.permissions.size||active.updateCount||active.observationPending||this.starting.has(uri)||(!underSelectedLock&&this.resourceLocks.has(uri)))return true;
+    if(this.settledCallbacks.size||this.stoppedCallbacks.size||[...this.clientTools.values()].some(tool=>tool.session===uri)||this.store.db.prepare("SELECT 1 FROM receipts WHERE channel=? AND json_extract(payload,'$.status') IN ('admitted','dispatching','unknown') LIMIT 1").get(chat)||this.relocationFence(uri)||this.transferFence(uri)||this.retentionChanging.has(uri))return true;
+    try{this.guardSessionLifecycle(uri);}catch{return true;}
+    return !!this.store.db.prepare("SELECT 1 FROM queue_intents WHERE chat=? AND status='pending' UNION ALL SELECT 1 FROM steering_intents WHERE chat=? AND status IN ('pending','dispatching','unknown') UNION ALL SELECT 1 FROM history_edits WHERE session=? AND status IN ('admitted','unknown') LIMIT 1").get(chat,chat,uri);
+  }
   private async retireIdle(force=false) {
-    if(this.intake.inspect().intakeClosed)return;
-    for(const [uri,active] of this.active) {
-      if(active.busy||active.controlDepth||this.starting.has(uri)||this.resourceLocks.has(uri)||(!force&&Date.now()-active.lastUsed<(this.config.idleAgentMs??60000)))continue;
+    return this.withAgentCapacity(()=>this.retireIdleUnderCapacity(force));
+  }
+  private async retireIdleUnderCapacity(force=false):Promise<boolean> {
+    if(this.intake.inspect().intakeClosed)return false;
+    for(const [uri] of this.active)this.refreshAgentInterest(uri);
+    const candidates=[...this.active].map(([uri,active])=>({uri,active,priorOrder:active.useOrder,priorInterest:active.interested}));
+    candidates.sort((a,b)=>Number(!!a.priorInterest)-Number(!!b.priorInterest)||(a.priorOrder??0)-(b.priorOrder??0)||a.uri.localeCompare(b.uri));
+    let retiredAny=false;
+    for(const {uri,active,priorOrder,priorInterest} of candidates) {
+      if(this.cachedAgentProtected(uri,active))continue;
+      if(!force&&(active.interested||performance.now()-Math.max(active.lastUsed,active.uninterestedSince??active.lastUsed)<(this.config.idleAgentMs??900000)))continue;
       if(!active.agent.initialized?.agentCapabilities?.sessionCapabilities?.resume&&!active.agent.initialized?.agentCapabilities?.loadSession)continue;
-      const retired=await this.withLock(uri,async()=>{
-        if(this.active.get(uri)!==active||active.busy||active.controlDepth||this.starting.has(uri))return false;
+      const retirement=this.withLock(uri,async()=>{
+        this.refreshAgentInterest(uri);
+        // This lock itself is expected; any queued successor must also protect use.
+        if(this.resourceLocks.get(uri)!==retirement||this.active.get(uri)!==active||active.useOrder!==priorOrder||active.interested!==priorInterest||active.busy||active.finishing||active.controlDepth||active.permissions.size||this.starting.has(uri))return false;
+        // Recheck durable protection after the asynchronous lock boundary.
+        if(this.cachedAgentProtected(uri,active,true))return false;
+        if(!force&&(active.interested||performance.now()-Math.max(active.lastUsed,active.uninterestedSince??active.lastUsed)<(this.config.idleAgentMs??900000)))return false;
         active.controlDepth=(active.controlDepth??0)+1;
         try {
           if(!await this.retireActive(uri,active))return false;
           active.retireReason='idle-retired';await active.agent.retire();await active.stopCallback;this.active.delete(uri);return true;
         }finally{active.controlDepth--;}
       });
-      if(force&&retired)return;
+      const retired=await retirement;
+      if(retired)retiredAny=true;
+      if(force&&retired)return true;
     }
+    return retiredAny;
   }
   private quiescenceWork() {
     const active=[...this.active.values()];
@@ -2344,7 +2389,7 @@ export class AmplifierHost {
   withQuiescenceMaintenance<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T> {return this.intake.maintain(input,work);}
   /** Composition uses this for native-admin and other effects outside normal AHP methods. */
   withExternalMutation<T>(ownerId:string,work:()=>Promise<T>):Promise<T> {return this.intake.external(ownerId,work);}
-  diagnostics(){return {...(this.presentation?{catalogHints:this.presentation.hintDiagnostics()}:{}),steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.starting.size,subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq,
+  diagnostics(){return {...(this.presentation?{catalogHints:this.presentation.hintDiagnostics()}:{}),steeringDispositionPending:this.steeringTimers.size,turnSettledPending:this.settledCallbacks.size,turnSettledFailures:this.settledCallbackFailures,turnSettledDropped:this.settledCallbackDropped,agentStoppedPending:this.stoppedCallbacks.size,agentStoppedFailures:this.stoppedCallbackFailures,clients:this.peers.size,activeAgents:this.active.size,startingAgents:this.admittedStarts.size,pendingAgentAdmissions:this.starting.size,agentCache:{capacity:this.config.maxActiveAgents??8,graceMs:this.config.idleAgentMs??900000,hostManaged:[...this.active.values()].filter(a=>a.agent.runtimeRetention==='host').length,unmanaged:[...this.active.values()].filter(a=>a.agent.runtimeRetention!=='host').length},subscriptions:[...this.peers].reduce((n,p)=>n+p.subscriptions.size,0),serverSeq:this.store.seq,
     workingSet:{hotRecords:this.hotRecords.size,passiveReads:this.passiveReads,selectedNativeWindows:this.nativeWindows.size,selectedNativeTurnIds:[...this.nativeWindows.values()].reduce((sum,window)=>sum+window.ids.length,0),selectedHostWindows:this.loadedFloors.size,cursors:{turns:this.cursors.size,native:this.nativeCursors.size,mixed:this.mixedCursors.size,prefix:this.prefixCursors.size,recall:this.recallCursors.size,coordination:this.coordinationCursors.size},peerBufferedBytes:[...this.peers].reduce((sum,peer)=>sum+peer.socket.bufferedAmount,0),handshakeQueuedEvents:[...this.peers].reduce((sum,peer)=>sum+peer.buffer.length,0),handshakeQueuedBytes:[...this.peers].reduce((sum,peer)=>sum+peer.bufferBytes,0)},
     retainedReplay:this.store.db.prepare('SELECT count(*) events,coalesce(sum(bytes),0) bytes FROM actions').get(),
     pendingQueue:this.store.db.prepare("SELECT count(*) messages,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM queue_intents WHERE status='pending'").get()

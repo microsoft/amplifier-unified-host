@@ -12,6 +12,8 @@ export interface AgentHandlers {
   hostRequest?(method: string, params: Record<string,unknown>): Promise<Record<string,unknown>>;
   nativeEvent?(params:Record<string,unknown>):Promise<void>;
   hostCapabilities?:Record<string,unknown>;
+  /** Request connection-scoped Host retention only for owned resident agents. */
+  hostRuntimeRetention?:boolean;
   /** Host admission for filesystem and terminal effects, including idle peer callbacks. */
   admitEffect?<T>(work:()=>Promise<T>):Promise<T>;
   stopped?(event:{exitCode?:number;signal?:string}):void;
@@ -28,6 +30,9 @@ export class AcpProcess {
   readonly connectionId = randomUUID();
   readonly client: ClientSideConnection;
   initialized!: InitializeResponse;
+  /** Immutable outcome of the initial connection handshake. */
+  private negotiatedRetention: 'host'|'unmanaged' = 'unmanaged';
+  get runtimeRetention(){return this.negotiatedRetention;}
   nativeId?: string;
   closed = false;
   loading = false;
@@ -119,7 +124,10 @@ export class AcpProcess {
     return canonical;
   }
   async initialize() {
-    this.initialized=await this.client.initialize({protocolVersion:1,clientInfo:{name:'amplifier-unified-host',version:'0.1.0'},clientCapabilities:{fs:{readTextFile:true,writeTextFile:true},terminal:true,_meta:{'amplifier.dev/native':{version:1},...(this.engine.messagePrincipal!==undefined?{'amplifier.dev/messagePrincipal':{version:1,account:this.engine.messagePrincipal}}:{}),...(this.handlers.hostRequest?{'amplifier.dev/host':{...this.handlers.hostCapabilities,version:1}}:{})}}});
+    this.initialized=await this.client.initialize({protocolVersion:1,clientInfo:{name:'amplifier-unified-host',version:'0.1.0'},clientCapabilities:{fs:{readTextFile:true,writeTextFile:true},terminal:true,_meta:{'amplifier.dev/native':{version:1},...(this.engine.messagePrincipal!==undefined?{'amplifier.dev/messagePrincipal':{version:1,account:this.engine.messagePrincipal}}:{}),...(this.handlers.hostRequest||this.handlers.hostRuntimeRetention?{'amplifier.dev/host':{...this.handlers.hostCapabilities,version:1,...(this.handlers.hostRuntimeRetention?{runtimeRetention:{version:1,owner:'host',lifetime:'connection'}}:{})}}:{})}}});
+    const native=this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any;
+    const retention=native?.lifecycle?.runtimeRetention;
+    this.negotiatedRetention=this.handlers.hostRuntimeRetention===true&&native?.version===1&&native.lifecycle?.version===1&&retention&&typeof retention==='object'&&!Array.isArray(retention)&&Object.keys(retention).sort().join(',')==='lifetime,owner,standaloneIdleSeconds,version'&&retention.version===1&&retention.owner==='host'&&retention.lifetime==='connection'&&typeof retention.standaloneIdleSeconds==='number'&&Number.isFinite(retention.standaloneIdleSeconds)&&retention.standaloneIdleSeconds>0?'host':'unmanaged';
     if(this.initialized.protocolVersion!==1)throw new Error('Agent did not negotiate stable ACP version 1');
     return this.initialized;
   }

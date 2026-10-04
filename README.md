@@ -106,6 +106,22 @@ fixture mode does not provide external discovery or background workspace recheck
   never session/load just to browse. Unknown historical outcomes are represented
   visibly rather than inferred from a saved assistant message.
 
+Already-started agents use a bounded recent-agent cache: eight resident or
+admitted starting sessions by default. Selected session/chat subscriptions give
+retention priority without starting a cold agent. Unreferenced idle entries get
+fifteen minutes of grace; capacity pressure evicts safe unreferenced entries
+first, then safe selected entries, using real use/settlement LRU in each tier.
+Active work, approvals, unresolved outcomes and Native-owned work remain
+protected. If no safe slot exists, new startup is refused.
+
+Host requests connection-scoped lifetime ownership at ACP initialization. Only
+an exact negotiated acknowledgement suppresses Native's independent idle timer.
+Generic or unacknowledged peers keep their own lifetime behavior; retaining the
+ACP connection does not promise their inner runtime stays warm. Diagnostics
+report managed/unmanaged counts. See [runtime retention v1](docs/contracts/runtime-retention.v1.md)
+for negotiation, grace, pressure and validation boundaries. `idleAgentMs` remains
+a server-side override; there is no selection-triggered preparation or UI setting.
+
 Default limits: eight active agents, four concurrent passive history readers,
 128 connected clients, 64 subscriptions per client, 32 concurrent requests per
 client, 512 queued ACP updates / 8 MiB, 8 MiB of active-turn projection input,
