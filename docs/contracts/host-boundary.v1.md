@@ -82,6 +82,27 @@ alone grants none of those authorities. New reversible product-visibility/reset
 semantics under development remain a separately reviewed producer/consumer seam;
 this packet does not claim they are implemented or replace the current contract.
 
+Copy consumers use the catalog's trusted, bounded `reconcileFamily` and
+`verifyFamily` seams when supported. Initial selected namespace discovery supplies
+an exact scoped inventory/revision proof; under admitted child locks the host
+revalidates that physical inventory and then the pure indexed revision before
+native dispatch. Cache freshness alone cannot account for a child created after
+discovery. Incomplete coverage, source changes and unavailable verification refuse
+without copying or replaying; native parent checks and actual writer leases still
+own execution safety. Metadata discovery never reads canonical body files or
+claims exclusion of noncooperating external writers. Legacy peers retain their
+existing complete global-freshness requirement; a supported refusal does not
+permit downgrade. Acceptance: [focused family integration](../../test/family-refresh.integration.test.ts)
+and the selected-family/legacy/unknown regressions in [host tests](../../test/host.test.ts).
+Selected-family reconciliation joins the presentation owner's exclusive discovery
+boundary. Metadata reconstruction pauses and joins that writer; an unknown reply
+retains the exact durable `reconcileFamily` attempt and blocks rebuilding until
+trusted response or actual process-exit evidence settles it. The owned stdio
+adapter joins the original process exit after a discovery timeout. Revalidation
+is read-only and does not join the derived-index writer queue.
+
+These are public catalog seams, not private SQL contracts or new AHP fields.
+
 Upstream omitted-view semantics remain authoritative: omitting `view.turns` can
 request all retained turns. Normal clients request bounded windows, but the host
 must not silently truncate required state to claim a universal memory bound.

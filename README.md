@@ -959,15 +959,36 @@ launcher owns the named choices; client filesystem references are not accepted.
 The original composition is retained in the source. Neither copying nor selecting
 a bundle claims model/account readiness.
 
-The independently installed catalog now optionally exposes `descendants`.
-Recovery and bundle copies require complete indexed family coverage (at most100),
-a completed issue-free discovery no older than10minutes, authorized workspaces,
-one configured engine and stable indexed revision while host child admission
-locks are held. Native Foundation writer leases guard actual known descendants.
-Child histories remain cold. An index cannot prove absence of undiscovered or
-noncooperating external writers; returned native coverage preserves that limit.
+The independently installed catalog optionally exposes `descendants` and the
+trusted `reconcileFamily` / `verifyFamily` pair. Before a copy guard, the host
+requests bounded discovery of the selected root's known native project namespaces
+(`limit:100,maxEntries:512`), not a global scan. A complete version1 scoped proof
+must bind the exact family revision, identities, inventory hash and process-local
+verification token. Partial, ambiguous, oversized, stale or missing proof refuses
+copying. Reconciliation reads at most 8MiB of metadata and 2048 metadata files;
+canonical transcript/event bodies are not read or changed.
+
+Selected-family reconciliation joins the presentation owner's exclusive discovery
+boundary. Metadata reconstruction pauses and joins that writer; an unknown reply
+retains the exact durable `reconcileFamily` attempt and blocks rebuilding until
+trusted response or actual process-exit evidence settles it. The owned stdio
+adapter joins the original process exit after a discovery timeout. Revalidation
+is read-only and does not join the derived-index writer queue.
+
+Under source and child admission locks, the host asks `verifyFamily` to check the
+retained namespace inventory again, then re-reads the pure indexed revision. An
+unhinted new native child, changed metadata, expired token, restarted producer or
+changed family refuses before native copy effects. Verification does not repair
+the index or replay a copy. Actual native Foundation root/descendant leases and
+native parent checks remain mandatory. The proof's `externalWriterCoverage:false`
+does not exclude a later noncooperating filesystem writer.
+
+Older producers lacking `reconcileFamily` (explicit method-not-found) retain the
+existing complete indexed/global-freshness path. Supported reconciliation failures
+never fall back to a weaker proof. Historical unknown outcomes remain preserved.
 Ordinary complete forks without a catalog retain native selected-worker-family
-coverage only. Configured catalogs lacking descendant support refuse copy effects.
+coverage only. Recovery/bundle copies require catalog coverage, and configured
+catalogs lacking descendant support refuse copy effects.
 
 `inspectSessionHistory` exposes negotiated per-engine `lifecycleCapabilities` and
 optional bounded native `failure` guidance. It never fabricates historical failure

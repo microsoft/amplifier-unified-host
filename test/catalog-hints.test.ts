@@ -20,3 +20,16 @@ test('failed hint retains exact attempt across reopen; mismatched settlement can
   proof={attemptId:attempt.attemptId,evidence:'process-exited',ownerReceipt:'retained-exit'};await hints.quiet();assert.equal(hints.inspect().unsettled,false);assert.equal(hints.inspect().pending,1);
  }finally{await hints.close();db.close();}
 });
+test('selected-family discovery shares durable writer settlement and joins exact in-flight work',async()=>{
+ const db=new DatabaseSync(':memory:');let release!:()=>void,entered!:()=>void,settlement:any,observed:any;
+ const hold=new Promise<void>(r=>release=r),started=new Promise<void>(r=>entered=r);
+ const ports={hint:async()=>{},ready:async()=>true,blocked:()=>{},settle:async(attempt:any)=>{observed=attempt;return settlement;}};let hints=new CatalogHints(db,ports);
+ try{
+  hints.pause();const attempt={attemptId:'family-attempt',method:'reconcileFamily' as const,parentUri:'ahp-session:/root'};
+  const writer=hints.discover(attempt,async()=>{entered();await hold;return 'complete';});await started;let quiet=false;const joining=hints.quiet().then(()=>quiet=true);await new Promise(r=>setTimeout(r,10));assert.equal(quiet,false);assert.equal(hints.inspect().inFlight,true);release();assert.equal(await writer,'complete');await joining;assert.equal(hints.inspect().unsettled,false);
+  await assert.rejects(hints.discover(attempt,async()=>{throw Error('unknown writer');}),/unknown writer/);await hints.close();hints=new CatalogHints(db,ports);hints.pause();
+  settlement={attemptId:'other',evidence:'process-exited',ownerReceipt:'exit'};await assert.rejects(hints.quiet(),/Exact catalog-owner/);assert.deepEqual(observed,attempt);assert.equal(hints.inspect().unsettled,true);
+  settlement={attemptId:attempt.attemptId,evidence:'process-exited',ownerReceipt:'original-exit'};await hints.quiet();assert.equal(hints.inspect().unsettled,false);
+  await assert.rejects(hints.discover({...attempt,attemptId:'settled'},async()=>{throw Object.assign(Error('refused'),{catalogDiscoverySettled:true});}),/refused/);assert.equal(hints.inspect().unsettled,false);
+ }finally{release();await hints.close();db.close();}
+});

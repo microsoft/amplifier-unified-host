@@ -104,3 +104,21 @@ test('preview byte pages are complete and bounded; oversized review refuses with
   f.rows.get('ahp-session:/0000').title='x'.repeat(20000);await assert.rejects(f.review('too-large'),/bounds/);assert.equal(f.stats().writes,0);
  }finally{await f.close();}
 });
+test('selected family discovery and metadata reconstruction exclude each other before writes',async()=>{
+ const f=await fixture(),entered=pause(),resume=pause();let discoveries=0,reconstructions=0;
+ try{
+  const original=f.ports.reconstructMetadata!;f.ports.reconstructMetadata=async request=>{reconstructions++;await original(request);};
+  const writer=f.host.discoverFamily('ahp-session:/0000',async()=>{discoveries++;entered.release();await resume.promise;return 'family';});await entered.promise;
+  await assert.rejects(f.host.rebuild({commandId:'during-family',expectedRevision:0},actor),/transaction already/);assert.equal(reconstructions,0);assert.equal(f.host.hintDiagnostics().inFlight,true);resume.release();assert.equal(await writer,'family');
+  const rebuilding=pause(),finish=pause();f.ports.reconstructMetadata=async request=>{reconstructions++;rebuilding.release();await finish.promise;await original(request);};
+  const rebuild=f.host.rebuild({commandId:'after-family',expectedRevision:0},actor);await rebuilding.promise;
+  await assert.rejects(f.host.discoverFamily('ahp-session:/0000',async()=>{discoveries++;}),/transaction already/);assert.equal(discoveries,1);finish.release();assert.equal((await rebuild).status,'completed');
+ }finally{resume.release();await f.close();}
+});
+test('unknown selected-family writer survives restart and blocks reconstruction without exact owner settlement',async()=>{
+ const f=await fixture();let reconstructions=0;
+ try{
+  f.ports.reconstructMetadata=async()=>{reconstructions++;};await assert.rejects(f.host.discoverFamily('ahp-session:/0000',async()=>{throw Error('lost reply');}),/lost reply/);assert.equal(f.host.hintDiagnostics().unsettled,true);f.restart();
+  const rebuild=await f.host.rebuild({commandId:'unknown-family',expectedRevision:0},actor);assert.equal(rebuild.status,'unknown');assert.equal(reconstructions,0);assert.equal(f.host.hintDiagnostics().unsettled,true);assert.equal(f.host.inspect().ready,false);
+ }finally{await f.close();}
+});

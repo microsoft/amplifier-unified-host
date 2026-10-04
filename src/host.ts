@@ -20,7 +20,8 @@ import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
 export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;productHidden?:boolean;storagePath?:string;isArchived?:boolean;location?:ManagedLocation;}
-export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};}
+export interface CatalogFamilyDiscovery {version:1;scope:'selected-native-project-namespaces';phase:'complete'|'refused';issues:string[];maxEntries:number;metadataByteLimit:number;metadataFileLimit:number;indexRevision:string;verificationToken:string;inventoryHash:string;entriesExamined:number;metadataReads:number;metadataBytesAdmitted:number;namespaces:string[];completedAt:string;externalWriterCoverage:false;transcriptBodiesRead:false;nativeOwnershipVerified:false;}
+export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};familyDiscovery?:CatalogFamilyDiscovery;}
 export interface Catalog {
   list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];allowedManagedRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
   projectSessionVisibility?:(params:VisibilityProjectionRequest)=>Promise<VisibilityProjectionReceipt>;
@@ -36,6 +37,8 @@ export interface Catalog {
   setVisibility?(params:{uri:string;nativeSessionId:string;workingDirectory:string;deleted:boolean;commandId:string;evidence:"native-completed-receipt"}):Promise<unknown>;
   retentionCandidates?(params:RetentionPreviewRequest&{allowedWorkspaceRoots:string[]}):Promise<Json>;
   descendants?(params:{parentUri:string;limit:number}):Promise<CatalogFamily>;
+  reconcileFamily?(params:{parentUri:string;limit:number;maxEntries:number}):Promise<CatalogFamily>;
+  verifyFamily?(params:{parentUri:string;verificationToken:string}):Promise<{version:1;scope:string;valid:boolean;parentUri:string;indexRevision?:string;inventoryHash?:string;issues:string[];completedAt:string;externalWriterCoverage:false;nativeOwnershipVerified:false;transcriptBodiesRead:false}>;
   close?():Promise<void>;
 }
 export type MessageUnavailableReason='not-indexed'|'not-user'|'oversized'|'invalid-provenance';
@@ -1185,8 +1188,16 @@ export class AmplifierHost {
     const catalog=this.config.catalog;
     if(!catalog){if(required)throw new RpcFault(-32601,'Recovery and bundle copies require indexed family coverage',{executed:false});return work([],[]);}
     if(!catalog.descendants)throw new RpcFault(-32601,'Catalog cannot provide bounded descendant coverage',{executed:false});
-    const family=await catalog.descendants({parentUri:record.uri,limit:100}),fresh=family.freshness,age=Date.now()-Date.parse(fresh?.completedAt??'');
-    if(!family.rootKnown||!family.completeIndexedCoverage||family.truncated||family.issues?.length||family.excludedKinds?.length||family.coverage!=='indexed-native-history'||family.root?.nativeSessionId!==record.nativeSessionId||family.root?.engineId!==record.engineId||family.root?.workingDirectory!==record.workingDirectory||!Array.isArray(family.items)||family.items.length>100||fresh?.phase!=='complete'||fresh.issues!==0||!Number.isFinite(age)||age<0||age>600000)throw new RpcFault(-32011,'Indexed family coverage is incomplete or stale; copy was not executed',{executed:false});
+    let family:CatalogFamily|undefined,scoped=false;
+    if(catalog.reconcileFamily){
+      try{const discover=()=>catalog.reconcileFamily!({parentUri:record.uri,limit:100,maxEntries:512});family=await (this.presentation?this.presentation.discoverFamily(record.uri,discover):discover());scoped=true;}
+      catch(error){if((error as {code?:number}).code!==-32601)throw new RpcFault(-32011,'Selected family discovery could not be confirmed; copy was not executed',{executed:false});}
+    }
+    family??=await catalog.descendants({parentUri:record.uri,limit:100});
+    const proof=family.familyDiscovery,fresh=family.freshness,age=Date.now()-Date.parse((scoped?proof?.completedAt:fresh?.completedAt)??'');
+    const bounded=(value:unknown,max:number)=>Number.isSafeInteger(value)&&Number(value)>=0&&Number(value)<=max;
+    const discoveryValid=scoped?!!proof&&proof.version===1&&proof.scope==='selected-native-project-namespaces'&&proof.phase==='complete'&&Array.isArray(proof.issues)&&proof.issues.length===0&&proof.indexRevision===family.revision&&proof.maxEntries===512&&proof.metadataByteLimit===8388608&&proof.metadataFileLimit===2048&&typeof proof.verificationToken==='string'&&proof.verificationToken.length>0&&proof.verificationToken.length<=2048&&typeof proof.inventoryHash==='string'&&/^[a-f0-9]{64}$/.test(proof.inventoryHash)&&!!catalog.verifyFamily&&bounded(proof.entriesExamined,512)&&bounded(proof.metadataReads,2048)&&bounded(proof.metadataBytesAdmitted,8388608)&&Array.isArray(proof.namespaces)&&proof.namespaces.length>0&&proof.namespaces.length<=101&&proof.namespaces.every(path=>typeof path==='string'&&path.length>0)&&new Set(proof.namespaces).size===proof.namespaces.length&&proof.externalWriterCoverage===false&&proof.transcriptBodiesRead===false&&proof.nativeOwnershipVerified===false:fresh?.phase==='complete'&&fresh.issues===0;
+    if(family.parentUri!==record.uri||family.root?.uri!==record.uri||family.rootKnown!==true||family.completeIndexedCoverage!==true||family.truncated!==false||!Array.isArray(family.issues)||family.issues.length||!Array.isArray(family.excludedKinds)||family.excludedKinds.length||family.coverage!=='indexed-native-history'||family.root?.nativeSessionId!==record.nativeSessionId||family.root?.engineId!==record.engineId||family.root?.workingDirectory!==record.workingDirectory||!Array.isArray(family.items)||family.items.length>100||!discoveryValid||family.externalWriterCoverage!==false||typeof family.revision!=='string'||!family.revision||!Number.isFinite(age)||age<0||age>600000)throw new RpcFault(-32011,'Indexed family coverage is incomplete or stale; copy was not executed',{executed:false});
     const rows=new Map<string,CatalogRecord>([[record.uri,family.root],...family.items.map(row=>[row.uri,row] as [string,CatalogRecord])]);
     if(rows.size!==family.items.length+1)throw new RpcFault(-32011,'Indexed family contains conflicting identities',{executed:false});
     const descendants:Json[]=[];
@@ -1201,6 +1212,13 @@ export class AmplifierHost {
     const lock=async(index:number):Promise<T>=>{
       if(index<family.items.length)return this.withLock(family.items[index].uri,()=>lock(index+1));
       for(const row of family.items){validate?.(row);const child=this.getRecord(row.uri);if(child&&(child.engineId!==row.engineId||child.nativeSessionId!==row.nativeSessionId||child.workingDirectory!==row.workingDirectory))throw new RpcFault(-32011,'Indexed descendant differs from its admitted identity',{executed:false});this.guardSessionLifecycle(row.uri);if(this.store.unknown(chatURI(row.uri))||child?.chat.activeTurn||this.relocationFence(row.uri))throw new RpcFault(-32011,'A descendant has unresolved or active work',{executed:false});await this.quiesceLifecycle({uri:row.uri});}
+      if(scoped){
+        let checked:Awaited<ReturnType<NonNullable<Catalog['verifyFamily']>>>;
+        try{checked=await catalog.verifyFamily!({parentUri:record.uri,verificationToken:proof!.verificationToken});}
+        catch{throw new RpcFault(-32011,'Selected family discovery could not be revalidated; copy was not executed',{executed:false});}
+        const checkedAge=Date.now()-Date.parse(checked?.completedAt??'');
+        if(checked?.version!==1||checked.scope!=='selected-native-project-namespaces'||checked.valid!==true||checked.parentUri!==record.uri||checked.indexRevision!==family.revision||checked.inventoryHash!==proof!.inventoryHash||!Array.isArray(checked.issues)||checked.issues.length||checked.externalWriterCoverage!==false||checked.nativeOwnershipVerified!==false||checked.transcriptBodiesRead!==false||!Number.isFinite(checkedAge)||checkedAge<0||checkedAge>600000)throw new RpcFault(-32011,'Selected family changed while acquiring ownership; copy was not executed',{executed:false});
+      }
       if((await catalog.descendants!({parentUri:record.uri,limit:100})).revision!==family.revision)throw new RpcFault(-32011,'Indexed family changed while acquiring ownership',{executed:false});
       return work(descendants,family.items.map(row=>row.uri));
     };

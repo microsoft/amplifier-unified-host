@@ -897,3 +897,33 @@ test('readable recovery preserves unknown source admission and requires bounded 
   assert.deepEqual(await f.host.forkSession(session,args),copy);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1,'Copy must not prompt source, children, or target');
  }finally{await f.cleanup();}
 });
+
+
+test('selected family proof refreshes stale discovery but refuses partial, unbound and changed snapshots',async()=>{
+ const records=new Map<string,any>();let bad:string|undefined,changed=false,refreshes=0;
+ const family=(parentUri:string)=>({parentUri,rootKnown:records.has(parentUri),root:records.get(parentUri),items:[...records.values()].filter(row=>row.parentUri===parentUri),completeIndexedCoverage:true,truncated:false,issues:[],excludedKinds:[],revision:changed?'changed':'stable',coverage:'indexed-native-history',externalWriterCoverage:false,freshness:{phase:'not-started'}});
+ const catalog:any={list:async()=>({items:[...records.values()]}),get:async(uri:string)=>records.get(uri),upsert:async(row:any)=>records.set(row.uri,structuredClone(row)),descendants:async({parentUri}:any)=>family(parentUri),reconcileFamily:async(args:any)=>{
+  refreshes++;assert.equal(args.limit,100);assert.equal(args.maxEntries,512);const value=family(args.parentUri);
+  const proof:any={version:1,scope:'selected-native-project-namespaces',phase:'complete',issues:[],maxEntries:512,metadataByteLimit:8388608,indexRevision:value.revision,entriesExamined:2,metadataReads:2,metadataBytesAdmitted:512,metadataFileLimit:2048,verificationToken:'opaque',inventoryHash:'a'.repeat(64),namespaces:['/owned/namespace'],completedAt:new Date().toISOString(),externalWriterCoverage:false,transcriptBodiesRead:false,nativeOwnershipVerified:false};
+  if(bad==='partial')proof.phase='refused';if(bad==='binding')proof.indexRevision='unbound';if(bad==='body')proof.transcriptBodiesRead=true;if(bad==='overflow')proof.entriesExamined=513;if(bad==='old')proof.completedAt=new Date(Date.now()-700000).toISOString();
+  if(bad==='unavailable')throw Error('catalog response lost');
+  if(bad==='changed')changed=true;
+  return {...value,familyDiscovery:proof};
+ },verifyFamily:async({parentUri}:any)=>({version:1,scope:'selected-native-project-namespaces',valid:bad!=='physical-change',parentUri,indexRevision:'stable',inventoryHash:bad==='physical-binding'?'b'.repeat(64):'a'.repeat(64),issues:[],completedAt:new Date().toISOString(),externalWriterCoverage:false,nativeOwnershipVerified:false,transcriptBodiesRead:false})};
+ const f=await setup({catalog});try{
+  const client=await f.connect(),root=await f.create(client),child=await f.create(client);records.get(child.session).parentUri=root.session;
+  for(const failure of ['partial','binding','body','overflow','old','unavailable','changed','physical-change','physical-binding']){
+   bad=failure;changed=false;await assert.rejects(f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'}),/coverage|discovery|family changed/);
+  }
+  bad=undefined;changed=false;const result=await f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'});assert.equal(result.workReplayed,false);assert.equal(refreshes,10);
+  await assert.rejects(readFile(f.log,'utf8'),/ENOENT/,'No source, child or target prompt is replayed');
+ }finally{await f.cleanup();}
+});
+
+test('older catalog without reconcileFamily retains fresh indexed proof only',async()=>{
+ const records=new Map<string,any>();let stale=false;
+ const catalog:any={list:async()=>({items:[]}),get:async(uri:string)=>records.get(uri),upsert:async(row:any)=>records.set(row.uri,structuredClone(row)),reconcileFamily:async()=>{throw Object.assign(Error('Method not found'),{code:-32601});},descendants:async({parentUri}:any)=>({parentUri,rootKnown:true,root:records.get(parentUri),items:[],completeIndexedCoverage:true,truncated:false,issues:[],excludedKinds:[],revision:'stable',coverage:'indexed-native-history',externalWriterCoverage:false,freshness:{phase:'complete',issues:0,completedAt:new Date(Date.now()-(stale?700000:0)).toISOString()}})};
+ const f=await setup({catalog});try{
+  const client=await f.connect(),root=await f.create(client);stale=true;await assert.rejects(f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'}),/coverage/);stale=false;assert.equal((await f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'})).workReplayed,false);
+ }finally{await f.cleanup();}
+});
