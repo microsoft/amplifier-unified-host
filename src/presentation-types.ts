@@ -46,6 +46,6 @@ export interface ConversationPresentationConfig {
  /** Optional recovery for discovery interrupted by host loss or an unclassified adapter failure.
   * A new catalog process alone does not prove the old writer stopped. No wire caller supplies this proof. */
  settleDiscovery?:(attempt:CatalogDiscoveryAttempt)=>Promise<CatalogDiscoverySettlement>;
- /** Owns scan/hint scheduling. Seed exact mappings BEFORE explicit complete native discovery. */
+ /** Seeds exact mappings BEFORE explicit complete native discovery. The host then reobserves retained paths through its durable discovery boundary. */
  reconstructMetadata?:(request:{commandId:string;source:string;readMappings:(cursor?:string)=>PresentationMappingPage})=>Promise<void>;
 }
