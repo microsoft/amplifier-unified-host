@@ -99,6 +99,12 @@ export class Store {
     this.db.exec("UPDATE queue_intents SET held=1,reason='host-restarted' WHERE status='pending'");
     this.db.exec("UPDATE steering_intents SET status='unknown',reason='host-restarted' WHERE status='dispatching'; UPDATE steering_intents SET held=1,reason='host-restarted' WHERE status='pending'");
     this.db.exec('CREATE INDEX IF NOT EXISTS terminals_lifecycle ON terminals(lifecycle,modified DESC)');
+    // Optional derived presentation remains in the original lifecycle journal;
+    // no target Turn/receipt or second canonical transcript is created.
+    if(!this.db.prepare("SELECT value FROM meta WHERE key='fork_projection_schema'").get()) {
+      if(this.db.prepare('PRAGMA table_info(lifecycle_commands)').all().some(row=>row.name==='fork_projection'))throw new Error('Unclassified retained fork projection schema');
+      this.db.exec("ALTER TABLE lifecycle_commands ADD COLUMN fork_projection TEXT; INSERT INTO meta VALUES('fork_projection_schema',1)");
+    }
     this.replayBytes=Number(this.db.prepare('SELECT coalesce(sum(bytes),0) AS n FROM actions').get()!.n);
     // An interrupted admitted/dispatching command is never sent again automatically.
     for (const row of this.db.prepare("SELECT payload FROM receipts WHERE json_extract(payload,'$.status') IN ('admitted','dispatching')").iterate()) {

@@ -117,6 +117,11 @@ function inspect(db:DatabaseSync){
   if(!profiles.some(schema=>matches(schema,!marked)))fail(`${owner} table/column profile`);
   if(matches(spec,false))presentBits|=bits(owner);
  }
+ if(objects.has('meta')&&objects.has('lifecycle_commands')) {
+  const fork=db.prepare("SELECT value FROM meta WHERE key='fork_projection_schema'").get();
+  const column=db.prepare('PRAGMA table_info(lifecycle_commands)').all().find(row=>row.name==='fork_projection');
+  if(fork&&(fork.value!==1||!column||column.type!=='TEXT')||!fork&&column)fail('retained fork projection column/marker');
+ }
  return {version,presentBits,objects};
 }
 /** Validate every previously initialized authority before this owner's writes.

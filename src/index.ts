@@ -16,6 +16,7 @@ export type {ManagedFilesProtection,ManagedFilesActor,ManagedFilesApply} from '.
 
 export type * from './presentation-types.js';
 export {PRESENTATION_LIMITS} from './presentation.js';
-
 export type {SessionMetadataAdapter,SessionMetadataContext,SessionTitleSnapshot,SessionTitleCommitContext,SessionTitleWriteContext,SessionTitleCommitResult} from './session-metadata.js';
 export {SESSION_METADATA_KEY} from './session-metadata.js';
+export type {ForkBinding,CanonicalRow,AttachmentFact,ForkAttachmentBindingRequest,ForkAttachmentBindingReceipt,ForkAttachmentBindingVerification} from './fork-presentation.js';
+export {FORK_ATTACHMENT_LIMITS,forkDigest} from './fork-presentation.js';

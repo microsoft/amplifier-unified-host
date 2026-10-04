@@ -2,6 +2,7 @@ import {createHash} from 'node:crypto';
 
 /** Derived display facts only. This module has no store, process, or admission API. */
 export const FORK_META='amplifier.dev/fork';
+export const FORK_ATTACHMENT_LIMITS=Object.freeze({maxItems:64,maxTotalBytes:256*1024*1024,maxFileBytes:32*1024*1024,chunkBytes:256*1024});
 export interface ForkBinding {
  version:1;commandId:string;engineId:string;
  source:{session:string;nativeSessionId:string;historyRevision:string};
@@ -118,6 +119,10 @@ export interface ForkAttachmentBindingReceipt {
  status:'completed'|'refused'|'unknown';
  items:Array<{sourceUri:string;targetUri:string;sha256:string;size:number;name:string;contentType:string}>;
  replayed:false;
+}
+/** Host checks its own durable lifecycle/projection facts, never caller assertions. */
+export interface ForkAttachmentBindingVerification {
+ verified:true;commandId:string;requestDigest:string;projectionDigest:string;targetSession:string;
 }
 export function forkAttachmentRequest(projection:ForkProjection):ForkAttachmentBindingRequest {
  const {digest:claimed,...body}=projection;if(claimed!==hash(body))throw Error('Retained display projection integrity differs');

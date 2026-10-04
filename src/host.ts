@@ -1,5 +1,6 @@
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
+import {FORK_META,FORK_ATTACHMENT_LIMITS,captureForkProjection,forkDisplay,forkAttachmentRequest,verifiedForkAttachments,forkDigest,type CanonicalGroup,type SourceDisplay,type AttachmentFact,type ForkProjection,type ForkAttachmentBindingRequest,type ForkAttachmentBindingReceipt,type ForkAttachmentBindingVerification} from './fork-presentation.js';
 import {ConversationPresentation,type PresentationMetadata} from './presentation.js';
 import type {ConversationPresentationConfig,PresentationActor,PresentationPrepare,PresentationApply,PresentationRebuild,PresentationIdentity,VisibilityProjectionRequest,VisibilityProjectionReceipt} from './presentation-types.js';
 import {ManagedFilesJournal,type ManagedFilesProtection,type ManagedFilesApply,type ManagedFilesActor} from './managed-files.js';
@@ -13,7 +14,7 @@ import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { realpath, stat, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { isAbsolute, relative, join, dirname, basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
+import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, MessageAttachmentKind, TurnState, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { Store, type SessionRecord } from './store.js';
 import { AcpProcess, type EngineConfig, type AgentHandlers } from './acp.js';
@@ -68,6 +69,8 @@ export interface HostConfig {
   maxActiveProjectionBytes?:number;steeringOutcomeTimeoutMs?:number;
   /** Resolve committed attachment references only during new execution, never history reads. */
   resolvePromptAttachment?:(context:{session:string;engineId:string;nativeSessionId?:string;workingDirectory:string},attachment:NonNullable<Message['attachments']>[number])=>Promise<ContentBlock[]|undefined>;
+  /** Trusted composition only. Metadata is body-free; retention never repeats Native fork. */
+  forkPresentation?:{readAttachmentMetadata?:(sourceSession:string,uris:string[])=>Promise<AttachmentFact[]>;retainForkAttachments?:(request:ForkAttachmentBindingRequest)=>Promise<ForkAttachmentBindingReceipt>};
   resourceProviders?:Array<{scheme:string;read?:(params:Json,context:{clientId:string})=>Promise<Json>;resolve?:(params:Json,context:{clientId:string})=>Promise<Json>;list?:(params:Json,context:{clientId:string})=>Promise<Json>;write?:(params:Json,context:{clientId:string})=>Promise<Json>}>;
   catalog?:Catalog;
   retentionProtection?:RetentionProtection;
@@ -519,7 +522,7 @@ export class AmplifierHost {
     if(Buffer.byteLength(JSON.stringify({...mapped,diagnostics:result.diagnostics??[]}))>RECALL_LIMITS.maxBytes)throw new RpcFault(-32000,'Complete Recall page exceeds byte capacity; use a smaller turn limit');
     return {...mapped,revision:result.revision,...(result.nextCursor?{nextCursor:this.rememberRecallCursor({scope,cursor:result.nextCursor})}:{}),limits:RECALL_LIMITS,coverage:{source:'native-history',authorization:'unverified-native-history',diagnostics:result.diagnostics??[],omittedUpdates:mapped.omittedUpdates}};
   }
-  private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string,before?:{beforeTurnId:string;expectedRevision:string}):Promise<{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]}> {
+  private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string,before?:{beforeTurnId:string;expectedRevision:string}):Promise<{turns:Turn[];groups:CanonicalGroup[];nextCursor?:string;revision:string;diagnostics:unknown[]}> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
     if(!engine||!record.nativeSessionId)throw new RpcFault(-32000,'Native history reader is unavailable; no empty transcript was substituted');
@@ -529,7 +532,7 @@ export class AmplifierHost {
       const init=await agent.initialize();
       const capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
       if(capability?.version!==1||capability?.paging!=='complete-turns'||capability?.passive!==true)throw new RpcFault(-32601,'Agent does not advertise a passive native history reader');
-      let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[];
+      let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[],groups:CanonicalGroup[]=[];
       do {
         const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(before??{}),...(next?{cursor:next}:{})}) as Json;
         if(!Array.isArray(result.turnGroups)||typeof result.revision!=='string')throw new Error('Malformed native history page');
@@ -549,9 +552,9 @@ export class AmplifierHost {
           const active:Active={agent,busy:true,lastUsed:0,turnId:group.id,tools:new Set(),permissions:new Map()};
           for(const update of group.updates)await this.update(record.uri,{sessionId:record.nativeSessionId,update} as SessionNotification,{active,emit:action=>{state=chatReducer(state,action as any);}});
           const action=group.recordedOnly||group.state==='complete'?{type:'chat/turnComplete',turnId:group.id,duration:0}:{type:'chat/error',turnId:group.id,duration:0,part:{kind:'error',error:{errorType:'NATIVE_OUTCOME_UNKNOWN',message:'Historical content is preserved; its execution outcome was not recorded.'}}};
-          state=chatReducer(state,action as any);page.push(...state.turns);
+          state=chatReducer(state,action as any);page.push(...state.turns.map(turn=>this.projectForkTurn(record,group,turn)));
         }
-        turns=[...page,...turns];next=result.nextCursor??undefined;
+        groups=[...result.turnGroups,...groups];turns=[...page,...turns];next=result.nextCursor??undefined;
       } while(next&&(limit===undefined||turns.length<limit));
       let nextCursor:string|undefined;
       if(next){nextCursor=randomUUID();this.nativeCursors.set(nextCursor,{chat:record.chat.resource,cursor:next,revision});if(this.nativeCursors.size>4096)this.nativeCursors.delete(this.nativeCursors.keys().next().value!);}
@@ -562,8 +565,91 @@ export class AmplifierHost {
       if(fresh&&fresh.engineId===record.engineId&&fresh.nativeSessionId===record.nativeSessionId&&fresh.workingDirectory===record.workingDirectory&&JSON.stringify((fresh.state._meta?.['amplifier.dev/acp'] as Json|undefined)?.capabilities)!==JSON.stringify(init.agentCapabilities)) {
         this.emit(record.uri,{type:'session/metaChanged',_meta:{...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:init.agentCapabilities}}} as StateAction);
       }
-      return {turns,nextCursor,revision,diagnostics};
+      return {turns,groups,nextCursor,revision,diagnostics};
     } finally {this.passiveReads--;await agent.retire();}
+  }
+  private forkJournal(commandId:string):Json|undefined {
+    const row=this.store.db.prepare('SELECT fork_projection FROM lifecycle_commands WHERE command_id=?').get(commandId);
+    return row?.fork_projection?JSON.parse(String(row.fork_projection)):undefined;
+  }
+  private saveForkJournal(commandId:string,value:Json) {
+    if(Buffer.byteLength(JSON.stringify(value))>4*1024*1024)throw new Error('Fork presentation journal exceeds capacity');
+    this.store.db.prepare('UPDATE lifecycle_commands SET fork_projection=? WHERE command_id=?').run(JSON.stringify(value),commandId);
+  }
+  private async prepareForkPresentation(record:SessionRecord,args:Json):Promise<Json|undefined> {
+    if(!this.config.forkPresentation)return;
+    const page=await this.nativeHistory(record,200);
+    if(page.revision!==args.expectedHistoryRevision||page.nextCursor)throw new RpcFault(-32011,'Fork presentation requires a complete selected prefix within 200 turns; no copy was executed',{executed:false});
+    let selected=page.groups;
+    if(args.throughMessageId){const index=selected.findIndex(group=>group.updates.some(update=>update.sessionUpdate==='user_message_chunk'&&update._meta?.['amplifier.dev/history']?.messageId===args.throughMessageId));if(index<0)throw new RpcFault(-32011,'Reviewed fork user boundary is unavailable',{executed:false});selected=selected.slice(0,index+1);}
+    const source=selected.map(group=>({id:group.id,updates:group.updates.map(update=>{const h=update._meta?.['amplifier.dev/history'];return {sessionUpdate:update.sessionUpdate,_meta:{'amplifier.dev/history':{position:h?.position,messageId:h?.messageId,...(h?.messageReference?{messageReference:h.messageReference}:{}),...(h?.historicalOnly?{historicalOnly:true}:{})}}};})}));
+    const displays:Array<{turn:Turn;uris:string[]}>=[],uris=new Set<string>();
+    for(const group of selected){const row=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,group.id);if(!row)continue;const turn=JSON.parse(String(row.payload)) as Turn;
+      const selectedUris=(turn.message.attachments??[]).map(a=>{if(a.type!=='resource'||typeof a.uri!=='string')throw new RpcFault(-32601,'Fork attachment presentation requires Resources-owned references',{executed:false});return a.uri;});selectedUris.forEach(uri=>uris.add(uri));displays.push({turn,uris:selectedUris});}
+    if(displays.reduce((count,row)=>count+row.uris.length,0)>FORK_ATTACHMENT_LIMITS.maxItems)throw new RpcFault(-32602,'Fork attachment count exceeds 64 selected references',{executed:false});
+    let metadata:AttachmentFact[]=[];
+    if(uris.size){if(!this.config.forkPresentation.readAttachmentMetadata||!this.config.forkPresentation.retainForkAttachments)throw new RpcFault(-32601,'Resources-owned fork attachment binding is unavailable',{executed:false});metadata=await this.config.forkPresentation.readAttachmentMetadata(record.uri,[...uris]);}
+    const byUri=new Map(metadata.map(item=>[item.uri,item]));
+    if(byUri.size!==uris.size||metadata.length!==uris.size||[...byUri.keys()].some(uri=>!uris.has(uri)))throw new RpcFault(-32011,'Resources metadata does not cover exact fork references',{executed:false});
+    let total=0;for(const item of metadata){if(!Number.isSafeInteger(item.size)||item.size<0||item.size>FORK_ATTACHMENT_LIMITS.maxFileBytes||!/^[a-f0-9]{64}$/.test(item.sha256))throw new RpcFault(-32602,'Fork attachment integrity or per-file bound is unavailable',{executed:false});total+=item.size;}
+    if(total>FORK_ATTACHMENT_LIMITS.maxTotalBytes)throw new RpcFault(-32602,'Fork attachment total exceeds 256 MiB',{executed:false});
+    const display:SourceDisplay[]=displays.map(({turn,uris})=>{const observed=this.store.receipt(turn.id);return {turnId:turn.id,text:turn.message.text,attachments:uris.map(uri=>byUri.get(uri)!),...(observed?{receipt:{commandId:observed.commandId,channel:observed.channel,status:observed.status}}:{})};});
+    const plan={version:1,sourceRevision:page.revision,source,display,coverage:displays.length===selected.length?'complete':'partial'};
+    if(Buffer.byteLength(JSON.stringify(plan))>2*1024*1024)throw new RpcFault(-32602,'Fork presentation prefix exceeds 2 MiB',{executed:false});return {prepared:plan,planDigest:forkDigest(plan),status:'prepared'};
+  }
+  private projectForkTurn(record:SessionRecord,group:CanonicalGroup,turn:Turn):Turn {
+    const row=this.store.db.prepare("SELECT fork_projection FROM lifecycle_commands WHERE target=? AND operation='fork' AND status='completed' AND fork_projection IS NOT NULL LIMIT 1").get(record.uri);
+    if(!row)return turn;const journal=JSON.parse(String(row.fork_projection));if(!journal.projection)return turn;
+    const projection=journal.projection as ForkProjection,fact=forkDisplay(projection,group,record.nativeSessionId!);if(!fact)return turn;
+    const attachments=journal.grants?.map((item:AttachmentFact)=>item) as AttachmentFact[]|undefined;
+    const bySource=new Map<string,AttachmentFact>((journal.mapping??[]).map((item:any)=>[item.sourceUri,item.attachment]));
+    const cards=fact.attachments.flatMap(a=>{const target=bySource.get(a.uri);return target?[{type:MessageAttachmentKind.Resource as const,uri:target.uri,label:target.name,contentType:target.contentType}]:[];});
+    const known=fact.observedOutcome==='source-completed';
+    const responseParts=known?turn.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN'):turn.responseParts;
+    return {...turn,...(known&&!responseParts.some(part=>part.kind==='error')?{state:TurnState.Complete}:{}),responseParts,message:{...turn.message,text:fact.text,...(fact.attachments.length?{attachments:cards}:{}),_meta:{...turn.message._meta,[FORK_META]:{commandId:projection.binding.commandId,presentationOnly:true,executionAuthority:false,observedOutcome:fact.observedOutcome,attachments:fact.attachments.length&&!attachments?'unavailable':journal.attachmentStatus??'none'}}}};
+  }
+  /** Resources calls this trusted embedding method; it is not an AHP wire action. */
+  async verifyForkAttachmentBinding(request:ForkAttachmentBindingRequest):Promise<ForkAttachmentBindingVerification> {
+    const b=request.binding,row=this.store.db.prepare("SELECT * FROM lifecycle_commands WHERE command_id=? AND session=? AND target=? AND operation='fork' AND status='completed'").get(b.commandId,b.source.session,b.target.session),journal=this.forkJournal(b.commandId);
+    if(!row||!journal?.request||forkDigest(journal.request)!==forkDigest(request)||!journal.projection||journal.projection.digest!==request.projectionDigest)throw new Error('No exact completed Host fork attachment plan');
+    const result=JSON.parse(String(row.result));
+    if(result.receipt?.status!=='completed'||result.receipt.commandId!==b.commandId||result.receipt.operation!=='fork'||result.uri!==b.target.session||result.source?.sessionId!==b.source.nativeSessionId||result.source.historyRevision!==b.source.historyRevision||result.historyRevision!==b.target.historyRevision||result.workReplayed!==false)throw new Error('Retained Native fork receipt differs');
+    const target=this.getRecord(b.target.session),source=this.getRecord(b.source.session);
+    if(!target||!source||target.nativeSessionId!==b.target.nativeSessionId||source.nativeSessionId!==b.source.nativeSessionId||target.engineId!==b.engineId||source.engineId!==b.engineId)throw new Error('Fork attachment mapping identity changed');
+    const page=await this.nativeHistory(target,200);
+    for(const item of request.items){const group=page.groups.find(group=>group.id===item.turnId);if(!group||!forkDisplay(journal.projection,group,target.nativeSessionId!))throw new Error('Fork attachment target anchors changed');}
+    return {verified:true,commandId:b.commandId,requestDigest:forkDigest(request),projectionDigest:request.projectionDigest,targetSession:b.target.session};
+  }
+  private async finishForkPresentation(record:SessionRecord,entry:Json,native:Json):Promise<Json> {
+    let journal=this.forkJournal(entry.command_id);if(!journal)return {status:'unavailable'};
+    if(journal.status==='ready')return {status:journal.coverage==='partial'?'partial':'ready',coverage:journal.coverage,attachments:journal.attachmentStatus};
+    try{
+      const target=this.getRecord(String(entry.target))!;
+      if(!journal.projection){const page=await this.nativeHistory(target,200);if(page.nextCursor)throw new Error('Target copy prefix exceeds selected view');const args=JSON.parse(String(entry.payload)),plan=journal.prepared;if(!plan||journal.planDigest!==forkDigest(plan))throw new Error('Retained source display plan integrity differs');
+        const projection=captureForkProjection({binding:{version:1,commandId:String(entry.command_id),engineId:record.engineId,source:{session:record.uri,nativeSessionId:record.nativeSessionId!,historyRevision:args.expectedHistoryRevision},target:{session:target.uri,nativeSessionId:target.nativeSessionId!,historyRevision:native.historyRevision},...(args.throughMessageId?{throughMessageId:args.throughMessageId}:{}),workReplayed:false},sourceRevision:plan.sourceRevision,targetRevision:page.revision,source:plan.source,target:page.groups,display:plan.display});
+        journal={projection,request:forkAttachmentRequest(projection),coverage:plan.coverage,status:'mapped',attachmentStatus:'pending'};this.saveForkJournal(entry.command_id,journal);
+      }
+      if(journal.request.items.length){const callback=this.config.forkPresentation?.retainForkAttachments;if(!callback)throw new Error('Resources fork retention callback unavailable');const receipt=await callback(journal.request);const mapping=verifiedForkAttachments(journal.request,receipt);journal.attachmentReceipt=receipt;
+        if(!mapping){journal.status=receipt.status;journal.attachmentStatus=receipt.status;this.saveForkJournal(entry.command_id,journal);return {status:journal.status,coverage:journal.coverage,attachments:journal.attachmentStatus};}
+        journal.mapping=[...mapping].map(([sourceUri,attachment])=>({sourceUri,attachment}));journal.grants=[...mapping.values()];journal.attachmentStatus='completed';
+      }else{journal.mapping=[];journal.grants=[];journal.attachmentStatus='none';}
+      journal.status='ready';this.saveForkJournal(entry.command_id,journal);return {status:journal.coverage==='partial'?'partial':'ready',coverage:journal.coverage,attachments:journal.attachmentStatus};
+    }catch(error){journal.status='unknown';journal.reason=(error as Error).message;this.saveForkJournal(entry.command_id,journal);return {status:'unknown',reason:journal.reason};}
+  }
+  /** Explicit owner reconciliation, never a new Native fork or runtime command. */
+  async reconcileForkPresentation(commandId:string):Promise<Json> {
+    return this.intake.run(async()=>{
+      const entry=this.store.db.prepare("SELECT * FROM lifecycle_commands WHERE command_id=? AND operation='fork' AND status='completed'").get(commandId);
+      if(!entry)throw new RpcFault(-32008,'No completed original fork to reconcile');
+      return this.withLock(String(entry.session),()=>this.withLock(String(entry.target),async()=>{
+        const source=this.getRecord(String(entry.session));if(!source)throw new RpcFault(-32008,'Original fork source mapping unavailable');
+        const result=JSON.parse(String(entry.result));result.forkPresentation=await this.finishForkPresentation(source,entry,result);
+        this.store.db.prepare('UPDATE lifecycle_commands SET result=? WHERE command_id=?').run(JSON.stringify(result),commandId);
+        const target=this.getRecord(String(entry.target))!,origin={...(target.state._meta?.[FORK_META] as Json),presentation:result.forkPresentation};
+        target.state._meta={...target.state._meta,[FORK_META]:origin};target.summary._meta={...target.summary._meta,[FORK_META]:origin};this.store.save(target);
+        return {commandId,uri:entry.target,nativeStatus:'completed',forkPresentation:result.forkPresentation,workReplayed:false,requiresSubscribe:true};
+      }));
+    });
   }
   private rememberMixedCursor(chat:string,page:{turns:Turn[];hasOlder:boolean;revision:string}) {
     if(!page.hasOlder||!page.turns.length)return;
@@ -732,11 +818,14 @@ export class AmplifierHost {
     await this.managed!.inspect(receipt);
     const existing=this.getRecord(receipt.session),indexed=await this.config.catalog?.get(receipt.session);
     for(const row of [existing,indexed])if(row&&(row.nativeSessionId!==location.allocationId||row.workingDirectory!==receipt.marker.workspace||row.engineId!==receipt.request.provider))throw new RpcFault(-32011,'Managed session identity collides with an existing mapping');
-    if(!existing){const timestamp=now(),meta={'amplifier.dev/location':location},chat:ChatState={resource:chatURI(receipt.session),title:receipt.request.title??'New chat',status:1,modifiedAt:timestamp,turns:[],...(native.source?.operation==='fork'?{_meta:{'amplifier.dev/history':{source:'native',available:true}}}:{})};
+    const copyOrigin=native.source?.operation==='fork'?this.store.db.prepare("SELECT session,target,payload FROM lifecycle_commands WHERE command_id=? AND operation='fork'").get(native.source.commandId):undefined;
+    const origin=copyOrigin&&copyOrigin.target===receipt.session?{version:1,commandId:native.source.commandId,source:{session:String(copyOrigin.session),nativeSessionId:native.source.sessionId,historyRevision:native.source.historyRevision,...(JSON.parse(String(copyOrigin.payload)).throughMessageId?{throughMessageId:JSON.parse(String(copyOrigin.payload)).throughMessageId}:{})},targetSession:receipt.session,independentRoot:true,workReplayed:false,materialization:'pending'}:undefined;
+    if(!existing){const timestamp=now(),meta:Json={'amplifier.dev/location':location,...(origin?{[FORK_META]:origin}:{})},chat:ChatState={resource:chatURI(receipt.session),title:receipt.request.title??'New chat',status:1,modifiedAt:timestamp,turns:[],...(native.source?.operation==='fork'?{_meta:{'amplifier.dev/history':{source:'native',available:true}}}:{})};
       const summary:SessionSummary={resource:receipt.session,provider:receipt.request.provider,title:chat.title,status:1,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(receipt.marker.workspace).href],_meta:meta};
       const state:SessionState={provider:receipt.request.provider,title:chat.title,status:1,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:meta};
       this.store.save({uri:receipt.session,engineId:receipt.request.provider,nativeSessionId:location.allocationId,workingDirectory:receipt.marker.workspace,executionDirectory:receipt.marker.workspace,summary,state,chat});
     }
+    if(existing&&origin){existing.state._meta={...existing.state._meta,[FORK_META]:origin};existing.summary._meta={...existing.summary._meta,[FORK_META]:origin};this.store.save(existing);}
     const result={session:receipt.session,uri:receipt.session,creationConfirmed:true,location,configurationScope:'global-and-session',runtimeStarted:false,workReplayed:false,receipt:receipt.commandId};
     // Native creation is complete; retrying catalog projection can never replay it.
     await this.syncCatalog(this.getRecord(receipt.session)!);this.managed!.settle(receipt.commandId,'completed',result);
@@ -1205,7 +1294,7 @@ export class AmplifierHost {
       if(args.mode==='recovery'&&(native.mode!=='recovery'||native.preservedSource!==true)||args.bundle!==undefined&&native.bundleSelection!==args.bundle)throw new Error('Native copy mode does not match the reviewed request');
       const allocation=this.managed?.bySession(String(entry.target));
       const historyCwd=allocation?.marker.workspace??record.workingDirectory;
-      if(native.creationConfirmed!==true||native.sessionId!==entry.target?.slice('ahp-session:/'.length)||native.historyCwd!==historyCwd||native.workReplayed!==false||native.source?.sessionId!==record.nativeSessionId||native.source?.historyRevision!==args.expectedHistoryRevision||typeof native.executionDirectory!=='string')throw new Error('Native fork confirmation does not match reserved identity');
+      if(native.receipt.operation!=='fork'||native.creationConfirmed!==true||native.sessionId!==entry.target?.slice('ahp-session:/'.length)||native.historyCwd!==historyCwd||native.workReplayed!==false||native.source?.sessionId!==record.nativeSessionId||native.source?.historyRevision!==args.expectedHistoryRevision||native.source?.throughMessageId!==args.throughMessageId||typeof native.executionDirectory!=='string')throw new Error('Native fork confirmation does not match reserved identity');
       if(record.state._meta?.['amplifier.dev/location']){
         if(!allocation||native.executionDirectory!==historyCwd||managedHash(native.location)!==managedHash(this.managed!.location(allocation))||native.generatedFilesCopied!==false)throw new Error('Managed copy lacks its fresh allocation proof');
         const proof:Json=await this.managedAgent(record.engineId,agent=>agent.client.extMethod('_amplifier/managed',this.managedNativeParams(allocation,'receipt')));
@@ -1216,9 +1305,10 @@ export class AmplifierHost {
       const chat:ChatState={resource:chatURI(uri),title,status:SessionStatus.Idle,modifiedAt:timestamp,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:true}}};
       const summary:SessionSummary={resource:uri,provider:record.engineId,title,status:SessionStatus.Idle,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(record.workingDirectory).href]};
       const target:SessionRecord=existing??{uri,engineId:record.engineId,nativeSessionId:native.sessionId,workingDirectory:record.workingDirectory,executionDirectory:native.executionDirectory,summary,chat,state:{provider:record.engineId,title,status:SessionStatus.Idle,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories}};
-      if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==historyCwd)throw new Error('Reserved fork target now has a different identity');
+      if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==historyCwd||target.engineId!==record.engineId)throw new Error('Reserved fork target now has a different identity');
+      const origin={version:1,commandId:String(entry.command_id),source:{session:record.uri,nativeSessionId:record.nativeSessionId,historyRevision:args.expectedHistoryRevision,...(args.throughMessageId?{throughMessageId:args.throughMessageId}:{})},targetSession:uri,independentRoot:true,workReplayed:false,materialization:'confirmed'};
+      target.state._meta={...target.state._meta,[FORK_META]:origin};target.summary._meta={...target.summary._meta,[FORK_META]:origin};
       this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,workReplayed:false,...(allocation?{location:native.location,generatedFilesCopied:false}:{}),mode:native.mode??'complete',...(native.bundleSelection!==undefined?{bundleSelection:native.bundleSelection}:{}),preservedSource:true,receipt:native.receipt};
-      this.notify('root/sessionAdded',{channel:ROOT,summary:target.summary});
     }else if(operation==='legacyCopy.purge'){
       if(native.receipt.operation!==operation||native.sessionId!==record.nativeSessionId||native.historyCwd!==record.workingDirectory||native.historyRevision!==args.expectedHistoryRevision||native.previewId!==args.previewId||native.previewHash!==args.previewHash||native.canonicalFilesDeleted!==0||native.eventsDeleted!==0||native.legacyWriterCoverage!=='launcher-attested-retired'||!Array.isArray(native.removed)||!native.removed.length||native.removed.length>3||new Set(native.removed.map((f:Json)=>f.name)).size!==native.removed.length||native.removed.some((f:Json)=>!['transcript.jsonl','metadata.json','checkpoint.json'].includes(f.name)||!Number.isSafeInteger(f.bytes)||f.bytes<0||f.bytes>64*1024*1024||typeof f.sha256!=='string'||!/^[a-f0-9]{64}$/.test(f.sha256)))throw new Error('Retired-copy effect lacks exact duplicate-only native receipt proof');
       result={...native,session:record.uri};
@@ -1236,7 +1326,16 @@ export class AmplifierHost {
       result={session:record.uri,deleted:native.deleted,preserved:native.preserved,historyRevision:native.historyRevision,receipt:native.receipt};
       if(native.deleted){this.holdQueue(record.chat.resource,'session-removed');this.notify('root/sessionRemoved',{channel:ROOT,session:record.uri});}else this.notify('root/sessionAdded',{channel:ROOT,summary:record.summary});
     }
-    this.store.transaction(()=>{this.store.db.prepare("UPDATE lifecycle_commands SET status='completed',result=? WHERE command_id=?").run(JSON.stringify(result),entry.command_id);this.store.finish(String(entry.command_id),'completed');});return result;
+    this.store.transaction(()=>{this.store.db.prepare("UPDATE lifecycle_commands SET status='completed',result=? WHERE command_id=?").run(JSON.stringify(result),entry.command_id);this.store.finish(String(entry.command_id),'completed');});
+    // Native completion is already durable. Display/attachment failures cannot
+    // turn that known copy into an unknown Native outcome or trigger another fork.
+    if(operation==='fork'){
+      result.forkPresentation=await this.withLock(String(entry.target),()=>this.finishForkPresentation(record,entry,native));this.store.db.prepare('UPDATE lifecycle_commands SET result=? WHERE command_id=?').run(JSON.stringify(result),entry.command_id);
+      const target=this.getRecord(String(entry.target))!,origin={...(target.state._meta?.[FORK_META] as Json),presentation:result.forkPresentation};
+      target.state._meta={...target.state._meta,[FORK_META]:origin};target.summary._meta={...target.summary._meta,[FORK_META]:origin};this.store.save(target);
+      this.notify('root/sessionAdded',{channel:ROOT,summary:target.summary});
+    }
+    return result;
   }
   /** Caller holds source admission; indexed facts never stand in for native ownership. */
   private async withLifecycleFamily<T>(record:SessionRecord,required:boolean,work:(descendants:Json[],sessions:string[])=>Promise<T>,validate?:(row:CatalogRecord)=>void):Promise<T> {
@@ -1302,7 +1401,9 @@ export class AmplifierHost {
         const allocationRequest=managedCopy?{session:target!,provider:record.engineId,commandId:'managed-copy:'+managedHash([record.uri,args.commandId]),title:args.title??record.summary.title}:null;
         if(allocationRequest)this.managed!.validate(allocationRequest);
         const entry={command_id:args.commandId,session:record.uri,operation,target,status:'dispatching',payload:JSON.stringify(args)};
+        const forkPlan=operation==='fork'?await this.prepareForkPresentation(record,args):undefined;
         this.store.transaction(()=>{this.store.admission(record.uri,{operation,args},args.commandId,'host:lifecycle',this.store.extensionSequence('host:lifecycle'));this.store.db.prepare('INSERT INTO lifecycle_commands(command_id,session,operation,target,status,payload) VALUES(?,?,?,?,?,?)').run(entry.command_id,entry.session,operation,target,entry.status,entry.payload);this.store.finish(args.commandId,'dispatching');});
+        if(forkPlan)this.saveForkJournal(args.commandId,forkPlan);
         const {title,...nativeArgs}=args;
         let allocation:Json|undefined;
         try{

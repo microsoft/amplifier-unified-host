@@ -3,7 +3,9 @@
 The canonical Native copy remains the resume and message-mutation authority.
 Host retains a derived presentation of the exact copied prefix so a PDF fork can
 show the original public input and card without exposing provider instructions.
-This contract prototype is not wired into production lifecycle or history reads.
+Host wiring is opt-in through trusted `HostConfig.forkPresentation` callbacks.
+The attachment protocol v1 export is sealed separately; full graph and browser
+acceptance remain open.
 
 ## Authority and binding
 
@@ -43,8 +45,11 @@ cancelled, unresolved, or unavailable receipt observations remain unknown.
 
 Host must load source display text from its original durable StandardMessage,
 and source completion from its original receipt authority, under the same selected
-source lock. It stores the projection inside its existing Host projection store,
-bound to the retained lifecycle command and manifest digest. It must not insert
+source lock. It stores the bounded prepared source plan and derived projection in the
+`fork_projection` column of its original `lifecycle_commands` journal. A separate
+marker validates that optional column before restart normalization; no additional
+database or transcript is created. The plan is bound to the retained lifecycle
+command and manifest digest. It must not insert
 copied rows in `turns`, `receipts`, `receipt_attempts`, or executable history-edit
 inputs. A manifest hash checks retained data consistency; it is not authorization
 or a MAC. Existing Host ownership and the validated lifecycle command provide trust.
@@ -88,9 +93,11 @@ scope, filename/type/size/digest, and one-to-one mapping before using target car
 for edit/regenerate. Unknown/refused status creates no target grants. Historical
 transfer evidence remains viewing-only; URI query rewriting creates no grant.
 
-This prototype verifies receipt structure but does not implement the Resources
-owner operation or authenticate a callback. The Resources lane must agree the
-boundary through Root before Host composition wiring. No fallback widens
+Host verifies the original durable completed Native receipt, retained request
+digest, engine/source/target mappings and fresh bounded target row anchors in
+`verifyForkAttachmentBinding(request)`, an async trusted embedding method.
+Resources must call that verifier and own its byte/grant operation. This Host
+change does not implement Resources copying. No fallback widens
 `AttachmentService.prompt`'s conversation ownership check.
 
 ## Integration and acceptance still required
@@ -101,7 +108,7 @@ Host record before ordinary lifecycle materialization; provenance must be retain
 there too, without changing Native `parent_id: None`. Web projects this provenance
 to the existing original-chat link and independent-root fork presentation.
 
-Source-model/configuration copying stays Native-owned. The prototype neither copies
+Source-model/configuration copying stays Native-owned. The projection neither copies
 selection nor claims candidate execution/model acceptance. Recovery, bundle,
 reset-model, imported history, voice-only groups, hidden reasoning and unrelated
 client actions preserve their existing contracts. Mapping omissions must be explicit.
@@ -111,3 +118,12 @@ source/installed Host tests; exact text/card/hash and origin link after reload;
 unchanged source; Resources denial for unrelated scopes; crash/retry reconciliation;
 canonical quote/reaction/edit references; and separately authorized fresh target
 execution with copied configuration. Full graph/browser acceptance remains open.
+
+The agreed whole-plan attachment bounds are 64 referenced items, 256 MiB total,
+32 MiB per file and 256 KiB streaming chunks. Host preflights body-free committed
+metadata before Native fork where available. Native completion is recorded before
+attachment retention. An interrupted/refused copy grants no cards and leaves the
+Native fork known complete. `reconcileForkPresentation(commandId)` is an explicit
+owner retry of that same retained plan, under source and target Host locks; it
+never calls Native fork. Target mapping becomes visible only after complete exact
+Resources receipt verification. Source projection coverage is reported separately.

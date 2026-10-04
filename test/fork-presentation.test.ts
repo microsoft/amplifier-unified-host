@@ -1,7 +1,9 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
-import {captureForkProjection,forkDisplay,forkAttachmentRequest,verifiedForkAttachments,forkDigest,type ForkAttachmentBindingReceipt,type ForkBinding,type SourceDisplay} from '../src/fork-presentation.js';
+import {pathToFileURL} from 'node:url';
+import type {ForkAttachmentBindingReceipt,ForkBinding,SourceDisplay} from '../src/fork-presentation.js';
+const {captureForkProjection,forkDisplay,forkAttachmentRequest,verifiedForkAttachments,forkDigest}=await import(process.env.FORK_PRESENTATION_MODULE?pathToFileURL(process.env.FORK_PRESENTATION_MODULE).href:'../src/fork-presentation.js');
 
 const fixture=JSON.parse(readFileSync(new URL('./fixtures/fork-canonical.json',import.meta.url),'utf8'));
 const boundary=fixture.source.turnGroups[0].updates[0]._meta['amplifier.dev/history'].messageId;
