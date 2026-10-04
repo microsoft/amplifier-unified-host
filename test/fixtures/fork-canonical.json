@@ -1,0 +1,692 @@
+{
+  "producer": "amplifier_acp.history.page; synthetic owned transcript only",
+  "producerSha256": "8d91cd94103c898ddb19f61d41a471f0cf45a538bf0abbb2d8010ebf7394a326",
+  "source": {
+    "updates": [
+      {
+        "sessionUpdate": "user_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Read fictional-project-plan.pdf.\nEmbedded resource: literal user text\nEmbedded resource: amplifier-attachment://fixture/body?session=ahp-session%3A%2Fsource\nUser attachment: ACP image\nLocal file: /fixture/native/content\nRead this attachment using the reader tool."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 0,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "nativeInput": {
+              "id": "input-one"
+            },
+            "messageReference": {
+              "sessionId": "source",
+              "messageId": "native:81ec1a6ffebc75d7a66a9ac7",
+              "position": 0,
+              "historyEpoch": null,
+              "sourceDigest": "7d91136c0978497b3489181e9b22eebd2030335bb5af2a91be2b50cf99d3f69c"
+            },
+            "turnId": "input-one",
+            "messageId": "native:81ec1a6ffebc75d7a66a9ac7"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Maya Chen - 2026-10-12."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 382,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "messageReference": {
+              "sessionId": "source",
+              "messageId": "native:d7e576409e95e531f1dc31bf",
+              "position": 382,
+              "historyEpoch": null,
+              "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+            },
+            "turnId": "input-one",
+            "messageId": "native:d7e576409e95e531f1dc31bf"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "user_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Later user input"
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 470,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "nativeInput": {
+              "id": "input-two"
+            },
+            "messageReference": {
+              "sessionId": "source",
+              "messageId": "native:670be619c8ad1f66142a9a43",
+              "position": 470,
+              "historyEpoch": null,
+              "sourceDigest": "adb13fcc674e85b4a0ac1d6f46c93b1a2245c14e65d12c412190173c80b385ca"
+            },
+            "turnId": "input-two",
+            "messageId": "native:670be619c8ad1f66142a9a43"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Later answer"
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 572,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "messageReference": {
+              "sessionId": "source",
+              "messageId": "native:b0268570a1f63467fd547bb7",
+              "position": 572,
+              "historyEpoch": null,
+              "sourceDigest": "abd5b7d6e4493561135921bcbc0d6ead7bf27f5473c5d786b1f86a039511b24d"
+            },
+            "turnId": "input-two",
+            "messageId": "native:b0268570a1f63467fd547bb7"
+          }
+        }
+      }
+    ],
+    "turnGroups": [
+      {
+        "id": "input-one",
+        "updates": [
+          {
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Read fictional-project-plan.pdf.\nEmbedded resource: literal user text\nEmbedded resource: amplifier-attachment://fixture/body?session=ahp-session%3A%2Fsource\nUser attachment: ACP image\nLocal file: /fixture/native/content\nRead this attachment using the reader tool."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 0,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "nativeInput": {
+                  "id": "input-one"
+                },
+                "messageReference": {
+                  "sessionId": "source",
+                  "messageId": "native:81ec1a6ffebc75d7a66a9ac7",
+                  "position": 0,
+                  "historyEpoch": null,
+                  "sourceDigest": "7d91136c0978497b3489181e9b22eebd2030335bb5af2a91be2b50cf99d3f69c"
+                },
+                "turnId": "input-one",
+                "messageId": "native:81ec1a6ffebc75d7a66a9ac7"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Maya Chen - 2026-10-12."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 382,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "messageReference": {
+                  "sessionId": "source",
+                  "messageId": "native:d7e576409e95e531f1dc31bf",
+                  "position": 382,
+                  "historyEpoch": null,
+                  "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+                },
+                "turnId": "input-one",
+                "messageId": "native:d7e576409e95e531f1dc31bf"
+              }
+            }
+          }
+        ],
+        "state": "unknown"
+      },
+      {
+        "id": "input-two",
+        "updates": [
+          {
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Later user input"
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 470,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "nativeInput": {
+                  "id": "input-two"
+                },
+                "messageReference": {
+                  "sessionId": "source",
+                  "messageId": "native:670be619c8ad1f66142a9a43",
+                  "position": 470,
+                  "historyEpoch": null,
+                  "sourceDigest": "adb13fcc674e85b4a0ac1d6f46c93b1a2245c14e65d12c412190173c80b385ca"
+                },
+                "turnId": "input-two",
+                "messageId": "native:670be619c8ad1f66142a9a43"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Later answer"
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 572,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "messageReference": {
+                  "sessionId": "source",
+                  "messageId": "native:b0268570a1f63467fd547bb7",
+                  "position": 572,
+                  "historyEpoch": null,
+                  "sourceDigest": "abd5b7d6e4493561135921bcbc0d6ead7bf27f5473c5d786b1f86a039511b24d"
+                },
+                "turnId": "input-two",
+                "messageId": "native:b0268570a1f63467fd547bb7"
+              }
+            }
+          }
+        ],
+        "state": "unknown"
+      }
+    ],
+    "nextCursor": null,
+    "revision": "0a6e5173b3e77578a9e6f7917321ff6831a69fbeb7ae8ffca549c4501c4d6b8c",
+    "diagnostics": []
+  },
+  "target": {
+    "updates": [
+      {
+        "sessionUpdate": "user_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Read fictional-project-plan.pdf.\nEmbedded resource: literal user text\nEmbedded resource: amplifier-attachment://fixture/body?session=ahp-session%3A%2Fsource\nUser attachment: ACP image\nLocal file: /fixture/native/content\nRead this attachment using the reader tool."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 0,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "nativeInput": {
+              "id": "input-one"
+            },
+            "messageReference": {
+              "sessionId": "target",
+              "messageId": "native:81ec1a6ffebc75d7a66a9ac7",
+              "position": 0,
+              "historyEpoch": null,
+              "sourceDigest": "7d91136c0978497b3489181e9b22eebd2030335bb5af2a91be2b50cf99d3f69c"
+            },
+            "turnId": "input-one",
+            "messageId": "native:81ec1a6ffebc75d7a66a9ac7"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Maya Chen - 2026-10-12."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 382,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "messageReference": {
+              "sessionId": "target",
+              "messageId": "native:d7e576409e95e531f1dc31bf",
+              "position": 382,
+              "historyEpoch": null,
+              "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+            },
+            "turnId": "input-one",
+            "messageId": "native:d7e576409e95e531f1dc31bf"
+          }
+        }
+      }
+    ],
+    "turnGroups": [
+      {
+        "id": "input-one",
+        "updates": [
+          {
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Read fictional-project-plan.pdf.\nEmbedded resource: literal user text\nEmbedded resource: amplifier-attachment://fixture/body?session=ahp-session%3A%2Fsource\nUser attachment: ACP image\nLocal file: /fixture/native/content\nRead this attachment using the reader tool."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 0,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "nativeInput": {
+                  "id": "input-one"
+                },
+                "messageReference": {
+                  "sessionId": "target",
+                  "messageId": "native:81ec1a6ffebc75d7a66a9ac7",
+                  "position": 0,
+                  "historyEpoch": null,
+                  "sourceDigest": "7d91136c0978497b3489181e9b22eebd2030335bb5af2a91be2b50cf99d3f69c"
+                },
+                "turnId": "input-one",
+                "messageId": "native:81ec1a6ffebc75d7a66a9ac7"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Maya Chen - 2026-10-12."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 382,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "messageReference": {
+                  "sessionId": "target",
+                  "messageId": "native:d7e576409e95e531f1dc31bf",
+                  "position": 382,
+                  "historyEpoch": null,
+                  "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+                },
+                "turnId": "input-one",
+                "messageId": "native:d7e576409e95e531f1dc31bf"
+              }
+            }
+          }
+        ],
+        "state": "unknown"
+      }
+    ],
+    "nextCursor": null,
+    "revision": "38286bea8e0c295f1328551cfa5dfd8743efe521bc7308a544f851194c073a8f",
+    "diagnostics": []
+  },
+  "toolsSource": {
+    "updates": [
+      {
+        "sessionUpdate": "user_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Read the fixture PDF."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 0,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "nativeInput": {
+              "id": "input-one"
+            },
+            "messageReference": {
+              "sessionId": "source",
+              "messageId": "native:a0657dba835c0642b37307ca",
+              "position": 0,
+              "historyEpoch": null,
+              "sourceDigest": "a4e1f7525ca23c6c099a645043a392238958508b00592abe4fa7eae2b8670d27"
+            },
+            "turnId": "input-one",
+            "messageId": "native:a0657dba835c0642b37307ca"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "reader-one",
+        "title": "read_file",
+        "status": "completed",
+        "rawInput": {
+          "path": "fixture.pdf"
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 107,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "turnId": "input-one",
+            "messageId": "native:dc1b0b7fcb125f39a79dd1da"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "reader-one",
+        "status": "completed",
+        "rawOutput": "Fixture PDF contents",
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 239,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "turnId": "input-one",
+            "messageId": "native:76130212a19b0b5980faf992"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Maya Chen - 2026-10-12."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 321,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "messageReference": {
+              "sessionId": "source",
+              "messageId": "native:0d7727742d94afcc0939f9df",
+              "position": 321,
+              "historyEpoch": null,
+              "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+            },
+            "turnId": "input-one",
+            "messageId": "native:0d7727742d94afcc0939f9df"
+          }
+        }
+      }
+    ],
+    "turnGroups": [
+      {
+        "id": "input-one",
+        "updates": [
+          {
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Read the fixture PDF."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 0,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "nativeInput": {
+                  "id": "input-one"
+                },
+                "messageReference": {
+                  "sessionId": "source",
+                  "messageId": "native:a0657dba835c0642b37307ca",
+                  "position": 0,
+                  "historyEpoch": null,
+                  "sourceDigest": "a4e1f7525ca23c6c099a645043a392238958508b00592abe4fa7eae2b8670d27"
+                },
+                "turnId": "input-one",
+                "messageId": "native:a0657dba835c0642b37307ca"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "reader-one",
+            "title": "read_file",
+            "status": "completed",
+            "rawInput": {
+              "path": "fixture.pdf"
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 107,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "turnId": "input-one",
+                "messageId": "native:dc1b0b7fcb125f39a79dd1da"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "reader-one",
+            "status": "completed",
+            "rawOutput": "Fixture PDF contents",
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 239,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "turnId": "input-one",
+                "messageId": "native:76130212a19b0b5980faf992"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Maya Chen - 2026-10-12."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 321,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "messageReference": {
+                  "sessionId": "source",
+                  "messageId": "native:0d7727742d94afcc0939f9df",
+                  "position": 321,
+                  "historyEpoch": null,
+                  "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+                },
+                "turnId": "input-one",
+                "messageId": "native:0d7727742d94afcc0939f9df"
+              }
+            }
+          }
+        ],
+        "state": "unknown"
+      }
+    ],
+    "nextCursor": null,
+    "revision": "25cedc346d4c07cc34b93de72a293ca07a08f75de9ff867c489cb9e6988300ad",
+    "diagnostics": []
+  },
+  "toolsTarget": {
+    "updates": [
+      {
+        "sessionUpdate": "user_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Read the fixture PDF."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 0,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "nativeInput": {
+              "id": "input-one"
+            },
+            "messageReference": {
+              "sessionId": "target",
+              "messageId": "native:a0657dba835c0642b37307ca",
+              "position": 0,
+              "historyEpoch": null,
+              "sourceDigest": "a4e1f7525ca23c6c099a645043a392238958508b00592abe4fa7eae2b8670d27"
+            },
+            "turnId": "input-one",
+            "messageId": "native:a0657dba835c0642b37307ca"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "tool_call",
+        "toolCallId": "reader-one",
+        "title": "read_file",
+        "status": "completed",
+        "rawInput": {
+          "path": "fixture.pdf"
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 107,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "turnId": "input-one",
+            "messageId": "native:dc1b0b7fcb125f39a79dd1da"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": "reader-one",
+        "status": "completed",
+        "rawOutput": "Fixture PDF contents",
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 239,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "turnId": "input-one",
+            "messageId": "native:76130212a19b0b5980faf992"
+          }
+        }
+      },
+      {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "Maya Chen - 2026-10-12."
+        },
+        "_meta": {
+          "amplifier.dev/history": {
+            "position": 321,
+            "authorization": "unverified-native-history",
+            "inputOrigin": "unknown",
+            "messageReference": {
+              "sessionId": "target",
+              "messageId": "native:0d7727742d94afcc0939f9df",
+              "position": 321,
+              "historyEpoch": null,
+              "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+            },
+            "turnId": "input-one",
+            "messageId": "native:0d7727742d94afcc0939f9df"
+          }
+        }
+      }
+    ],
+    "turnGroups": [
+      {
+        "id": "input-one",
+        "updates": [
+          {
+            "sessionUpdate": "user_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Read the fixture PDF."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 0,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "nativeInput": {
+                  "id": "input-one"
+                },
+                "messageReference": {
+                  "sessionId": "target",
+                  "messageId": "native:a0657dba835c0642b37307ca",
+                  "position": 0,
+                  "historyEpoch": null,
+                  "sourceDigest": "a4e1f7525ca23c6c099a645043a392238958508b00592abe4fa7eae2b8670d27"
+                },
+                "turnId": "input-one",
+                "messageId": "native:a0657dba835c0642b37307ca"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "reader-one",
+            "title": "read_file",
+            "status": "completed",
+            "rawInput": {
+              "path": "fixture.pdf"
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 107,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "turnId": "input-one",
+                "messageId": "native:dc1b0b7fcb125f39a79dd1da"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "reader-one",
+            "status": "completed",
+            "rawOutput": "Fixture PDF contents",
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 239,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "turnId": "input-one",
+                "messageId": "native:76130212a19b0b5980faf992"
+              }
+            }
+          },
+          {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+              "type": "text",
+              "text": "Maya Chen - 2026-10-12."
+            },
+            "_meta": {
+              "amplifier.dev/history": {
+                "position": 321,
+                "authorization": "unverified-native-history",
+                "inputOrigin": "unknown",
+                "messageReference": {
+                  "sessionId": "target",
+                  "messageId": "native:0d7727742d94afcc0939f9df",
+                  "position": 321,
+                  "historyEpoch": null,
+                  "sourceDigest": "fa8bad96027b4b6f348926b42353e8a17f5f14c0276ba65d01eaf7afe79ea3af"
+                },
+                "turnId": "input-one",
+                "messageId": "native:0d7727742d94afcc0939f9df"
+              }
+            }
+          }
+        ],
+        "state": "unknown"
+      }
+    ],
+    "nextCursor": null,
+    "revision": "38059a26682792cbe222bcf631fca41f5033772a170f94b686e7bf6136cd199d",
+    "diagnostics": []
+  }
+}
