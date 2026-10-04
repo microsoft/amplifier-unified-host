@@ -195,12 +195,15 @@ export class QuiescenceGate {
   const config=this.config,previous=this.abortAttempt(input.commandId),completed=previous?.value.result;
   const current=this.fence(),fence=completed?previous!.value.context:current;
   if(!config?.verifyAdmissionAbort||!fence||fence.purpose!=='distribution-update'||fence.admissionStage!=='participants'||(!completed&&fence.phase!=='unknown')||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||fence.instanceId!==input.instanceId||fence.dataScope!==input.dataScope||config.instanceId!==input.instanceId||config.dataScope!==input.dataScope)throw new QuiescenceError('Exact authenticated pre-retirement admission abort is unavailable',{executed:false});
+  // The persisted fence retains internal phase/owner/stage evidence. External
+  // abort callbacks receive only their declared distribution context contract.
+  const context:Readonly<QuiescenceContext>=Object.freeze({commandId:fence.commandId,fenceId:fence.fenceId,instanceId:fence.instanceId,dataScope:fence.dataScope,purpose:fence.purpose});
   const requestSignature=digest(input);
   if(previous&&previous.value.requestSignature!==requestSignature)throw new QuiescenceError('Admission abort identity has different arguments',{executed:false});
   if(!completed&&fence.owners.some(owner=>!config.participants.find(p=>p.id===owner)?.abortAdmission))throw new QuiescenceError('Admission abort owner receipt coverage is unavailable',{executed:false});
   this.changing=true;
   try {
-   const proof=await this.deadline(config.verifyAdmissionAbort({...structuredClone(fence),evidence:input.evidence}));
+   const proof=await this.deadline(config.verifyAdmissionAbort({...context,evidence:input.evidence}));
    const bound=(value:AdmissionAbortBinding)=>value&&value.commandId===input.commandId&&value.fenceId===input.fenceId&&value.instanceId===input.instanceId&&value.dataScope===input.dataScope;
    if(!bound(proof)||proof.kind!=='distribution-admission-abort'||proof.verified!==true||proof.purpose!=='distribution-update'||Object.keys(proof).sort().join(',')!=='commandId,dataScope,fenceId,instanceId,kind,purpose,receiptId,verified')throw Error('Supervisor admission abort proof does not bind the exact original attempt');
    token(proof.receiptId,'admission abort proof receipt');
@@ -214,7 +217,7 @@ export class QuiescenceGate {
    for(const ownerId of [...fence.owners].reverse()) {
     if(attempt.owners.some(receipt=>receipt.ownerId===ownerId))continue;
     const participant=config.participants.find(p=>p.id===ownerId)!;
-    const receipt=await this.deadline(participant.abortAdmission!({...structuredClone(fence),proof:structuredClone(proof)}));
+    const receipt=await this.deadline(participant.abortAdmission!({...context,proof:structuredClone(proof)}));
     if(!bound(receipt)||receipt.ownerId!==ownerId||!['released','not-acquired'].includes(receipt.status)||Object.keys(receipt).sort().join(',')!=='commandId,dataScope,fenceId,instanceId,ownerId,receiptId,status'||(receipt.status==='not-acquired'&&this.leases.has(ownerId)))throw Error('Owner admission abort receipt is missing, uncertain or misbound');
     token(receipt.receiptId,'owner admission abort receipt');
     attempt.owners.push(structuredClone(receipt));save();this.leases.delete(ownerId);

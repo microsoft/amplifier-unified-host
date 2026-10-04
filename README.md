@@ -854,6 +854,12 @@ and a durable `receiptId`. The supervisor is responsible for authenticating the
 original admission-requested command, unchanged owned runtime, and absence of a
 new-instance start. Caller evidence alone grants nothing.
 
+Abort verifier and owner callbacks receive the five canonical context fields
+`commandId`, `fenceId`, `instanceId`, `dataScope`, `purpose`, plus `evidence` or
+`proof` respectively. Internal phase, attempted owners, observation time, reason
+and admission stage remain in the durable Host fence and abort-attempt journal;
+they are not callback arguments. Other purpose-specific callbacks are unchanged.
+
 Every attempted participant needs `abortAdmission(contextWithProof)` returning an
 exact `AdmissionAbortOwnerReceipt`: `ownerId`, the four bound identity fields,
 `status:'released'|'not-acquired'`, and `receiptId`. The owner must authenticate its
