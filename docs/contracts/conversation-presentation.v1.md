@@ -89,6 +89,18 @@ Authorized exact-ID reads and original receipt lookup must not be wrapped in it.
 New mapping claims still require their own verified native creation/adoption
 proof. The listing guard is not that proof.
 
+A creation reservation with no native identity or native location revision is
+not a retained canonical mapping. Reconstruction excludes that reservation only
+when its lifecycle is still creating or failed and the host retains an unknown
+creation receipt for that exact session under its internal `host:creation`
+origin. The failed snapshot and original receipt remain available by exact ID;
+creation and execution are not replayed. A possible native checkpoint does not
+authorize guessing a mapping from a path or timestamp. Reconstruction counts
+confirmed mappings, not these unresolved reservations. Every bound session and
+every unexplained missing mapping still requires retained canonical metadata.
+This distinction does not add failed reservations to catalog discovery or
+resolve their original outcomes.
+
 ## Bounds
 
 Selection contains 1–500 explicit unique AHP IDs; no live cursor is an immutable
