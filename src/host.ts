@@ -180,7 +180,22 @@ export class AmplifierHost {
         withSelection:(sessions,work)=>this.withPresentationSelection(sessions,work),validateSelection:sessions=>this.validatePresentationSelection(sessions),
         projectionStatus:source=>catalog.sessionVisibilityProjectionStatus!({source}),project:request=>catalog.projectSessionVisibility!(request),projectionReceipt:(source,commandId)=>catalog.sessionVisibilityProjectionReceipt!({source,commandId}),
         catalogGet:session=>catalog.get(session),catalogFreshness:()=>catalog.status!(),
-        mappings:async after=>{const rows=this.store.db.prepare('SELECT uri FROM sessions WHERE uri>? ORDER BY uri LIMIT 100').all(after??'');const items=[];for(const row of rows){const retained=this.presentation!.mapping(String(row.uri));if(!retained)throw Error('Host mapping lacks retained canonical metadata; reconstruct its original authority first');items.push(retained);}return {items,...(rows.length===100?{nextCursor:String(rows.at(-1)!.uri)}:{})};},
+        mappings:async after=>{
+          const rows=this.store.db.prepare("SELECT uri,native_id,native_location_revision,json_extract(state,'$.lifecycle') AS lifecycle FROM sessions WHERE uri>? ORDER BY uri LIMIT 100").all(after??'');
+          const items=[];
+          for(const row of rows){
+            const retained=this.presentation!.mapping(String(row.uri));
+            if(retained){items.push(retained);continue;}
+            // A reserved creation may have reached the engine without returning a native identity.
+            // Its unknown receipt is not a mapping, absence proof, or permission to retry creation.
+            const unboundCreation=row.native_id===null&&row.native_location_revision===0&&
+              (row.lifecycle===SessionLifecycle.Creating||row.lifecycle===SessionLifecycle.Failed)&&
+              this.store.db.prepare("SELECT 1 FROM receipts WHERE json_extract(payload,'$.status')='unknown' AND channel=? AND client_id='host:creation' LIMIT 1").get(row.uri);
+            if(!unboundCreation)throw Error('Host mapping lacks retained canonical metadata; reconstruct its original authority first');
+          }
+          // Advance over the original bounded page, including any unbound reservations.
+          return {items,...(rows.length===100?{nextCursor:String(rows.at(-1)!.uri)}:{})};
+        },
         reconstructMetadata:config.conversationPresentation.reconstructMetadata,settleDiscovery:config.conversationPresentation.settleDiscovery,
         ...(catalog.hint?{hint:(path:string,context:{attemptId:string})=>catalog.hint!(path,context)}:{}),
         changed:rows=>{for(const row of rows){if(row.hidden)this.notify('root/sessionRemoved',{channel:ROOT,session:row.session});else {const record=this.getRecord(row.session);if(record&&!this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(row.session))this.notify('root/sessionAdded',{channel:ROOT,summary:record.summary});}}},
