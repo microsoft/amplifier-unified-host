@@ -43,6 +43,17 @@ test('negotiated exact ID is validated before resolver/admission effects',async(
   try{const id='x'.repeat(129);await assert.rejects(f.host.submitTurn(f.session,{commandId:id,clientId:'caller',text:'literal',attachments:[{type:'resource',label:'a.pdf',contentType:'application/pdf',uri:`amplifier-attachment://${randomUUID()}/body?session=${encodeURIComponent(f.session)}`}]}));assert.equal(calls,0);assert.equal(f.host.store.receipt(id),undefined);await assert.rejects(readFile(f.log));}finally{await f.close();}
 });
 
+test('full resolved request budget rejects before durable admission or Native dispatch and leaves no unknown fence',async()=>{
+  let resolves=0;const declared={...capability,runtimeNegotiated:true};
+  const f=await fixture({capability:declared,mounted:{...declared,supported:true},config:{resolvePromptAttachment:async()=>{resolves++;return [{type:'text',text:'x'.repeat(Math.floor(7.1*1024*1024))}];}}});
+  try{
+    const id=randomUUID(),text='literal'.repeat(Math.floor(512*1024/7)),uri=`amplifier-attachment://${randomUUID()}/body?session=${encodeURIComponent(f.session)}`;
+    await assert.rejects(f.host.submitTurn(f.session,{commandId:id,text,clientId:'caller',attachments:[{type:'resource',label:'large.txt',contentType:'text/plain',uri}]}),error=>(error as any).code===-32602&&(error as any).data?.executed===false);
+    assert.equal(resolves,1);assert.equal(f.host.store.receipt(id),undefined);assert.equal(f.host.store.db.prepare('SELECT turn_id FROM turns WHERE turn_id=?').get(id),undefined);assert.equal(f.host.store.unknown(f.session.replace('ahp-session:','ahp-chat:')),false);await assert.rejects(readFile(f.log));
+    const next=randomUUID();await f.host.submitTurn(f.session,{commandId:next,text:'valid following input',clientId:'caller'});await wait(()=>f.host.store.receipt(next)?.status==='completed');assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+  }finally{await f.close();}
+});
+
 test('runtime-negotiated capture requires a positive mounted report and preserves ordinary Host intent otherwise',async()=>{
   const declared={...capability,runtimeNegotiated:true},negative={version:1,supported:false,originalAuthority:'host',reason:'shared-request-view-unavailable'};
   for(const mounted of [undefined,negative,{...declared,supported:true}]){
