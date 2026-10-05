@@ -24,7 +24,9 @@ async function fixture(quiescence=config(),stateDirectory?:string){
  const base={stateDirectory:join(directory,'host'),allowedWorkspaceRoots:[directory],engines:[{id:'fixture',command:process.execPath,args:[fileURLToPath(new URL('../fixtures/acp-peer.mjs',import.meta.url))]}]};
  let host=await createHost({...base,quiescence});const clients:AhpClient[]=[];
  const client=async()=>{const c=new AhpClient(await WebSocketTransport.connect(host.url));c.connect();await c.initialize({clientId:randomUUID(),protocolVersions:['0.9.0']});clients.push(c);return c;};
- return {directory,get host(){return host;},client,create:async(c:AhpClient)=>{const channel='ahp-session:/'+randomUUID();await c.request('createSession',{channel,provider:'fixture',workingDirectories:[pathToFileURL(directory).href]});return channel;},restart:async(quiescence:QuiescenceConfig|undefined)=>{for(const c of clients)await c.shutdown();await host.close();host=await createHost({...base,quiescence});},close:async()=>{for(const c of clients)await c.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}};
+ // Retained legacy participant-fence fixtures exercise old release/reconciliation only.
+ // They do not qualify the new ordinary shared-service admission path.
+ return {directory,get host(){return host;},legacyStop:(input:any)=>(host as any).intake.admitBound({commandId:input.commandId,...(input.retryRefused===undefined?{}:{retryRefused:input.retryRefused}),purpose:'service-stop',serviceIdentity:input.expected}),client,create:async(c:AhpClient)=>{const channel='ahp-session:/'+randomUUID();await c.request('createSession',{channel,provider:'fixture',workingDirectories:[pathToFileURL(directory).href]});return channel;},restart:async(quiescence:QuiescenceConfig|undefined)=>{for(const c of clients)await c.shutdown();await host.close();host=await createHost({...base,quiescence});},close:async()=>{for(const c of clients)await c.shutdown();await host.close();await rm(directory,{recursive:true,force:true});}};
 }
 
 test('service stop authenticates every expected identity field and never borrows generic admission',async()=>{
@@ -41,10 +43,10 @@ test('service stop authenticates every expected identity field and never borrows
 test('busy service stop records a known refusal, and only explicit same-identity retry may acquire after work settles',async()=>{
  const f=await fixture(config(oldIdentity,[{id:'fixture',serviceStop:{version:1},acquire:async c=>({ownerId:'fixture',fenceId:c.fenceId,release:async()=>{}})}])),gate=pause(),entered=pause();try{
   const pending=f.host.withExternalMutation('fixture',async()=>{entered.release();await gate.promise;});await entered.promise;
-  const first=await f.host.admitServiceStop({commandId:'busy',expected:oldIdentity});assert.equal(first.admitted,false);assert.equal(first.executed,false);assert.equal(first.intakeClosed,false);assert.equal(first.purpose,'service-stop');
+  const first=await f.legacyStop({commandId:'busy',expected:oldIdentity});assert.equal(first.admitted,false);assert.equal(first.executed,false);assert.equal(first.intakeClosed,false);assert.equal(first.purpose,'service-stop');
   gate.release();await pending;
-  assert.deepEqual(await f.host.admitServiceStop({commandId:'busy',expected:oldIdentity}),first);
-  const retry=await f.host.admitServiceStop({commandId:'busy',expected:oldIdentity,retryRefused:true});assert.equal(retry.admitted,true);assert.notEqual(retry.fenceId,first.fenceId);
+  assert.deepEqual(await f.legacyStop({commandId:'busy',expected:oldIdentity}),first);
+  const retry=await f.legacyStop({commandId:'busy',expected:oldIdentity,retryRefused:true});assert.equal(retry.admitted,true);assert.notEqual(retry.fenceId,first.fenceId);
  }finally{gate.release();await f.close();}
 });
 
@@ -52,7 +54,7 @@ test('service acquisition closes all intake, keeps AHP reads available, and gran
  const entered=pause(),finish=pause();let releases=0;let acquired:any;
  const p:QuiescenceParticipant={id:'owner',serviceStop:{version:1},acquire:async c=>{acquired=structuredClone(c);entered.release();await finish.promise;return {ownerId:'owner',fenceId:c.fenceId,release:async(outcome,proof)=>{assert.equal(outcome,'unchanged');assert.equal((proof as ServiceReleaseProof).kind,'service-lifecycle');releases++;}};}};
  const f=await fixture(config(oldIdentity,[p]));try{
-  const c=await f.client(),pending=f.host.admitServiceStop({commandId:'stop',expected:oldIdentity});await entered.promise;
+  const c=await f.client(),pending=f.legacyStop({commandId:'stop',expected:oldIdentity});await entered.promise;
   assert.equal(acquired.purpose,'service-stop');assert.deepEqual(acquired.serviceIdentity,oldIdentity);
   await assert.rejects(f.create(c),/intake is closed/);await c.request('listSessions',{channel:'ahp-root://',limit:1});
   finish.release();const held=await pending;
@@ -70,7 +72,7 @@ test('replacement must prove exact old and new identities plus durable exit/read
  let observed=newIdentity,patch:Partial<ServiceReleaseProof>={},released=0;
  const p:QuiescenceParticipant={id:'owner',serviceStop:{version:1},acquire:async c=>({ownerId:'owner',fenceId:c.fenceId,release:async()=>{throw Error('Old process lease is unavailable');}}),reconcileRelease:async c=>{assert.deepEqual(c.serviceIdentity,oldIdentity);assert.equal((c.proof as ServiceReleaseProof).kind,'service-lifecycle');released++;}};
  const f=await fixture(config(oldIdentity,[p]));try{
-  const held=await f.host.admitServiceStop({commandId:'stop',expected:oldIdentity});
+  const held=await f.legacyStop({commandId:'stop',expected:oldIdentity});
   const next=config(newIdentity,[p]);const baseVerify=next.serviceLifecycle!.verifyRelease;next.serviceLifecycle!.verifyRelease=async r=>({...await baseVerify(r),observed,...patch});
   await f.restart(next);assert.equal(f.host.inspectServiceLifecycle().fence?.phase,'unknown');await assert.rejects(f.create(await f.client()),/intake is closed/);
   const input={fenceId:held.fenceId,commandId:'stop',outcome:'resumed' as const,resumeCommandId:'resume',evidence:{ownerReceipt:'durable-confirmed-exit-and-ready'}};
@@ -89,7 +91,7 @@ test('uncertain participant release persists exact accepted proof and refuses a 
  const p:QuiescenceParticipant={id:'owner',serviceStop:{version:1},acquire:async c=>({ownerId:'owner',fenceId:c.fenceId,release:async()=>{attempts++;throw Error('Ack lost after owner released');}}),reconcileRelease:async()=>{attempts++;}};
  const configuration=config(oldIdentity,[p]);const baseVerify=configuration.serviceLifecycle!.verifyRelease;configuration.serviceLifecycle!.verifyRelease=async r=>({...await baseVerify(r),...proofPatch});
  const f=await fixture(configuration);try{
-  const held=await f.host.admitServiceStop({commandId:'stop',expected:oldIdentity});const input={fenceId:held.fenceId,commandId:'stop',outcome:'stop-refused' as const,evidence:{receipt:'no-effect'}};
+  const held=await f.legacyStop({commandId:'stop',expected:oldIdentity});const input={fenceId:held.fenceId,commandId:'stop',outcome:'stop-refused' as const,evidence:{receipt:'no-effect'}};
   await assert.rejects(f.host.releaseServiceStop(input),/remains unknown/);assert.equal(attempts,1);
   await f.restart(configuration);proofPatch={refusalReceiptId:'changed-proof'};await assert.rejects(f.host.releaseServiceStop(input),/remains unknown/);assert.equal(attempts,1);
   proofPatch={};await f.host.releaseServiceStop(input);assert.equal(attempts,2);assert.equal(f.host.inspectServiceLifecycle().intakeClosed,false);
@@ -99,8 +101,8 @@ test('uncertain participant release persists exact accepted proof and refuses a 
 test('known partial acquisition refusal unwinds only the same live leases; unknown or missing service configuration stays closed',async()=>{
  let rollbacks=0;
  const owners:QuiescenceParticipant[]=[{id:'one',serviceStop:{version:1},acquire:async c=>({ownerId:'one',fenceId:c.fenceId,release:async(outcome,proof)=>{assert.equal(outcome,'unchanged');assert.deepEqual(proof,{kind:'admission-refused'});rollbacks++;}})},{id:'two',serviceStop:{version:1},acquire:async()=>null}];
- const f=await fixture(config(oldIdentity,owners));try{const refused=await f.host.admitServiceStop({commandId:'busy-owner',expected:oldIdentity});assert.equal(refused.executed,false);assert.equal(refused.intakeClosed,false);assert.equal(rollbacks,1);}finally{await f.close();}
- const uncertain=await fixture();try{const held=await uncertain.host.admitServiceStop({commandId:'lost-stop',expected:oldIdentity});await uncertain.host.releaseServiceStop({fenceId:held.fenceId,commandId:'lost-stop',outcome:'unknown'});await uncertain.restart(undefined);assert.equal(uncertain.host.inspectServiceLifecycle().intakeClosed,true);assert.equal(uncertain.host.inspectServiceLifecycle().enabled,false);await assert.rejects(uncertain.host.releaseServiceStop({fenceId:held.fenceId,commandId:'lost-stop',outcome:'stop-refused'}),/not configured/);}finally{await uncertain.close();}
+ const f=await fixture(config(oldIdentity,owners));try{const refused=await f.legacyStop({commandId:'busy-owner',expected:oldIdentity});assert.equal(refused.executed,false);assert.equal(refused.intakeClosed,false);assert.equal(rollbacks,1);}finally{await f.close();}
+ const uncertain=await fixture();try{const held=await uncertain.legacyStop({commandId:'lost-stop',expected:oldIdentity});await uncertain.host.releaseServiceStop({fenceId:held.fenceId,commandId:'lost-stop',outcome:'unknown'});await uncertain.restart(undefined);assert.equal(uncertain.host.inspectServiceLifecycle().intakeClosed,true);assert.equal(uncertain.host.inspectServiceLifecycle().enabled,false);await assert.rejects(uncertain.host.releaseServiceStop({fenceId:held.fenceId,commandId:'lost-stop',outcome:'stop-refused'}),/not configured/);}finally{await uncertain.close();}
 });
 
 test('actual host process death retains service fence and no replacement admission is possible before exact proof',async()=>{
@@ -115,5 +117,5 @@ test('actual host process death retains service fence and no replacement admissi
 
  test('every declared execution owner must explicitly support service identity before any owner acquisition',async()=>{
  let acquisitions=0;const owners:QuiescenceParticipant[]=[{id:'modern',serviceStop:{version:1},acquire:async()=>{acquisitions++;return null;}},{id:'legacy',acquire:async()=>{acquisitions++;return null;}}];
- const f=await fixture(config(oldIdentity,owners));try{const result=await f.host.admitServiceStop({commandId:'unsupported-owner',expected:oldIdentity});assert.equal(result.admitted,false);assert.equal(result.executed,false);assert.equal(result.intakeClosed,false);assert.equal(result.reason,'service-stop-coverage-unavailable');assert.deepEqual(result.work.gaps,['legacy']);assert.equal(acquisitions,0);}finally{await f.close();}
+ const f=await fixture(config(oldIdentity,owners));try{const result=await f.legacyStop({commandId:'unsupported-owner',expected:oldIdentity});assert.equal(result.admitted,false);assert.equal(result.executed,false);assert.equal(result.intakeClosed,false);assert.equal(result.reason,'service-stop-coverage-unavailable');assert.deepEqual(result.work.gaps,['legacy']);assert.equal(acquisitions,0);}finally{await f.close();}
 });

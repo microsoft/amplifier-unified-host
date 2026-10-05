@@ -159,10 +159,15 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       const turn=active;
       if(text==='crash'){process.exit(17);return;}
       if(text==='terminal-failure'){const proof={version:1,sessionId:p.sessionId,inputId:turn.inputId,status:'failed',terminal:true,noReplay:true,inputPersisted:true,effectBoundary:'provider-request',error:{type:'InvalidRequestError',message:'The provider could not accept the request format.'},...JSON.parse(process.env.FIXTURE_INPUT_PROOF??'{}')};send({id,error:{code:-32000,message:'Recorded native failure',data:{'amplifier.dev/inputOutcome':proof}}});active=undefined;return;}
-      if(text==='approval'){
+      if(text==='approval'||text==='drain-approval'){
         const requestId=permissionId++;
         const choice=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'session/request_permission',params:{sessionId:p.sessionId,toolCall:{toolCallId:'tool-1',title:'Write file',kind:'edit',status:'pending'},options:[{optionId:'allow',name:'Allow once',kind:'allow_once'},{optionId:'deny',name:'Deny once',kind:'reject_once'}]}});});
         update(p.sessionId,{sessionUpdate:'tool_call_update',toolCallId:'tool-1',title:'Write file',status:choice.outcome.optionId==='allow'?'completed':'failed',content:[{type:'content',content:{type:'text',text:JSON.stringify(choice)}}]});
+        if(text==='drain-approval'&&choice.outcome.optionId==='allow'){
+          const requestId=permissionId++;
+          const result=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'fs/write_text_file',params:{sessionId:p.sessionId,path:process.cwd()+'/admitted-approval.txt',content:'accepted approval drained'}});});
+          update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:JSON.stringify(result)}});
+        }
       }
       if(text==='mapping-permission'){
         update(p.sessionId,{sessionUpdate:'tool_call',toolCallId:'approval-replace',title:'Changed permission input',status:'pending',rawInput:{path:'old'}});
@@ -191,6 +196,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       if(text==='client-tool'){
         const requestId=permissionId++;
         const outcome=await new Promise(resolve=>{pending.set(requestId,resolve);send({id:requestId,method:'_amplifier/host',params:{sessionId:p.sessionId,operation:'ui.inspect',args:{}}});});
+        if(process.env.FIXTURE_CLIENT_TOOL_NAMING)send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:{type:'session.naming',name:'advisory accepted name',nameRevision:1}}});
         update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:JSON.stringify(outcome)}});
       }
       if(text==='terminal'||text==='terminal-background'||text==='terminal-delayed'||text==='terminal-released'){

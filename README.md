@@ -979,19 +979,28 @@ const admission = await host.admitServiceStop({
   commandId: durableStopCommandId,
   expected: authenticatedCurrentIdentity,
 });
-// Only admission.admitted === true authorizes the platform owner to stop its
-// retained process. The host sends no signal and discovers or adopts no PID.
+// Ordinary graceful stop requires phase === 'held' and evidence.activeWork === 0.
+// The host sends no signal and discovers or adopts no PID.
 ```
 
-All receipts retain `purpose:'service-stop'` and `expected`. A held receipt adds
-`admitted:true`, `intakeClosed:true`, `fenceId`, `commandId`, and the ordinary
-bounded work evidence. Known refusal is `admitted:false,executed:false,
-intakeClosed:false`; an unknown receipt includes `fence.phase:'unknown'` and closed
-intake. `serviceStopReceipt(commandId)` is passive and rejects a command from
-another lifecycle. `inspectServiceLifecycle()` returns configured identity and
-any retained service fence; it does not claim operating-system process ownership.
-`retryRefused:true` has the same narrowly defined known-no-effect semantics as
-ordinary quiescence. A changed expected identity never reuses a stop command.
+`closeServiceIntake(request)` durably closes the shared local gate before any
+await. Its `admitted:true,phase:'closed'` receipt proves only closure; measured
+`evidence.activeWork` can be nonzero or unknown. `admitServiceStop` uses the same
+command/fence/identity and waits for actual local work to drain, then returns
+`phase:'held',evidence.activeWork:0`. Deadline expiry retains closed, unconfirmed
+state without interrupting or replaying work. An explicit same-command observation
+can finish a timed-out drain; it cannot clear an unknown platform stop outcome.
+New starts and configuration remain closed while exact admitted tool results,
+approvals, cancellation, startup/turn/control callbacks and completion projections
+continue under counted, expiring authority. Durable waiting intents, business
+unknown receipts, cached residents and passive reads are not active work.
+No participant marker census or lease fanout is used for ordinary service stops.
+Actual writer/session locks and retained legacy maintenance holds remain intact.
+
+All receipts retain `purpose:'service-stop'` and `expected`. A changed identity
+never reuses a stop command. `serviceStopReceipt(commandId)` is passive;
+`inspectServiceLifecycle()` exposes the retained fence without claiming OS
+ownership. See the [shared admission contract](docs/contracts/shared-service-admission.v1.md).
 
 The platform supervisor owns durable stop/resume receipts and authoritative
 process exit. A stopped process, an absent endpoint, a PID, or an unknown outcome
@@ -1015,21 +1024,21 @@ actual authenticated owner receipts. It returns the ordinary proof fields
 - `expected` (exact original identity) and `observed` (exact currently configured
   identity);
 - for resumed: `outcome:'ready'`, the exact `resumeCommandId`, `exitReceiptId` and
-  `readyReceiptId`. The new instance must differ; installation, owner, scope and
-  release digest must remain identical;
+  `readyReceiptId`. The new instance must differ; installation, owner and scope
+  remain identical. A different release digest additionally requires authenticated
+  `activation:{schema:'distribution-service-activation-v1',target:{id,version,revision,digest}}`,
+  whose qualified signed target matches the currently configured digest;
 - for stop-refused: `outcome:'unchanged'` and `refusalReceiptId` proving no stop
   effect. Original and observed identities must be identical, with no resume or
   exit/readiness claims.
 
 Passing `outcome:'unknown'` preserves the fence. Generic `releaseQuiescence` and
 `withQuiescenceMaintenance` refuse service fences: service stop grants no recovery
-or native-admin mutation privileges. Each participant must explicitly advertise `serviceStop:{version:1}`; any missing
-declaration refuses before the first participant is acquired. A marker is an
-implementation contract, not a composition override for older owners. Each
-participant retains the complete service
-identity and validates the service proof. Before stop admission succeeds, a known
-busy participant can unwind only exact leases acquired in that same live attempt
-with `admission-refused`; this shortcut must never reconcile a recovered fence.
+or native-admin mutation privileges. Retained legacy participant-based service
+holds retain their original identity, lease and proof meaning; they are not new
+shared-drain receipts. Their recovered release still authenticates every original
+owner. Maintenance, retention, recovery and real writer exclusion keep their
+separate domain protections.
 
 The host persists the canonical exact release request and authenticated proof
 before releasing any participant. A lost acknowledgement can be reconciled with
