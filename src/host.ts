@@ -1792,8 +1792,11 @@ export class AmplifierHost {
     return this.intake.run(async()=>{
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     this.guardSessionLifecycle(uri);
+    // A published process is not usable until initialization and session loading finish.
+    if(this.starting.has(uri))return this.starting.get(uri)!;
     const existing=this.active.get(uri);if(existing?.stopCallback)await existing.stopCallback;if(existing)this.guardRetirement(existing);this.guardRetirementRecord(await this.record(uri));if(existing&&!existing.agent.closed)return existing;
     if(existing?.agent.closed)this.active.delete(uri);
+    // record() above yields, so another caller may have reserved this start.
     if(this.starting.has(uri))return this.starting.get(uri)!;
     const pending=(async()=>{
       // Publish pending deduplication before admitting a process-start reservation.

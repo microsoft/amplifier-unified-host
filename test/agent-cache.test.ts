@@ -271,3 +271,19 @@ test('class settlement: steering acceptance timeout preserves underlying request
   await assert.rejects(f.host.submitTurn(one.session,{commandId:randomUUID(),text:'do not replay',clientId:'owner'}),/unknown/);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
  }finally{barrier.release();await f.cleanup();}
 });
+
+
+test('concurrent first use waits for native initialization and shares one startup',async()=>{
+ const f=await setup();const original=AcpProcess.prototype.initialize;let release!:()=>void;
+ try{
+  const client=await f.connect(),one=await f.create(client);
+  const old=f.active(one.session);await old.agent.retire();await old.stopCallback;f.h.active.delete(one.session);
+  const gate=new Promise<void>(resolve=>{release=resolve});let calls=0;
+  AcpProcess.prototype.initialize=async function(){calls++;await gate;return original.call(this)};
+  const first=f.h.ensureAgent(one.session);await waitFor(()=>!!f.active(one.session));
+  let settled=false;const second=f.h.ensureAgent(one.session).then((value:any)=>{settled=true;return value});
+  await new Promise(resolve=>setTimeout(resolve,30));assert.equal(settled,false,'published process is still initializing');
+  release();const [a,b]=await Promise.all([first,second]);assert.equal(a,b);assert.equal(calls,1);assert.ok(b.agent.initialized.agentCapabilities);
+  await f.use(one.session);
+ }finally{release?.();AcpProcess.prototype.initialize=original;await f.cleanup()}
+});
