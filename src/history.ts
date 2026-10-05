@@ -9,7 +9,7 @@ export function mergeHistoryTurns(canonical:Turn[],live:Turn[]):Turn[] {
     const position=positions.get(canonical[index].id);if(position===undefined)continue;
     if(position<liveStart)throw new Error('Native and host history ordering disagree; reconcile the canonical history boundary');
     if(position>liveStart&&index>nativeStart)throw new Error('Unindexed native and host rows share an ordering interval');
-    result.push(...live.slice(liveStart,position),...canonical.slice(nativeStart,index),live[position]);
+    result.push(...live.slice(liveStart,position),...canonical.slice(nativeStart,index),{...live[position],message:{...live[position].message,_meta:{...live[position].message._meta,...canonical[index].message._meta}}});
     nativeStart=index+1;liveStart=position+1;
   }
   if(nativeStart<canonical.length&&liveStart<live.length)throw new Error('Unindexed native and host rows share an ordering interval');

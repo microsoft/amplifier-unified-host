@@ -662,6 +662,10 @@ export class AmplifierHost {
         const includePublicRows=!before&&publicCapability?.version===1&&publicCapability.publicRows===true;
         const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(includePublicRows?{includePublicRows:true}:{}),...(before??{}),...(next?{cursor:next}:{})}) as Json;
         if(!Array.isArray(result.turnGroups)||typeof result.revision!=='string')throw new Error('Malformed native history page');
+        if(result.selection?.version===1&&typeof result.selection.bundle==='string'&&result.selection.bundle.length<=4096&&typeof result.selection.bundleLabel==='string'&&result.selection.bundleLabel.length<=200){
+          const fresh=this.getRecord(record.uri);
+          if(fresh&&JSON.stringify(fresh.state._meta?.['amplifier.dev/selection'])!==JSON.stringify(result.selection))this.emit(record.uri,{type:'session/metaChanged',_meta:{...fresh.state._meta,'amplifier.dev/selection':result.selection}} as StateAction);
+        }
         if(before?.includeEditContext){if(result.editContext?.version!==1||result.editContext.targetMessageId!==before.beforeTurnId||!Object.hasOwn(result.editContext,'publicMessage'))throw new Error('Native edit context is unavailable');editContext=result.editContext;}
         const publicRows=includePublicRows?this.publicRows(record,result):[];
         if(revision&&revision!==result.revision)throw new RpcFault(-32013,'Native history changed while assembling the selected window');
@@ -850,6 +854,18 @@ export class AmplifierHost {
         const path=await this.resourcePath(p.uri),info=await stat(path);return {uri:pathToFileURL(path).href,type:info.isDirectory()?'directory':'file',size:info.size,mtime:info.mtime.toISOString(),ctime:info.birthtime.toISOString()};
       }
       case 'resourceRead': {
+        if(typeof p.uri==='string'&&p.uri.startsWith('amplifier-model:')){
+          const url=new URL(p.uri),session=url.searchParams.get('session');
+          if(url.hostname!=='recording'||!session||url.searchParams.size!==4||![...url.searchParams.keys()].every(key=>['session','callId','field','sha256'].includes(key)))throw new RpcFault(-32602,'Exact model recording resource required');
+          const record=await this.record(session),callId=url.searchParams.get('callId'),field=url.searchParams.get('field'),sha256=url.searchParams.get('sha256');
+          if(!record.nativeSessionId)throw new RpcFault(-32008,'Native recording identity unavailable');
+          const result=await this.passiveCreationAgent(record.engineId,this.passiveProcessDirectory(record),async agent=>{
+            if((agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.modelCalls?.version!==1)throw new RpcFault(-32601,'Agent does not provide recorded model details');
+            return agent.client.extMethod('_amplifier/model-detail',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,callId,field,sha256});
+          });
+          if(result.callId!==callId||result.field!==field||result.sha256!==sha256||typeof result.text!=='string'||Buffer.byteLength(result.text)>1000000)throw new RpcFault(-32000,'Invalid model recording');
+          return {data:result.text,encoding:'utf-8',contentType:'text/plain'};
+        }
         if(typeof p.uri==='string'&&p.uri.startsWith('amplifier-export:/'))return {data:JSON.stringify(await this.readExportResource(p.uri)),encoding:'utf-8',contentType:'application/json'};
         const topic=this.capability(p.uri);
         if(topic){const data=await this.config.capabilities!.read({uri:p.uri,...topic,clientId:peer.clientId!});const json=JSON.stringify(data);if(Buffer.byteLength(json)>1024*1024)throw new RpcFault(-32000,'Capability exceeds bounded topic size');return {data:json,encoding:'utf-8',contentType:'application/json'};}
@@ -1355,7 +1371,20 @@ export class AmplifierHost {
           if(missing){retainedTurns++;unresolvedSteeringInputs+=missing;continue;}
           // Native history is canonical for persisted response boundaries; the
           // live host remains authority for admission outcome and input provenance.
-          const responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
+          let responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
+          const hasRecords=live.responseParts.some(part=>(part as Json)._meta?.['amplifier.dev/modelCall']);
+          const responseText=(parts:typeof responseParts)=>parts.filter(part=>part.kind==='markdown').map(part=>typeof (part as any).content==='string'?(part as any).content:(part as any).content?.value??'').join('');
+          const toolIds=(parts:typeof responseParts)=>JSON.stringify(parts.filter(part=>part.kind==='toolCall').map(part=>(part as any).toolCall.toolCallId));
+          // A canonical reread has no provider timing records. Retain the
+          // observed ordering only when its answer and tool identities agree.
+          if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&toolIds(live.responseParts)===toolIds(responseParts)){
+            const savedText=responseParts.filter(part=>part.kind==='markdown'),liveText=live.responseParts.filter(part=>part.kind==='markdown');
+            if(savedText.length===liveText.length&&savedText.every((part,index)=>responseText([part])===responseText([liveText[index]]))){
+              let textIndex=0;
+              responseParts=live.responseParts.map(part=>part.kind==='markdown'?{...part,_meta:{...(part as Json)._meta,...(savedText[textIndex++] as Json)._meta}}:part);
+            }
+          }
+
           const boundary=canonical.message._meta?.['amplifier.dev/history'] as Json|undefined;
           const {messageReference:_oldReference,replyTo:_oldQuote,...liveBoundary}=(live.message._meta?.['amplifier.dev/history'] as Json)??{};
           this.store.saveTurn(record.chat.resource,{...live,responseParts,message:{...live.message,_meta:{...live.message._meta,'amplifier.dev/history':{...liveBoundary,messageId:boundary?.messageId,turnId:canonical.id,boundaryRevision:page.revision,...(boundary?.messageReference?{messageReference:boundary.messageReference}:{}),...(boundary?.replyTo?{replyTo:boundary.replyTo}:{})}}}});refreshedTurns++;
@@ -1791,6 +1820,23 @@ export class AmplifierHost {
         nativeEvent:async params=>{
           const event=params.event as Json|undefined;
           if(event) this.steeringEvent(uri,active,event);
+          if(event?.type==='execution.event'&&active.busy&&active.turnId&&event.activeInputId===active.turnId&&event.event?.kind==='llm'){
+            const node=event.event;
+            if(typeof node.id!=='string'||node.id.length>200||Buffer.byteLength(JSON.stringify(node))>32768)return;
+            const details:Json={};
+            for(const field of ['request','response']){
+              const detail=node[field+'Detail'];
+              if(detail?.callId===node.id&&detail.field===field&&/^[a-f0-9]{64}$/.test(detail.sha256)){
+                details[field+'Detail']={...detail,uri:'amplifier-model://recording?'+new URLSearchParams({session:uri,callId:node.id,field,sha256:detail.sha256})};
+              }
+            }
+            const action={type:'chat/responsePart',turnId:active.turnId,part:{kind:'systemNotification',content:'',_meta:{'amplifier.dev/modelCall':{version:1,...node,...details}}}} as StateAction;
+            const bytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(action));
+            // Optional diagnostics must not exhaust the active conversation view.
+            if(bytes>(this.config.maxActiveProjectionBytes??8*1024*1024))return;
+            active.projectionBytes=bytes;this.projectPendingTurn(uri,active);
+            this.emit(chatURI(uri),action);
+          }
           if(event?.type==='history.revised')this.confirmHistoryRevision(uri,active,event);
           if(active.busy&&((event?.type==='input.accepted'&&event.input_id===active.turnId)||(event?.type==='generation.started'&&event.activeInputId===active.turnId)))this.projectPendingTurn(uri,active);
           if(event?.type==='runtime.ready'){active.stopNotified=false;active.publicOriginalMount=event.report?.publicMessagePreservation;}
@@ -2021,8 +2067,8 @@ export class AmplifierHost {
     if((active.steeringRuns?.size??0)>=16||Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").get(record.chat.resource,active.turnId)!.n)>=50)return;
     const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
     const original=this.captureOriginal(active,message,id,'steer.submit');
-    const params=this.inputWireParams({sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})});
-    const submitted={type:'chat/responsePart',turnId:activeInputId,part:{kind:'systemNotification',content:'Steering submitted: '+message.text,_meta:{'amplifier.dev/steering':{inputId:id,activeTurnId:activeInputId}}}} as StateAction;
+    const params=this.inputWireParams({sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text,...(message._meta?.['amplifier.dev/input']?.voiceDelivery?{voiceDelivery:message._meta['amplifier.dev/input'].voiceDelivery}:{})},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})});
+    const submitted={type:'chat/responsePart',turnId:activeInputId,part:{kind:'systemNotification',content:'Steering submitted: '+message.text,_meta:{'amplifier.dev/steering':{inputId:id,activeTurnId:activeInputId,...(message._meta?.['amplifier.dev/input']?.voiceDelivery?{voiceDelivery:message._meta['amplifier.dev/input'].voiceDelivery}:{})}}}} as StateAction;
     const projectionBytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(submitted));
     if(projectionBytes>(this.config.maxActiveProjectionBytes??8*1024*1024))throw new RpcFault(-32000,'Active steering view exceeds its byte budget; original pending input is retained',{executed:false});
     const publication:{commit?:()=>void}={};
@@ -2236,14 +2282,23 @@ export class AmplifierHost {
       });
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */
-  async submitTurn(session:string,input:{commandId:string;text:string;clientId:string;attachments?:Message['attachments'];origin?:'agent'|'ui'}) {
+  async submitTurn(session:string,input:{commandId:string;text:string;clientId:string;attachments?:Message['attachments'];origin?:'agent'|'ui';delivery?:{version:1;callId:string;sourceItemIds:string[];context?:Json[]}}) {
     return this.intake.run(async()=>{
     if(typeof input.commandId!=='string'||!input.commandId||input.commandId.length>512||typeof input.clientId!=='string'||!input.clientId||typeof input.text!=='string'||Buffer.byteLength(input.text)>1024*1024)throw new RpcFault(-32602,'Bounded command, client identity and text are required');
+    if(input.delivery&&(input.delivery.version!==1||typeof input.delivery.callId!=='string'||input.delivery.callId.length>200||!Array.isArray(input.delivery.sourceItemIds)||input.delivery.sourceItemIds.length>32||input.delivery.sourceItemIds.some(id=>typeof id!=='string'||id.length>200)||Buffer.byteLength(JSON.stringify(input.delivery))>16000))throw new RpcFault(-32602,'Invalid bounded voice delivery');
     if(input.origin!==undefined&&!['agent','ui'].includes(input.origin))throw new RpcFault(-32602,'Unsupported turn origin');
     if(input.attachments&&(!Array.isArray(input.attachments)||input.attachments.length>16||Buffer.byteLength(JSON.stringify(input.attachments))>8*1024*1024))throw new RpcFault(-32602,'Attachments exceed the admitted input bound');
     const record=await this.record(session);
-    await this.withLock(record.uri,async()=>{if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Command already admitted; inspect its durable receipt before new work');await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:input.origin==='agent'?'agent':'user'},...(input.origin==='agent'?{_meta:{'amplifier.dev/input':{inputOrigin:'coordination'}}}:{}),...(input.attachments?{attachments:input.attachments}:{})}} as any,{clientId:input.clientId,clientSeq:this.store.extensionSequence(input.clientId)},undefined,input.origin==='agent');});
-    return {accepted:true,inputId:input.commandId,sessionId:record.uri,delivery:'sending',receipt:this.store.receipt(input.commandId)};
+    let activeInputId:string|undefined;
+    await this.withLock(record.uri,async()=>{
+      const active=this.active.get(record.uri);
+      if(input.delivery&&active?.busy&&active.turnId&&!active.cancel){
+        activeInputId=active.turnId;
+        await this.applySteeringAction(record,{type:'chat/pendingMessageSet',kind:'steering',id:input.commandId,message:{text:input.text,origin:{kind:'user'},_meta:{'amplifier.dev/steering':{activeTurnId:activeInputId},'amplifier.dev/input':{inputOrigin:'voice',voiceDelivery:input.delivery}}}} as any,{clientId:input.clientId,clientSeq:this.store.extensionSequence(input.clientId)});
+        return;
+      }
+      if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Command already admitted; inspect its durable receipt before new work');await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:input.origin==='agent'?'agent':'user'},...(input.delivery?{_meta:{'amplifier.dev/input':{inputOrigin:'voice',voiceDelivery:input.delivery}}}:input.origin==='agent'?{_meta:{'amplifier.dev/input':{inputOrigin:'coordination'}}}:{}),...(input.attachments?{attachments:input.attachments}:{})}} as any,{clientId:input.clientId,clientSeq:this.store.extensionSequence(input.clientId)},undefined,input.origin==='agent');});
+    return {accepted:true,inputId:input.commandId,sessionId:record.uri,delivery:activeInputId?'steering':'sending',...(activeInputId?{activeInputId}:{}),receipt:this.store.receipt(input.commandId)};
       });
   }
   /** Durable common creation for a configured source; no native history or goals are copied. */
@@ -2376,6 +2431,7 @@ export class AmplifierHost {
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
     limit=bounded(limit,12,50);const record=await this.record(session);let turns:Array<Turn|NonNullable<ChatState['activeTurn']>>=this.store.turns(record.chat.resource,limit).turns;
+    const generations=turns.filter(turn=>'state' in turn&&turn.state==='complete').slice(-8).map(turn=>({event:'generation.finished',generation_id:turn.id,input_ids:[turn.id],text:turn.responseParts.filter(part=>part.kind==='markdown').map(part=>(part as any).content??'').join('\n').slice(0,12000)}));
     if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native')turns=(await this.selectedHistory(record,limit)).turns;
     const current=this.getRecord(record.uri)!.chat.activeTurn;
     if(current)turns=[...turns.filter(turn=>turn.id!==current.id),current].slice(-limit);
@@ -2383,16 +2439,17 @@ export class AmplifierHost {
     for(const turn of turns){
       const history=turn.message._meta?.['amplifier.dev/history'] as Json|undefined,scheduled=turn.message._meta?.['amplifier.dev/scheduled'] as Json|undefined,input=turn.message._meta?.['amplifier.dev/input'] as Json|undefined,receipt=this.store.receipt(turn.id);
       const questionId=input?.questionId??history?.questionId,scheduledRunId=scheduled?.scheduledRunId??input?.scheduledRunId??history?.scheduledRunId;
-      const provenance={createdAt:history?.createdAt??turn.startedAt,inputOrigin:scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??(receipt?.channel===record.chat.resource?'user':'unknown'),...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(history?.via==='call'?{voiceId:history.callId,voiceItemId:history.itemId}:{}),...(history?.authorization?{authorization:history.authorization}:{})};
-      if(turn.message.text)messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':turn.message.origin?.kind==='systemNotification'?'system':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
+      const provenance={createdAt:history?.createdAt??turn.startedAt,inputOrigin:scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??(receipt?.channel===record.chat.resource?'user':'unknown'),...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(history?.via==='call'?{via:'call',voiceId:history.callId,voiceItemId:history.itemId}:{}),...(history?.authorization?{authorization:history.authorization}:{})};
+      const voiceDelivery=input?.voiceDelivery??history?.voiceDelivery;
+      if(turn.message.text&&(!voiceDelivery||voiceDelivery.source==='chat'))messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':turn.message.origin?.kind==='systemNotification'?'system':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
       for(const steering of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='applied' ORDER BY rowid DESC LIMIT ?").all(record.chat.resource,turn.id,limit).reverse()){
         const correction=JSON.parse(String(steering.message)),admitted=this.store.receipt(String(steering.id));
         messages.push({id:String(steering.id),role:'user',text:correction.text.slice(0,5000),truncated:correction.text.length>5000,createdAt:admitted?.createdAt,inputOrigin:'user',activeTurnId:turn.id,delivery:'steering'});
       }
       const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
-      if(text)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
+      if(text&&!voiceDelivery)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
     }
-    return {...await this.inspectSession(session),status:record.chat.status,messages:messages.slice(-limit),recentLimit:limit};
+    return {...await this.inspectSession(session),status:record.chat.status,messages:messages.slice(-limit),generations,recentLimit:limit};
   }
   /** Native-only recordings become available on the next standard history read. */
   async invalidateNativeHistory(session:string) {
@@ -2439,7 +2496,7 @@ export class AmplifierHost {
   private inputParams(active:Active,record:SessionRecord,turnId:string,message:Message,blocks:ContentBlock[],special:SettledInput|undefined,original:PublicMessageV1|undefined):Json {
     const reply=this.messageReply(message),originalMeta=original?{[PUBLIC_MESSAGE_META]:original}:{};
     const inputOrigin=String((message._meta?.['amplifier.dev/input'] as Json|undefined)?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
-    const params=special?{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},_meta:{...originalMeta,...(special.operation==='observation.submit'?{'amplifier.dev/native':{requireExisting:true}}:{})}}:{sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...originalMeta,...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{}),...(reply?{'amplifier.dev/messageReply':{...reply,sessionId:record.nativeSessionId}}:{})}};
+    const params=special?{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},_meta:{...originalMeta,...(special.operation==='observation.submit'?{'amplifier.dev/native':{requireExisting:true}}:{})}}:{sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...originalMeta,...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:inputOrigin==='voice'?{'amplifier.dev/input':message._meta?.['amplifier.dev/input']}:{}),...(reply?{'amplifier.dev/messageReply':{...reply,sessionId:record.nativeSessionId}}:{})}};
     return this.inputWireParams(params);
   }
   private captureOriginal(active:Active,message:Message,inputId:string,route:string):PublicMessageV1|undefined {
