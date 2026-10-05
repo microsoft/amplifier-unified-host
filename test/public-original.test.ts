@@ -50,6 +50,15 @@ test('missing negotiation and unsupported typed selections retain the ordinary r
   }
 });
 
+test('steering original uses its own exact input ID and validates before pending-intent effects',async()=>{
+  const f=await fixture();try{
+    const invalid='bad\0id';await assert.rejects(f.host.updatePendingQueue(f.session,{type:'chat/pendingMessageSet',kind:'steering',id:invalid,message:{text:'literal',origin:{kind:'user'}}} as any,{clientId:'caller'}));assert.equal(f.host.store.db.prepare('SELECT id FROM steering_intents WHERE id=?').get(invalid),undefined);
+    const steering=randomUUID(),initial=randomUUID();await f.host.updatePendingQueue(f.session,{type:'chat/pendingMessageSet',kind:'steering',id:steering,message:{text:'  literal steering\n',origin:{kind:'user'},_meta:{'amplifier.dev/publicMessage':{inputId:'forged'}}}} as any,{clientId:'caller'});
+    await f.host.submitTurn(f.session,{commandId:initial,text:'queue-hold',clientId:'caller'});await wait(()=>f.host.store.receipt(steering)?.status==='completed');
+    const request=JSON.parse((await readFile(f.log+'.public-steering','utf8')).trim());assert.equal(request.args.inputId,steering);assert.equal(request.args.activeInputId,initial);assert.deepEqual(request._meta['amplifier.dev/publicMessage'],{version:1,inputId:steering,capture:'host-standard',blocks:[{type:'text',text:'  literal steering\n'}]});assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+  }finally{await f.close();}
+});
+
 test('ordered card occurrence counts text blocks and permits Resources255 names without URI rewrite',()=>{
   const uri=`amplifier-attachment://${randomUUID()}/body?session=ahp-session%3A%2Fsource`,name='n'.repeat(255);
   const original=capturePublicMessage({text:'',origin:{kind:'user'},attachments:[{type:'resource',label:name,contentType:'application/pdf',uri}]} as any,'input')!;

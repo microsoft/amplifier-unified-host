@@ -541,6 +541,7 @@ export class AmplifierHost {
   }
   /** Existing passive Native owner reads; no grant or execution effects. */
   async readPublicOriginalRows(session:string,input:{cursor?:string;rowLocator?:NativeLocator;expectedRevision?:string}={}) {
+    if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['cursor','rowLocator','expectedRevision'].includes(key))||input.cursor!==undefined&&(typeof input.cursor!=='string'||!input.cursor)||input.expectedRevision!==undefined&&(typeof input.expectedRevision!=='string'||!input.expectedRevision))throw new RpcFault(-32602,'Exact public row read options required');
     if(input.cursor!==undefined&&input.rowLocator!==undefined)throw new RpcFault(-32602,'Choose public row paging or one exact occurrence');
     const record=await this.record(session),engine=this.config.engines.find(value=>value.id===record.engineId);
     if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native public row identity unavailable');
@@ -638,7 +639,14 @@ export class AmplifierHost {
           const inputHistory=(group.updates as Json[]).find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
           const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
           const attachments:any[]=[];
-          for(const content of inputs){if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});else if(content.type==='resource_link')attachments.push({type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});}
+          for(const content of inputs){
+            if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});
+            else if(content.type==='resource_link'){
+              let foreignScope=false;
+              if(content.uri?.startsWith('amplifier-attachment:')){try{foreignScope=new URL(content.uri).searchParams.get('session')!==record.uri;}catch{foreignScope=true;}}
+              attachments.push(foreignScope?{type:'simple',label:content.name??'Resource',_meta:{'amplifier.dev/publicAttachment':{originalReference:{owner:'resources',id:content.uri},access:'unavailable'}}}:{type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});
+            }
+          }
           if(publicRows.length){
             const seen=new Set<string>(),originals:PersistedPublicRow[]=[];
             for(const update of group.updates as Json[]){const locator=update._meta?.['amplifier.dev/history']?.rowLocator;if(locator){const exact=nativeLocator(locator),row=publicRows.find(value=>sameLocator(value.locator,exact));if(row&&!seen.has(row.locator.messageId)){seen.add(row.locator.messageId);originals.push(row);}}}
@@ -1880,6 +1888,7 @@ export class AmplifierHost {
     const native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
     if(native?.activeSteering?.version!==1||native.activeSteering.mode!=='request_boundary')throw new RpcFault(-32601,'Agent does not advertise generation-anchored request-boundary steering');
     if(!action.message||typeof action.message.text!=='string'||!action.message.text.trim()||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.attachments?.length||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering supports bounded user text; multimodal or per-message configuration is not negotiated');
+    if(supportsPublicOriginal(native?.publicMessagePreservation,'steer.submit'))capturePublicMessage(action.message,action.id);
     const payload=JSON.stringify(action.message);if(Buffer.byteLength(payload)>65536)throw new RpcFault(-32000,'Steering message exceeds byte bound');
     if(prior&&prior.status!=='pending'||this.store.receipt(action.id)||this.store.db.prepare('SELECT 1 FROM queue_intents WHERE id=?').get(action.id))throw new RpcFault(-32011,'Steering identity already consumed or removed; inspect its receipt without replay');
     const capacity=this.store.db.prepare("SELECT count(*) n,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM steering_intents WHERE status IN ('pending','dispatching') AND id!=?").get(action.id)!;
@@ -1901,10 +1910,10 @@ export class AmplifierHost {
     const row=this.store.db.prepare("SELECT * FROM steering_intents WHERE chat=? AND status='pending' AND held=0 LIMIT 1").get(record.chat.resource);if(!row||row.active_turn_id&&row.active_turn_id!==active.turnId)return;
     if((active.steeringRuns?.size??0)>=16||Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").get(record.chat.resource,active.turnId)!.n)>=50)return;
     const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
+    const original=this.captureOriginal(active,message,id,'steer.submit');
     this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);});
     this.emit(record.chat.resource,{type:'chat/pendingMessageRemoved',kind:'steering',id} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(id);this.store.finish(id,'dispatching');
     let acceptanceTimer:ReturnType<typeof setTimeout>|undefined;
-    const original=this.captureOriginal(active,message,id,'steer.submit');
     const request=this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})}));
     const pending=Promise.race([request,new Promise<never>((_resolve,reject)=>{acceptanceTimer=setTimeout(()=>reject(new Error('Native steering acceptance deadline expired')),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));acceptanceTimer.unref();})]).then(result=>{
       if(result.accepted===false&&result.executed===false){this.settleSteering(session,id,'held',String(result.reason??'Native steering refused before execution'));return;}

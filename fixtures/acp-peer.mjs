@@ -119,6 +119,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
     reply(message.id,{...result,applied:true});
   }
   else if(message.method==='_amplifier/native'&&p.operation==='steer.submit'){
+    if(process.env.FIXTURE_PUBLIC_ORIGINAL&&process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.public-steering',JSON.stringify(p)+'\n');
     if(process.env.FIXTURE_LOG)appendFileSync(process.env.FIXTURE_LOG+'.steering',JSON.stringify(p.args)+'\n');
     if(!active||active.inputId!==p.args.activeInputId){reply(message.id,{accepted:false,executed:false,reason:'No matching active input'});continue;}
     const result={accepted:true,inputId:p.args.inputId,activeInputId:p.args.activeInputId,generationId:active.generationId,disposition:'queued'};
