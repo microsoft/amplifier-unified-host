@@ -620,6 +620,32 @@ export class AmplifierHost {
     return {commandId,targetSession:String(entry.target),qualified,unresolved,unsupported,diagnosticCount,enumeration:diagnosticCount?'partial':'complete',grantCoverage:diagnosticCount||unresolved||unsupported?'partial':'complete',replayed:false};
     });
   }
+  private async nativeHistoryMessage(record:SessionRecord,group:Json,updates:Json[],publicRows:PersistedPublicRow[]):Promise<Message> {
+    const inputs=updates.map(update=>update.content);
+    const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
+    const inputHistory=updates.find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
+    const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
+    const attachments:any[]=[];
+    for(const content of inputs){
+      if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});
+      else if(content.type==='resource_link'){
+        let foreignScope=false;
+        if(content.uri?.startsWith('amplifier-attachment:'))foreignScope=resourcesBodyUri(content.uri)?.searchParams.get('session')!==record.uri;
+        attachments.push(foreignScope?{type:'simple',label:content.name??'Resource',_meta:{'amplifier.dev/publicAttachment':{originalReference:{owner:'resources',id:content.uri},access:'unavailable'}}}:{type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});
+      }
+    }
+    if(publicRows.length){
+      const seen=new Set<string>(),originals:PersistedPublicRow[]=[];
+      for(const update of updates){const locator=update._meta?.['amplifier.dev/history']?.rowLocator;if(locator){const exact=nativeLocator(locator),row=publicRows.find(value=>sameLocator(value.locator,exact));if(row&&!seen.has(row.locator.messageId)){seen.add(row.locator.messageId);originals.push(row);}}}
+      if(originals.length){
+        message.text=originals.flatMap(row=>row.publicMessage.blocks.filter(block=>block.type==='text').map(block=>block.text)).join('');
+        attachments.length=0;
+        for(const row of originals)for(const [blockIndex,block] of row.publicMessage.blocks.entries())if(block.type==='attachment')attachments.push(await this.publicAttachment(record,row,blockIndex,block));
+      }
+    }
+    if(attachments.length)message.attachments=attachments;
+    return message;
+  }
   private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string,before?:{beforeTurnId:string;expectedRevision:string}):Promise<{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]}> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
@@ -642,32 +668,30 @@ export class AmplifierHost {
         revision=result.revision;diagnostics.push(...(result.diagnostics??[]));const page:Turn[]=[];
         for(const group of result.turnGroups) {
           for(const update of group.updates as Json[])if(update._meta?.['amplifier.dev/history']!==undefined)update._meta={...update._meta,'amplifier.dev/history':this.nativeMessageHistory(record,update._meta['amplifier.dev/history'])};
-          const inputs=(group.updates as Json[]).filter(update=>update.sessionUpdate==='user_message_chunk').map(update=>update.content);
-          const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
-          const inputHistory=(group.updates as Json[]).find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
-          const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
-          const attachments:any[]=[];
-          for(const content of inputs){
-            if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});
-            else if(content.type==='resource_link'){
-              let foreignScope=false;
-              if(content.uri?.startsWith('amplifier-attachment:'))foreignScope=resourcesBodyUri(content.uri)?.searchParams.get('session')!==record.uri;
-              attachments.push(foreignScope?{type:'simple',label:content.name??'Resource',_meta:{'amplifier.dev/publicAttachment':{originalReference:{owner:'resources',id:content.uri},access:'unavailable'}}}:{type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});
-            }
+          // Multiple chunks may belong to one canonical user row. Later user
+          // rows in this turn must remain chronological, never join its question.
+          const userRows:Json[][]=[];const rowAt=new Map<number,Json[]>();let previous:Json[]|undefined,previousKey:string|undefined;
+          for(const [index,update] of (group.updates as Json[]).entries()) {
+            if(update.sessionUpdate!=='user_message_chunk'){previous=undefined;previousKey=undefined;continue;}
+            const history=update._meta?.['amplifier.dev/history'];
+            const key=history?.messageId??history?.rowLocator?.messageId??history?.nativeInput?.id;
+            if(!previous||key!==previousKey){previous=[];userRows.push(previous);rowAt.set(index,previous);previousKey=key;}
+            previous.push(update);
           }
-          if(publicRows.length){
-            const seen=new Set<string>(),originals:PersistedPublicRow[]=[];
-            for(const update of group.updates as Json[]){const locator=update._meta?.['amplifier.dev/history']?.rowLocator;if(locator){const exact=nativeLocator(locator),row=publicRows.find(value=>sameLocator(value.locator,exact));if(row&&!seen.has(row.locator.messageId)){seen.add(row.locator.messageId);originals.push(row);}}}
-            if(originals.length){
-              message.text=originals.flatMap(row=>row.publicMessage.blocks.filter(block=>block.type==='text').map(block=>block.text)).join('');
-              attachments.length=0;
-              for(const row of originals)for(const [blockIndex,block] of row.publicMessage.blocks.entries())if(block.type==='attachment')attachments.push(await this.publicAttachment(record,row,blockIndex,block));
-            }
-          }
-          if(attachments.length)message.attachments=attachments;
+          const initial=userRows[0]??[];
+          const message=await this.nativeHistoryMessage(record,group,initial,publicRows);
           let state=chatReducer({...record.chat,turns:[],activeTurn:undefined},{type:'chat/turnStarted',turnId:group.id,startedAt:group.startedAt??record.summary.createdAt,message} as any);
           const active:Active={agent,busy:true,lastUsed:0,turnId:group.id,tools:new Set(),permissions:new Map()};
-          for(const update of group.updates)await this.update(record.uri,{sessionId:record.nativeSessionId,update} as SessionNotification,{active,emit:action=>{state=chatReducer(state,action as any);}});
+          for(const [index,update] of (group.updates as Json[]).entries()) {
+            if(update.sessionUpdate==='user_message_chunk') {
+              const row=rowAt.get(index);if(!row||row===initial)continue;
+              const steering=await this.nativeHistoryMessage(record,group,row,publicRows);
+              active.textPart=undefined;active.reasoningPart=undefined;
+              state=chatReducer(state,{type:'chat/responsePart',turnId:group.id,part:{kind:'systemNotification',content:`${(steering._meta?.['amplifier.dev/history'] as Json)?.inputOrigin==='steering'?'Steering':'User'} input: ${steering.text}`,_meta:{'amplifier.dev/history':{...(steering._meta?.['amplifier.dev/history'] as Json),message:steering}}}} as any);
+              continue;
+            }
+            await this.update(record.uri,{sessionId:record.nativeSessionId,update} as SessionNotification,{active,emit:action=>{state=chatReducer(state,action as any);}});
+          }
           const action=group.recordedOnly||group.state==='complete'?{type:'chat/turnComplete',turnId:group.id,duration:0}:{type:'chat/error',turnId:group.id,duration:0,part:{kind:'error',error:{errorType:'NATIVE_OUTCOME_UNKNOWN',message:'Historical content is preserved; its execution outcome was not recorded.'}}};
           state=chatReducer(state,action as any);page.push(...state.turns);
         }
