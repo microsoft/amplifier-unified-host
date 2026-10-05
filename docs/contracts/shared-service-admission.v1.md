@@ -10,9 +10,19 @@ persists a `service-stop` fence before yielding. `admitted:true,phase:'closed'`
 means only intake closure; `evidence.activeWork` is a measured nonnegative count
 or `unknown`. `admitServiceStop` reuses that exact fence/command/identity, waits on
 actual work-change notifications, and returns `phase:'held',activeWork:0` only at
-local zero. Observation timeout keeps the fence unknown and closed. It neither
-signals processes nor settles a business outcome. A drain-only timeout can be
-observed again; restart/platform uncertainty needs authenticated reconciliation.
+local zero. Known active work keeps that original drain pending with a closed
+fence, without a duration limit or polling timer. A transport observation timeout
+does not change the drain's truth or cancel it. `serviceStopReceipt(commandId)`
+passively reads its existing receipt: after the work settles it reports the same
+fence as held, even if the original caller disconnected. A controller can continue
+its same durable stop operation from that exact receipt; it must not replay
+admission or create another stop command to recover a missing reply.
+
+Host shutdown/restart, unmeasurable work and platform uncertainty keep the fence
+unknown and require authenticated reconciliation. A sampled zero cannot clear
+that uncertainty. The Host neither signals processes nor settles a business
+outcome. A callback that has finished, including one that failed, no longer owns
+local work; its failure or unknown business receipt is preserved separately.
 
 New chat/configuration/resource/capability/scheduled starts use ordinary shared
 admission and stay closed. Exact pending client+chat+turn+tool results, current

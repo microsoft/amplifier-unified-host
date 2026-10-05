@@ -1300,7 +1300,7 @@ export class AmplifierHost {
     this.guardRetirement(active);
     if(active.busy||active.controlDepth||this.starting.has(record.uri))throw new RpcFault(-32008,'Session has active work; lifecycle change was not executed',{executed:false});
     active.controlDepth=(active.controlDepth??0)+1;
-    try{if(!active.agent.closed&&!await this.retireActive(record.uri,active))throw new RpcFault(-32008,'Native session still owns work; lifecycle change was not executed',{executed:false});active.retireReason='session-lifecycle';await active.agent.retire();await active.stopCallback;this.active.delete(record.uri);}finally{active.controlDepth--;}
+    try{if(!active.agent.closed&&!await this.retireActive(record.uri,active))throw new RpcFault(-32008,'Native session still owns work; lifecycle change was not executed',{executed:false});active.retireReason='session-lifecycle';await active.agent.retire();await active.stopCallback;this.active.delete(record.uri);}finally{active.controlDepth--;this.intake.workChanged();}
   }
   async previewDeleteSession(session:string) {const record=await this.record(session);return this.lifecycleAgent(record,agent=>this.nativeLifecycle(agent,record,'delete.preview'));}
   private lifecycleArgs(operation:string,args:Json) {
@@ -1701,8 +1701,10 @@ export class AmplifierHost {
         hostRuntimeRetention:true,
         admitEffect:work=>this.admittedNativeWork(uri,active,work),
         update:params=>{
-          const bytes=Buffer.byteLength(JSON.stringify(params));active.updateCount=(active.updateCount??0)+1;active.updateBytes=(active.updateBytes??0)+bytes;
-          if(active.updateCount>512||active.updateBytes>8*1024*1024){agent.process.kill();return Promise.reject(new Error('ACP update queue capacity exceeded; execution outcome requires reconciliation'));}
+          const bytes=Buffer.byteLength(JSON.stringify(params));
+          // Rejected updates never enter the queue or own a completion callback.
+          if((active.updateCount??0)+1>512||(active.updateBytes??0)+bytes>8*1024*1024){agent.process.kill();return Promise.reject(new Error('ACP update queue capacity exceeded; execution outcome requires reconciliation'));}
+          active.updateCount=(active.updateCount??0)+1;active.updateBytes=(active.updateBytes??0)+bytes;
           const update=(active.updates??Promise.resolve()).then(()=>this.update(uri,params)).finally(()=>{active.updateCount!--;active.updateBytes!-=bytes;this.intake.workChanged();});active.updates=update;return update;
         },permission:async params=>{await active.updates;return this.permission(uri,params);},
         terminal:event=>this.terminalEvent(uri,event),
@@ -2563,7 +2565,7 @@ export class AmplifierHost {
         try {
           if(!await this.retireActive(uri,active))return false;
           active.retireReason='idle-retired';await active.agent.retire();await active.stopCallback;this.active.delete(uri);return true;
-        }finally{active.controlDepth--;}
+        }finally{active.controlDepth--;this.intake.workChanged();}
       });
       const retired=await retirement;
       if(retired)retiredAny=true;
@@ -2589,7 +2591,7 @@ export class AmplifierHost {
         try{
           if(!await this.retireActive(session,active,this.config.quiescence?.timeoutMs??10000))return active.agent.retirementOutcome==='refused'?{ready:false,reason:'native-owned-work'}:{ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
           active.retireReason='quiesced';await active.agent.retire();await active.stopCallback;this.active.delete(session);return {ready:true};
-        }catch{return {ready:false,unknown:true,reason:'native-retirement-transport-unknown'};}finally{active.controlDepth!--;}
+        }catch{return {ready:false,unknown:true,reason:'native-retirement-transport-unknown'};}finally{active.controlDepth!--;this.intake.workChanged();}
       });
       if(!result.ready)return result;
     }
@@ -2838,6 +2840,7 @@ export class AmplifierHost {
   }
   async close() {
     this.closing=true;
+    this.intake.hostClosing();
     clearInterval(this.retireTimer);
     for(const observer of this.observers){observer.closed=true;observer.queue=[];}this.observers.clear();
     for(const peer of this.peers)peer.socket.terminate();

@@ -79,6 +79,7 @@ export interface QuiescenceConfig {
  verifyAdmissionAbort?:(request:Readonly<QuiescenceContext>&{evidence?:unknown})=>Promise<AdmissionAbortProof>;
  serviceLifecycle?:ServiceLifecycleConfig;
  onMayBeIdle?:()=>void;
+ /** Bounds owner/verifier observations, never the lifetime of known local service work. */
  timeoutMs?:number;
 }
 export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'closed'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;admissionStage?:'participants'|'native-retirement'|'owner-exclusion'|'held'|'service-drain';admissionModel?:'shared-service-v1';}
@@ -104,6 +105,7 @@ export class QuiescenceGate {
  private pending=new Set<Promise<unknown>>();
  private serviceDrain?:Promise<ServiceStopReceipt>;
  private drainWake?:()=>void;
+ private closing=false;
  constructor(private db:DatabaseSync,private config:QuiescenceConfig|undefined,private requirements:string[],private inspectWork:()=>WorkCounts,private retire:()=>Promise<{ready:boolean;reason?:string;unknown?:boolean}>,private hasResidents:()=>boolean=()=>false,private inspectServiceWork:()=>WorkCounts=inspectWork) {
   if(config){
    token(config.instanceId,'launch identity');token(config.dataScope,'data scope');
@@ -172,6 +174,8 @@ export class QuiescenceGate {
   try{return await this.scope.run({active:false},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{this.maintenance--;}
  }
  workChanged(){this.maybeIdle();}
+ /** End observations of this local lifetime without treating process shutdown as drained work. */
+ hostClosing(){this.closing=true;const fence=this.fence();if(fence?.admissionModel==='shared-service-v1'&&fence.phase==='closed')this.unknown(fence,'host-closing');this.drainWake?.();}
  private maybeIdle(){this.drainWake?.();if(this.calls||this.continuations)return;queueMicrotask(()=>{try{this.config?.onMayBeIdle?.();}catch{/* Advisory wakeup never changes operation truth. */}});}
  private work():WorkCounts{const work=this.inspectWork();return {counts:{...work.counts,admissions:this.calls,continuations:this.continuations},gaps:[...work.gaps,...this.requirements.filter(id=>id.startsWith('uncovered-')||!this.config?.participants.some(p=>p.id===id))]};}
  private async deadline<T>(promise:Promise<T>):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;this.pending.add(promise);void promise.then(()=>this.pending.delete(promise),()=>this.pending.delete(promise));try{return await Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('quiescence-observation-timeout')),this.config?.timeoutMs??10000);timer.unref();})]);}finally{clearTimeout(timer);}}
@@ -189,20 +193,22 @@ export class QuiescenceGate {
   if(!closed.intakeClosed||'released' in closed)return closed;
   const fence=this.fence();
   if(!fence||fence.fenceId!==closed.fenceId||fence.admissionModel!=='shared-service-v1')throw new QuiescenceError('Legacy service holds are not shared drain proof',{executed:false});
-  if(fence.phase==='held')return closed;
-  if(fence.phase==='unknown'&&fence.reason!=='service-drain-unconfirmed')return closed;
+  if(fence.phase!=='closed')return this.serviceStopReceipt(fence.commandId)!;
   if(this.serviceDrain)return this.serviceDrain;
   this.serviceDrain=(async()=>{
-   const until=Date.now()+(this.config?.timeoutMs??10000);
    while(true){
     const current=this.fence();if(!current||current.fenceId!==fence.fenceId||current.commandId!==fence.commandId)throw new QuiescenceError('Service drain fence changed',{executed:false});
-    const work=this.serviceWork();
-    if(!work.gaps.length&&Object.values(work.counts).every(n=>Number.isSafeInteger(n)&&n===0)){
+    if(current.phase!=='closed')return this.serviceStopReceipt(current.commandId)!;
+    if(this.closing)return this.unknown(current,'host-closing');
+    let work:WorkCounts;try{work=this.serviceWork();}catch{return this.unknown(current,'service-work-unconfirmed');}
+    if(work.gaps.length||Object.values(work.counts).some(n=>!Number.isSafeInteger(n)||n<0))return this.unknown(current,'service-work-unconfirmed');
+    if(Object.values(work.counts).every(n=>n===0)){
      current.phase='held';current.observedAt=Date.now();delete current.reason;this.save(current);
      const result=this.serviceClosedResult(current,work);this.result(current.commandId,result);return result;
     }
-    const left=until-Date.now();if(left<=0)return this.unknown(current,'service-drain-unconfirmed');
-    await new Promise<void>(resolve=>{const wake=()=>{clearTimeout(timer);if(this.drainWake===wake)this.drainWake=undefined;resolve();};const timer=setTimeout(wake,left);this.drainWake=wake;});
+    // A caller's observation deadline cannot make known, still-running work unknown.
+    // This original drain continues after a lost reply; passive receipt reads can find its settlement.
+    await new Promise<void>(resolve=>{const wake=()=>{if(this.drainWake===wake)this.drainWake=undefined;resolve();};this.drainWake=wake;});
    }
   })().finally(()=>{this.serviceDrain=undefined;this.drainWake=undefined;});return this.serviceDrain;
  }

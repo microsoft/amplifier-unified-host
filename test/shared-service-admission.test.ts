@@ -73,12 +73,14 @@ test('exact active cancellation drains without promoting durable waiting intents
  }finally{await c?.shutdown();await host?.close();await rm(dir,{recursive:true,force:true});}
 });
 
-test('drain timeout preserves the same closed fence without interrupting or clearing platform uncertainty',async()=>{
+test('observation timeout leaves the original drain pending; passive receipt observes completion without clearing platform uncertainty',async()=>{
  const dir=await mkdtemp(join(tmpdir(),'deadline-service-drain-'));let host:any,release!:()=>void;const gate=new Promise<void>(r=>release=r);let entered!:()=>void;const begun=new Promise<void>(r=>entered=r);
  try{const config=lifecycle();config.timeoutMs=25;host=await createHost({stateDirectory:join(dir,'host'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',command:'/must-not-start'}],quiescence:config});
   const running=host.withExternalMutation('trusted-job',async()=>{entered();await gate;});await begun;
-  const closed=await host.closeServiceIntake({commandId:'deadline-stop',expected:A});const uncertain=await host.admitServiceStop({commandId:'deadline-stop',expected:A});assert.equal(uncertain.intakeClosed,true);assert.equal(uncertain.fence.phase,'unknown');assert.equal(uncertain.fence.fenceId,closed.fenceId);assert.equal(uncertain.fence.reason,'service-drain-unconfirmed');
-  release();await running;const held=await host.admitServiceStop({commandId:'deadline-stop',expected:A});assert.equal(held.phase,'held');assert.equal(held.evidence.activeWork,0);assert.equal(held.fenceId,closed.fenceId);
+  const closed=await host.closeServiceIntake({commandId:'deadline-stop',expected:A});const pending=host.admitServiceStop({commandId:'deadline-stop',expected:A});
+  assert.equal(await Promise.race([pending.then(()=> 'settled'),new Promise(r=>setTimeout(()=>r('observation-ended'),60))]),'observation-ended');
+  const observed=host.serviceStopReceipt('deadline-stop');assert.equal(observed.intakeClosed,true);assert.equal(observed.fence.phase,'closed');assert.equal(observed.fence.fenceId,closed.fenceId);assert.equal(observed.fence.reason,undefined);
+  release();await running;await pending;const held=host.serviceStopReceipt('deadline-stop');assert.equal(held.phase,'held');assert.equal(held.evidence.activeWork,0);assert.equal(held.fenceId,closed.fenceId);
   await host.releaseServiceStop({fenceId:held.fenceId,commandId:'deadline-stop',outcome:'unknown'});const preserved=await host.admitServiceStop({commandId:'deadline-stop',expected:A});assert.equal(preserved.fence.phase,'unknown');assert.equal(preserved.fence.reason,'service-owner-outcome-unknown');
  }finally{release();await host?.close();await rm(dir,{recursive:true,force:true});}
 });
