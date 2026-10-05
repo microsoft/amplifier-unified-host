@@ -52,6 +52,13 @@ export const samePublicMessage=(left:PublicMessageV1,right:PublicMessageV1)=>lef
 export function supportsPublicOriginal(capability:any,route:string,resources=false):boolean {
   return capability?.version===1&&Array.isArray(capability.routes)&&capability.routes.includes(route)&&Array.isArray(capability.variants)&&capability.variants.includes('text')&&(!resources||capability.variants.includes('resources'));
 }
+/** Initialization declares the protocol. Runtime negotiation qualifies the
+ * mounted context; a negative report always overrides stale protocol support. */
+export function mountedPublicOriginal(capability:any,mounted:any):any {
+  if(mounted?.supported===false)return;
+  if(capability?.runtimeNegotiated===true)return mounted?.version===1&&mounted.supported===true?mounted:undefined;
+  return mounted?.supported===true?mounted:capability;
+}
 export function publicMessage(value:unknown):PublicMessageV1 {
   if(!fields(value,['version','inputId','capture','blocks'])||value.version!==1||!token(value.inputId,128)||!['host-standard','native-input'].includes(value.capture)||!Array.isArray(value.blocks))return invalid();
   for(const block of value.blocks){

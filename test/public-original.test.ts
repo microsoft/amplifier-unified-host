@@ -13,7 +13,7 @@ const wait=async(check:()=>boolean)=>{for(let i=0;i<400;i++){if(check())return;a
 async function fixture(options:any={}){
   const dir=await realpath(await mkdtemp(join(tmpdir(),'host-public-original-'))),log=join(dir,'prompts'),data=join(dir,'public.json'),history=join(dir,'history.json');
   await writeFile(data,'{}');await writeFile(history,'[]');
-  const host=await createHost({stateDirectory:join(dir,'state'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('../fixtures/acp-peer.mjs',import.meta.url))],env:{FIXTURE_LOG:log,FIXTURE_HISTORY:history,FIXTURE_HISTORY_LIFECYCLE:'1',FIXTURE_PUBLIC_ROWS:data,...(options.negotiated===false?{}:{FIXTURE_PUBLIC_ORIGINAL:JSON.stringify(capability)})}}],...options.config});
+  const host=await createHost({stateDirectory:join(dir,'state'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('../fixtures/acp-peer.mjs',import.meta.url))],env:{FIXTURE_LOG:log,FIXTURE_HISTORY:history,FIXTURE_HISTORY_LIFECYCLE:'1',FIXTURE_PUBLIC_ROWS:data,...(options.mounted?{FIXTURE_MOUNTED_PUBLIC_ORIGINAL:JSON.stringify(options.mounted)}:{}),...(options.ready?{FIXTURE_READY_PUBLIC_ORIGINAL:JSON.stringify(options.ready)}:{}),...(options.negotiated===false?{}:{FIXTURE_PUBLIC_ORIGINAL:JSON.stringify(options.capability??capability)})}}],...options.config});
   // Fixture session creation uses the actual AHP entry point, not a fake record.
   const {AhpClient}=await import('@microsoft/agent-host-protocol/client'),{WebSocketTransport}=await import('@microsoft/agent-host-protocol/ws');
   const client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();await client.initialize({clientId:'public-viewer',protocolVersions:['0.9.0']});
@@ -41,6 +41,35 @@ test('capture precedes resolver mutation and forged caller metadata cannot suppl
 test('negotiated exact ID is validated before resolver/admission effects',async()=>{
   let calls=0;const f=await fixture({config:{resolvePromptAttachment:async()=>{calls++;return [];}}});
   try{const id='x'.repeat(129);await assert.rejects(f.host.submitTurn(f.session,{commandId:id,clientId:'caller',text:'literal',attachments:[{type:'resource',label:'a.pdf',contentType:'application/pdf',uri:`amplifier-attachment://${randomUUID()}/body?session=${encodeURIComponent(f.session)}`}]}));assert.equal(calls,0);assert.equal(f.host.store.receipt(id),undefined);await assert.rejects(readFile(f.log));}finally{await f.close();}
+});
+
+test('runtime-negotiated capture requires a positive mounted report and preserves ordinary Host intent otherwise',async()=>{
+  const declared={...capability,runtimeNegotiated:true},negative={version:1,supported:false,originalAuthority:'host',reason:'shared-request-view-unavailable'};
+  for(const mounted of [undefined,negative,{...declared,supported:true}]){
+    const f=await fixture({capability:declared,mounted});try{
+      const id=randomUUID();await f.host.submitTurn(f.session,{commandId:id,text:'Literal retained Host original',clientId:'caller'});await wait(()=>f.host.store.receipt(id)?.status==='completed');
+      const prompt=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(!!prompt._meta['amplifier.dev/publicMessage'],mounted?.supported===true);assert.equal(prompt.prompt[0].text,'Literal retained Host original');assert.equal((await f.host.readUserMessage(f.session,id)).text,'Literal retained Host original');
+    }finally{await f.close();}
+  }
+});
+
+test('runtime.ready negative report overrides the mounted positive for subsequent captures',async()=>{
+  const declared={...capability,runtimeNegotiated:true},negative={version:1,supported:false,originalAuthority:'host',reason:'shared-request-view-unavailable'};
+  const f=await fixture({capability:declared,mounted:{...declared,supported:true},ready:negative});try{
+    for(const text of ['first admitted original','after mounted downgrade']){const id=randomUUID();await f.host.submitTurn(f.session,{commandId:id,text,clientId:'caller'});await wait(()=>f.host.store.receipt(id)?.status==='completed');}
+    const prompts=(await readFile(f.log,'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.ok(prompts[0]._meta['amplifier.dev/publicMessage']);assert.equal(prompts[1]._meta['amplifier.dev/publicMessage'],undefined);assert.equal(prompts[1].prompt[0].text,'after mounted downgrade');
+  }finally{await f.close();}
+});
+
+test('cold resume uses the new mounted report instead of a prior worker positive',async()=>{
+  const declared={...capability,runtimeNegotiated:true},negative={version:1,supported:false,originalAuthority:'host',reason:'shared-request-view-unavailable'};
+  const f=await fixture({capability:declared,mounted:{...declared,supported:true}});let cold:any;
+  try{
+    const first=randomUUID();await f.host.submitTurn(f.session,{commandId:first,text:'previous context original',clientId:'caller'});await wait(()=>f.host.store.receipt(first)?.status==='completed');
+    const config=f.host.config;await f.client.shutdown();await f.host.close();config.engines[0]!.env!.FIXTURE_MOUNTED_PUBLIC_ORIGINAL=JSON.stringify(negative);cold=await createHost(config);
+    const next=randomUUID();await cold.submitTurn(f.session,{commandId:next,text:'new unsupported context original',clientId:'caller'});await wait(()=>cold.store.receipt(next)?.status==='completed');
+    const prompts=(await readFile(f.log,'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.ok(prompts[0]._meta['amplifier.dev/publicMessage']);assert.equal(prompts[1]._meta['amplifier.dev/publicMessage'],undefined);assert.equal((await cold.readUserMessage(f.session,next)).text,'new unsupported context original');
+  }finally{await cold?.close();await f.client.shutdown();await f.host.close();await rm(f.dir,{recursive:true,force:true});}
 });
 
 test('missing negotiation and unsupported typed selections retain the ordinary route',async()=>{
