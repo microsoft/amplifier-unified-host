@@ -63,13 +63,13 @@ test('runtime.ready negative report overrides the mounted positive for subsequen
 
 test('cold resume uses the new mounted report instead of a prior worker positive',async()=>{
   const declared={...capability,runtimeNegotiated:true},negative={version:1,supported:false,originalAuthority:'host',reason:'shared-request-view-unavailable'};
-  const f=await fixture({capability:declared,mounted:{...declared,supported:true}});let cold:any;
+  const f=await fixture({capability:declared,mounted:{...declared,supported:true}});let cold:any,originalClosed=false;
   try{
     const first=randomUUID();await f.host.submitTurn(f.session,{commandId:first,text:'previous context original',clientId:'caller'});await wait(()=>f.host.store.receipt(first)?.status==='completed');
-    const config=f.host.config;await f.client.shutdown();await f.host.close();config.engines[0]!.env!.FIXTURE_MOUNTED_PUBLIC_ORIGINAL=JSON.stringify(negative);cold=await createHost(config);
+    const config=f.host.config;await f.client.shutdown();await f.host.close();originalClosed=true;config.engines[0]!.env!.FIXTURE_MOUNTED_PUBLIC_ORIGINAL=JSON.stringify(negative);cold=await createHost(config);
     const next=randomUUID();await cold.submitTurn(f.session,{commandId:next,text:'new unsupported context original',clientId:'caller'});await wait(()=>cold.store.receipt(next)?.status==='completed');
     const prompts=(await readFile(f.log,'utf8')).trim().split('\n').map(line=>JSON.parse(line));assert.ok(prompts[0]._meta['amplifier.dev/publicMessage']);assert.equal(prompts[1]._meta['amplifier.dev/publicMessage'],undefined);assert.equal((await cold.readUserMessage(f.session,next)).text,'new unsupported context original');
-  }finally{await cold?.close();await f.client.shutdown();await f.host.close();await rm(f.dir,{recursive:true,force:true});}
+  }finally{await cold?.close();await f.client.shutdown();if(!originalClosed)await f.host.close();await rm(f.dir,{recursive:true,force:true});}
 });
 
 test('missing negotiation and unsupported typed selections retain the ordinary route',async()=>{
@@ -106,7 +106,7 @@ test('target access rejects forged scope and never supplies access for unknown g
 });
 
 test('card-only persisted rows read after append using locator identity and no worker mount',async()=>{
-  const f=await fixture();try{
+  const f=await fixture({capability:{...capability,runtimeNegotiated:true}});try{
     const native=f.host.store.get(f.session)!.nativeSessionId!,locator={sessionId:native,messageId:'native:card',position:0,historyEpoch:null};
     const row={locator,publicMessage:{version:1,inputId:'card-only',capture:'host-standard',blocks:[{type:'attachment',reference:{owner:'resources',id:`amplifier-attachment://${randomUUID()}/body?session=${encodeURIComponent(f.session)}`},name:'card.pdf',mimeType:'application/pdf'}]}};
     await writeFile(f.data,JSON.stringify({[native]:{revision:'after-append',rows:[row]}}));
