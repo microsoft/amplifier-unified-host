@@ -800,6 +800,7 @@ export class AmplifierHost {
         if(rows.length>limit){nextCursor=randomUUID();const last=items.at(-1)!;peer.cursors.set(nextCursor,{modified:last.modifiedAt,uri:last.resource});if(peer.cursors.size>256)peer.cursors.delete(peer.cursors.keys().next().value!);}
         return {items,nextCursor};
       }
+      case 'resolveSessionConfig':if(p.channel!==ROOT)throw new RpcFault(-32602,'Session configuration uses the root channel');return this.resolveSessionConfig(p);
       case 'createSession':return this.createSessionResource(p);
       case 'fetchTurns': {
         const record=await this.record(p.channel);if(p.channel!==record.chat.resource)throw new RpcFault(-32602,'fetchTurns requires chat channel');
@@ -862,11 +863,43 @@ export class AmplifierHost {
       default:throw new RpcFault(-32601,`Unsupported AHP method: ${method}`);
     }
   }
-  private async managedAgent<T>(engineId:string,work:(agent:AcpProcess)=>Promise<T>):Promise<T>{
+  private async passiveCreationAgent<T>(engineId:string,cwd:string,work:(agent:AcpProcess)=>Promise<T>):Promise<T>{
     const engine=this.config.engines.find(e=>e.id===engineId);if(!engine)throw new RpcFault(-32602,'Unknown configured provider',{executed:false});
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native capacity reached',{executed:false});
-    this.passiveReads++;const agent=new AcpProcess(engine,this.defaultWorkingDirectory,{update:async()=>{throw new RpcFault(-32009,'Passive creation cannot stream execution');},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive creation cannot use client effects');}});
-    try{await agent.initialize();const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.managedCreation;if(capability?.version!==1||capability.passive!==true||capability.configurationScope!=='global-and-session'||capability.typedSelection!==true)throw new RpcFault(-32601,'Configured engine does not support passive managed creation',{executed:false});return await work(agent);}finally{this.passiveReads--;await agent.retire();}
+    this.passiveReads++;const agent=new AcpProcess(engine,cwd,{update:async()=>{throw new RpcFault(-32009,'Passive creation cannot stream execution');},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive creation cannot use client effects');}});
+    try{await agent.initialize();return await work(agent);}finally{this.passiveReads--;await agent.retire();}
+  }
+  private async managedAgent<T>(engineId:string,work:(agent:AcpProcess)=>Promise<T>):Promise<T>{
+    return this.passiveCreationAgent(engineId,this.defaultWorkingDirectory,async agent=>{const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.managedCreation;if(capability?.version!==1||capability.passive!==true||capability.configurationScope!=='global-and-session'||capability.typedSelection!==true)throw new RpcFault(-32601,'Configured engine does not support passive managed creation',{executed:false});return work(agent);});
+  }
+  /** Standard AHP creation choices, resolved by the negotiated workspace-aware Native owner. */
+  async resolveSessionConfig(input:Json){
+    if(!input||typeof input!=='object'||Array.isArray(input)||input.provider!==undefined&&(typeof input.provider!=='string'||!input.provider||input.provider.length>200))throw new RpcFault(-32602,'Configured agent provider required',{executed:false});
+    const config=input.config===undefined?{}:input.config;
+    if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['instance','model','effort'].includes(key))||Object.entries(config).some(([key,value])=>typeof value!=='string'||!value||value.length>({instance:200,model:500,effort:100} as Json)[key]))throw new RpcFault(-32602,'Creation configuration requires bounded instance/model/effort strings',{executed:false});
+    const provider=input.provider??this.config.engines[0].id,cwd=await this.workspace(input.workingDirectory??pathToFileURL(this.defaultWorkingDirectory).href);
+    return this.intake.inspectOnly(()=>this.passiveCreationAgent(provider,cwd,async agent=>{
+      const native=agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.initialSelection;
+      if(native?.version!==1||capability?.version!==1||capability.typedSelection!==true||capability.passive!==true){if(Object.keys(config).length)throw new RpcFault(-32601,'Engine does not advertise initial selection',{executed:false});return {schema:{type:'object',properties:{}},values:{}};}
+      if(capability.resolveMethod!=='_amplifier/initial-selection')throw new RpcFault(-32601,'Initial selection has no negotiated passive resolver',{executed:false});
+      const result:Json=await agent.client.extMethod(capability.resolveMethod,{cwd,selection:config});
+      const schema=result.schema,values=result.values;
+      if(result.version!==1||!schema||schema.type!=='object'||!schema.properties||typeof schema.properties!=='object'||Array.isArray(schema.properties)||!values||typeof values!=='object'||Array.isArray(values)||Buffer.byteLength(JSON.stringify(result))>1048576)throw new RpcFault(-32000,'Invalid passive initial configuration resolution',{executed:false});
+      const limits:Json={instance:200,model:500,effort:100};
+      for(const [key,property] of Object.entries(schema.properties) as [string,Json][]){
+        if(!Object.hasOwn(limits,key)||!property||property.type!=='string'||!Array.isArray(property.enum)||property.enum.length>1000||property.enum.some((value:unknown)=>typeof value!=='string'||!value||value.length>limits[key])||new Set(property.enum).size!==property.enum.length||property.enumLabels!==undefined&&(!Array.isArray(property.enumLabels)||property.enumLabels.length!==property.enum.length||property.enumLabels.some((value:unknown)=>typeof value!=='string'||value.length>512)))throw new RpcFault(-32000,'Invalid initial configuration schema',{executed:false});
+      }
+      if(schema.required!==undefined&&(!Array.isArray(schema.required)||schema.required.length>3||new Set(schema.required).size!==schema.required.length||schema.required.some((key:unknown)=>typeof key!=='string'||!Object.hasOwn(schema.properties,key))))throw new RpcFault(-32000,'Invalid required initial configuration fields',{executed:false});
+      for(const [key,value] of Object.entries(values)){const property=schema.properties[key];if(!Object.hasOwn(schema.properties,key)||!property||typeof value!=='string'||!property.enum.includes(value))throw new RpcFault(-32000,'Resolved initial configuration is outside its advertised choices',{executed:false});}
+      if(Object.entries(config).some(([key,value])=>values[key]!==value))throw new RpcFault(-32000,'Initial configuration resolution changed or omitted a requested choice',{executed:false});
+      return {schema:structuredClone(schema),values:structuredClone(values)};
+    }));
+  }
+  private resolveSessionConfigShape(config:unknown):Json {
+    if(config===undefined)return {};
+    if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['instance','model','effort'].includes(key))||Object.entries(config).some(([key,value])=>typeof value!=='string'||!value||value.length>({instance:200,model:500,effort:100} as Json)[key]))throw new RpcFault(-32602,'Creation configuration requires bounded instance/model/effort strings',{executed:false});
+    if(Object.keys(config).length&&(typeof (config as Json).instance!=='string'||typeof (config as Json).model!=='string'))throw new RpcFault(-32602,'Creation requires both provider instance and model',{executed:false});
+    return config as Json;
   }
   private managedNativeParams(receipt:Json,operation:string):Json{return {operation,sessionId:receipt.marker.id,cwd:receipt.marker.workspace,commandId:receipt.commandId,allocationHash:receipt.marker.allocationHash,...(operation==='create'?Object.fromEntries(Object.entries(receipt.request).filter(([key])=>['title','bundle','bundleRevision','selection'].includes(key))):{})};}
   private async confirmManaged(receipt:Json,proof:Json){
@@ -947,7 +980,9 @@ export class AmplifierHost {
       const engine=this.config.engines.find(e=>e.id===(p.provider??this.config.engines[0].id));if(!engine)throw new RpcFault(-32002,'Unknown provider');
       const cwd=await this.workspace(p.workingDirectories?.[0]);
       if(p.activeClient)throw new RpcFault(-32602,'Register active client tools after subscribing to the new session');
-      if(Object.keys(p.config??{}).length)throw new RpcFault(-32602,'Creation configuration is not advertised; use negotiated session selectors');
+      const resolved=this.resolveSessionConfigShape(p.config);
+      if(creation&&Object.keys(resolved).length)throw new RpcFault(-32602,'Configuration cloning cannot override initial selection',{executed:false});
+      if(Object.keys(resolved).length)await this.resolveSessionConfig({provider:engine.id,workingDirectory:pathToFileURL(cwd).href,config:resolved});
       const creationCommand=creation?.commandId??'create:'+p.channel;
       const timestamp=now(),chat:ChatState={resource:chatURI(p.channel),title:p.title??'New conversation',status:1,modifiedAt:timestamp,turns:[]};
       const summary:SessionSummary={resource:p.channel,provider:engine.id,title:chat.title,status:1,createdAt:timestamp,modifiedAt:timestamp,workingDirectories:[pathToFileURL(cwd).href]};
@@ -956,7 +991,7 @@ export class AmplifierHost {
       this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);
       this.notify('root/sessionAdded',{channel:ROOT,summary});
       this.store.finish(creationCommand,'dispatching');
-      try {await this.ensureAgent(p.channel,creation);this.emit(p.channel,{type:'session/ready'} as StateAction);this.store.finish(creationCommand,'completed');}
+      try {await this.ensureAgent(p.channel,creation,Object.keys(resolved).length?resolved:undefined);this.emit(p.channel,{type:'session/ready'} as StateAction);this.store.finish(creationCommand,'completed');}
       catch(error){this.store.finish(creationCommand,'unknown',(error as Error).message);this.emit(p.channel,{type:'session/creationFailed',error:{errorType:'SESSION_CREATION_FAILED',message:(error as Error).message}} as StateAction);throw error;}
       await this.syncCatalog(this.getRecord(p.channel)!);return null;
     });
@@ -1704,7 +1739,7 @@ export class AmplifierHost {
   private guardRetirement(active:Active) {
     if(['pending','unknown','retired'].includes(active.agent.retirementOutcome))throw new RpcFault(-32011,'This chat is waiting for confirmation that its previous runtime stopped. Your new message was not sent.',{executed:false,replayed:false,outcome:'unknown'});
   }
-  private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string}):Promise<Active> {
+  private async ensureAgent(uri:string,creation?:{sessionId:string;source:Json;commandId:string},initialSelection?:Json):Promise<Active> {
     return this.intake.run(async()=>{
     if(this.relocationFence(uri))throw new RpcFault(-32011,'Session relocation outcome is fenced; inspect and reconcile without replay');
     this.guardSessionLifecycle(uri);
@@ -1761,7 +1796,7 @@ export class AmplifierHost {
           try{const callback=()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params);return observation&&!this.nativeWorkAdmitted(uri,active)?await this.intake.continuation(callback):await this.admittedNativeWork(uri,active,callback);}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}this.intake.workChanged();}
         }}:{}),
       });active.agent=agent;this.touchAgent(active);this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location&&Object.hasOwn(location,'publicMessagePreservation'))active.publicOriginalMount=location.publicMessagePreservation;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));this.touchAgent(active);return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory,initialSelection);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location&&Object.hasOwn(location,'publicMessagePreservation'))active.publicOriginalMount=location.publicMessagePreservation;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));this.touchAgent(active);return active;}
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);this.admittedStarts.delete(uri);}
       });

@@ -133,7 +133,8 @@ export class AcpProcess {
     if(this.initialized.protocolVersion!==1)throw new Error('Agent did not negotiate stable ACP version 1');
     return this.initialized;
   }
-  async start(nativeId?:string,creation?:{sessionId:string;source:Record<string,unknown>;commandId:string},historyCwd?:string) {
+  async start(nativeId?:string,creation?:{sessionId:string;source:Record<string,unknown>;commandId:string},historyCwd?:string,initialSelection?:Record<string,unknown>) {
+    if(initialSelection&&(nativeId||creation))throw new Error('Initial selection applies only to standard new session creation');
     await this.initialize();
     this.loading=!!nativeId;
     const nativeHistory=historyCwd&&(this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any)?.version===1?{_meta:{'amplifier.dev/native':{historyCwd}}}:{};
@@ -150,7 +151,10 @@ export class AcpProcess {
         if(created.sessionId!==creation.sessionId||(created._meta as any)?.['amplifier.dev/native']?.creationConfirmed!==true)throw new Error('Native creation was not conclusively confirmed');
         this.nativeId=String(created.sessionId);return created as {sessionId:string;configOptions?:any[];modes?:any;_meta?:Record<string,unknown>};
       }
-      const created=await this.client.newSession({cwd:this.cwd,mcpServers:[]});this.nativeId=created.sessionId;return created;
+      if(initialSelection){const native=this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any;if(native?.version!==1||native.initialSelection?.version!==1||native.initialSelection.typedSelection!==true||native.initialSelection.passive!==true)throw new Error('Agent does not advertise initial selection');}
+      const created=await this.client.newSession({cwd:this.cwd,mcpServers:[],...(initialSelection?{_meta:{'amplifier.dev/native':{selection:initialSelection}}}:{})});this.nativeId=created.sessionId;
+      if(initialSelection){const proof=(created._meta as any)?.['amplifier.dev/native']?.initialSelection;if(proof?.version!==1||!proof.selection||Object.keys(proof.selection).sort().join(',')!==Object.keys(initialSelection).sort().join(',')||Object.entries(initialSelection).some(([key,value])=>proof.selection[key]!==value))throw new Error('Native initial selection effective readback differs from the requested creation configuration');}
+      return created;
     } finally {this.loading=false;}
   }
   /** Native atomic graceful retirement; refusal/uncertainty never force-closes owned work. */
