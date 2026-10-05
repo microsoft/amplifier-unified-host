@@ -1,5 +1,5 @@
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
-import {PUBLIC_MESSAGE_META,capturePublicMessage,supportsPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
+import {PUBLIC_MESSAGE_META,capturePublicMessage,supportsPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
 import {ConversationPresentation,type PresentationMetadata} from './presentation.js';
@@ -566,7 +566,7 @@ export class AmplifierHost {
     const metadata={originalReference:card.reference,rowLocator:row.locator,originalBlockIndex:blockIndex,disposition:row.copySource?.disposition??'original'};
     let uri:string|undefined,access='unavailable';
     if(card.reference.owner==='resources'){
-      if(!row.copySource){try{const original=new URL(card.reference.id);if(original.protocol==='amplifier-attachment:'&&original.pathname==='/body'&&original.searchParams.get('session')===record.uri&&original.searchParams.size===1)uri=original.href;}catch{}}
+      if(!row.copySource){const original=resourcesBodyUri(card.reference.id);if(original?.searchParams.get('session')===record.uri)uri=original.href;}
       else if(this.config.publicOriginalResources){try{const grant=await this.config.publicOriginalResources.resolveOriginalAttachment(record.uri,card.reference);uri=qualifiedAccessUri(grant,record.uri,card.reference);if(grant?.status==='unknown'||grant?.status==='pending')access=grant.status;}catch{access='unknown';}}
     }
     // A retained descriptor is visible even when target access is not qualified.
@@ -643,7 +643,7 @@ export class AmplifierHost {
             if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});
             else if(content.type==='resource_link'){
               let foreignScope=false;
-              if(content.uri?.startsWith('amplifier-attachment:')){try{foreignScope=new URL(content.uri).searchParams.get('session')!==record.uri;}catch{foreignScope=true;}}
+              if(content.uri?.startsWith('amplifier-attachment:'))foreignScope=resourcesBodyUri(content.uri)?.searchParams.get('session')!==record.uri;
               attachments.push(foreignScope?{type:'simple',label:content.name??'Resource',_meta:{'amplifier.dev/publicAttachment':{originalReference:{owner:'resources',id:content.uri},access:'unavailable'}}}:{type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});
             }
           }

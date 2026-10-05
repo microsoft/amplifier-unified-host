@@ -64,6 +64,7 @@ test('ordered card occurrence counts text blocks and permits Resources255 names 
   const original=capturePublicMessage({text:'',origin:{kind:'user'},attachments:[{type:'resource',label:name,contentType:'application/pdf',uri}]} as any,'input')!;
   assert.equal(original.blocks[0]!.type,'text');assert.equal((original.blocks[1] as PublicCard).reference.id,uri);assert.equal((original.blocks[1] as PublicCard).name,name);
   assert.equal(capturePublicMessage({text:'keep',origin:{kind:'user'},attachments:[{type:'resource',label:'a',contentType:'application/pdf',uri,range:{start:0,end:4}}]} as any,'input'),undefined);
+  assert.equal(capturePublicMessage({text:'keep',origin:{kind:'user'},attachments:[{type:'resource',label:'a',contentType:'application/pdf',uri:uri+'&token=not-an-owner-handle'}]} as any,'input'),undefined);
 });
 
 test('target access rejects forged scope and never supplies access for unknown grants',()=>{
@@ -72,6 +73,7 @@ test('target access rejects forged scope and never supplies access for unknown g
   assert.equal(qualifiedAccessUri(base,target,reference),undefined);
   assert.throws(()=>qualifiedAccessUri({...base,accessUri:'amplifier-attachment://forged/body'},target,reference));
   assert.throws(()=>qualifiedAccessUri({...base,status:'completed',accessUri:`amplifier-attachment://${randomUUID()}/body?session=ahp-session%3A%2Fother`},target,reference));
+  assert.throws(()=>qualifiedAccessUri({...base,status:'completed',accessUri:`amplifier-attachment://untrusted@${randomUUID()}/body?session=${encodeURIComponent(target)}`},target,reference));
 });
 
 test('card-only persisted rows read after append using locator identity and no worker mount',async()=>{

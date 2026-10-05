@@ -37,6 +37,9 @@ const object=(value:unknown):value is Record<string,any>=>!!value&&typeof value=
 const fields=(value:unknown,allowed:string[],required=allowed):value is Record<string,any>=>object(value)&&Object.keys(value).every(key=>allowed.includes(key))&&required.every(key=>Object.hasOwn(value,key));
 const token=(value:unknown,max?:number):value is string=>typeof value==='string'&&value.length>0&&(max===undefined||[...value].length<=max)&&!/[\x00-\x1f]/.test(value);
 const invalid=()=>{throw new Error('Invalid Native public original or exact row occurrence');};
+export function resourcesBodyUri(value:string):URL|undefined {
+  try{const uri=new URL(value);if(uri.protocol==='amplifier-attachment:'&&uri.pathname==='/body'&&!uri.username&&!uri.password&&!uri.port&&!uri.hash&&uri.searchParams.size===1&&uri.searchParams.get('session')?.startsWith('ahp-session:/')&&/^[-a-f0-9]{36}$/.test(uri.hostname))return uri;}catch{}
+}
 export function nativeLocator(value:unknown):NativeLocator {
   if(!fields(value,['sessionId','messageId','position','historyEpoch'])||!token(value.sessionId,200)||!token(value.messageId,200)||!Number.isSafeInteger(value.position)||value.position<0||(value.historyEpoch!==null&&!token(value.historyEpoch,200)))return invalid();
   return structuredClone(value) as NativeLocator;
@@ -78,7 +81,7 @@ export function capturePublicMessage(message:Message,inputId:string):PublicMessa
   if(message.origin?.kind!=='user')return;
   const blocks:(PublicText|PublicCard)[]=[{type:'text',text:message.text}];
   for(const attachment of message.attachments??[]){
-    if(attachment.type!=='resource'||Object.keys(attachment).some(key=>!['type','label','uri','contentType'].includes(key))||!attachment.uri.startsWith('amplifier-attachment:')||!attachment.contentType)return;
+    if(attachment.type!=='resource'||Object.keys(attachment).some(key=>!['type','label','uri','contentType'].includes(key))||!resourcesBodyUri(attachment.uri)||!token(attachment.label,255)||!attachment.contentType||!/^[-\w.+]+\/[-\w.+]+$/.test(attachment.contentType))return;
     blocks.push({type:'attachment',reference:{owner:'resources',id:attachment.uri},name:attachment.label,mimeType:attachment.contentType});
   }
   return publicMessage({version:1,inputId,capture:'host-standard',blocks});
@@ -89,7 +92,7 @@ export function qualifiedAccessUri(grant:OriginalAttachmentGrantV2|null,targetHo
   if(!object(grant)||grant.version!==2||grant.targetHostSession!==targetHostSession||grant.replayed!==false||!token(grant.commandId)||!['completed','pending','unknown','refused'].includes(grant.status)||!object(grant.originalReference)||grant.originalReference.owner!==reference.owner||grant.originalReference.id!==reference.id)throw new Error('Resources original attachment grant scope changed');
   if(grant.status!=='completed'){if(grant.accessUri!==undefined)throw new Error('Unqualified attachment grant supplied access');return;}
   if(!token(grant.accessUri))throw new Error('Completed attachment grant has no scoped access');
-  const uri=new URL(grant.accessUri);
-  if(uri.protocol!=='amplifier-attachment:'||uri.pathname!=='/body'||uri.searchParams.get('session')!==targetHostSession||uri.searchParams.size!==1||!/^[-a-f0-9]{36}$/.test(uri.hostname))throw new Error('Resources target attachment URI scope changed');
+  const uri=resourcesBodyUri(grant.accessUri);
+  if(!uri||uri.searchParams.get('session')!==targetHostSession)throw new Error('Resources target attachment URI scope changed');
   return uri.href;
 }
