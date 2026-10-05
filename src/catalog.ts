@@ -25,7 +25,7 @@ export class StdioCatalog implements Catalog {
         const line=this.buffer.slice(0,newline);this.buffer=this.buffer.slice(newline+1);
         let message;try{message=JSON.parse(line);}catch{this.fail(new Error('Malformed catalog protocol frame'));this.process.kill();return;}
         const pending=this.pending.get(message.id);if(!pending)continue;this.pending.delete(message.id);clearTimeout(pending.timer);
-        if(message.error)pending.reject(Object.assign(new Error(message.error.message),{code:message.error.code,catalogResponseSettled:true}));else pending.resolve(message.result);
+        if(message.error)pending.reject(Object.assign(new Error(message.error.message),{code:message.error.code,data:message.error.data,catalogResponseSettled:true}));else pending.resolve(message.result);
       }
     });
     this.process.on('error',error=>this.fail(error));this.process.on('close',()=>this.fail(new Error('Catalog process closed')));
@@ -40,6 +40,8 @@ export class StdioCatalog implements Catalog {
     if(Buffer.byteLength(frame)>1024*1024)return Promise.reject(new Error('Catalog request exceeded 1 MiB'));
     return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('Catalog response timed out'));},10000);timer.unref();this.pending.set(id,{resolve,reject,timer});this.process.stdin.write(frame,error=>{if(error){clearTimeout(timer);this.pending.delete(id);reject(error);}});});
   }
+  async supportsLibraryQuery(){try{return (await this.request('libraryCapabilities',{})).version===1;}catch(error){if((error as any).code===-32601)return false;throw error;}}
+  libraryQuery(params:import('./library-index.js').LibraryRead){return this.request('libraryQuery',{...params});}
   list(params:Parameters<Catalog['list']>[0]) {return this.request('list',params);}
   async get(uri:string):Promise<CatalogRecord|undefined>{return await this.request('get',{uri})??undefined;}
   projectSessionVisibility(params:Parameters<NonNullable<Catalog['projectSessionVisibility']>>[0]){return this.request('projectSessionVisibility',{...params});}

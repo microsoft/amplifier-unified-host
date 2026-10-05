@@ -1453,3 +1453,11 @@ this seam cannot recover it: the chat stays blocked until a separate authoritati
 recovery path resolves the original uncertainty. Process exit alone is not proof.
 Definitive refusal or confirmed retirement settles only the retirement receipt;
 ordinary cold resume remains available and user-input receipts are untouched.
+
+### Live library queries
+
+The optional [library query contract](docs/contracts/library-query.v1.md) adds a
+trusted Workspace read with indexed whole-domain predicates and explicit freshness.
+It preserves standard listSessions and selected-session AHP authority. Cold runtime
+unknown differs from a retained uncertain executed effect; no global current count
+or frozen-result snapshot is promised.

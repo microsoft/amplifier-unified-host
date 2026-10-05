@@ -1,3 +1,4 @@
+import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
 import {ConversationPresentation,type PresentationMetadata} from './presentation.js';
@@ -11,7 +12,7 @@ import { appendFileSync, mkdirSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { realpath, stat, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
-import { isAbsolute, relative, join, dirname, basename } from 'node:path';
+import { isAbsolute, relative, join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
@@ -21,10 +22,12 @@ import { mergeHistoryTurns, turnIdentityHash } from './history.js';
 import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
-export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;productHidden?:boolean;storagePath?:string;isArchived?:boolean;location?:ManagedLocation;}
+export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:string;workingDirectory:string;parentUri?:string;title:string;createdAt:string;modifiedAt:string;status?:number|string;kind?:string;availability?:string;workspaceAvailability?:string;nativeDeleted?:boolean;productHidden?:boolean;storagePath?:string;isArchived?:boolean;location?:ManagedLocation;hostObservation?:HostObservation;hostObservationOnly?:true;activity?:{kind:string;runtime:string;effect:string;evidence:string;observedAt?:string};}
 export interface CatalogFamilyDiscovery {version:1;scope:'selected-native-project-namespaces';phase:'complete'|'refused';issues:string[];maxEntries:number;metadataByteLimit:number;metadataFileLimit:number;indexRevision:string;verificationToken:string;inventoryHash:string;entriesExamined:number;metadataReads:number;metadataBytesAdmitted:number;namespaces:string[];completedAt:string;externalWriterCoverage:false;transcriptBodiesRead:false;nativeOwnershipVerified:false;}
 export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};familyDiscovery?:CatalogFamilyDiscovery;}
 export interface Catalog {
+  supportsLibraryQuery?:()=>Promise<boolean>;
+  libraryQuery?:(params:LibraryRead)=>Promise<{version:1;items:CatalogRecord[];nextCursor?:string;observationFreshness?:unknown;[key:string]:unknown}>;
   list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];allowedManagedRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
   projectSessionVisibility?:(params:VisibilityProjectionRequest)=>Promise<VisibilityProjectionReceipt>;
   sessionVisibilityProjectionStatus?:(params:{source:string})=>Promise<{source:string;revision:number}>;
@@ -124,6 +127,7 @@ export class AmplifierHost {
   private managedFiles:ManagedFilesJournal;
   private retentionChanging=new Set<string>();
   private active=new Map<string,Active>();
+  private library?:LibraryIndex;
   private starting=new Map<string,Promise<Active>>();
   private resourceLocks=new Map<string,Promise<unknown>>();
   private cursors=new Map<string,{chat:string;before:number}>();
@@ -227,10 +231,17 @@ export class AmplifierHost {
   }
   async listen():Promise<this> {
     this.roots=await Promise.all(this.config.allowedWorkspaceRoots.map(root=>realpath(root)));
+    if(this.config.catalog?.libraryQuery&&(!this.config.catalog.supportsLibraryQuery||await this.config.catalog.supportsLibraryQuery()))this.library=new LibraryIndex(this.config.catalog,{
+      page:after=>this.store.db.prepare('SELECT uri FROM sessions WHERE uri>? ORDER BY uri LIMIT 100').all(after).map(row=>String(row.uri)),
+      record:uri=>this.libraryMetadata(uri),unknown:uri=>this.libraryUnknown(uri),live:()=>this.libraryLiveFacts(),
+      changed:()=>this.invalidateCapability('workspaces','host'),
+    },await realpath(this.config.stateDirectory),this.store.incarnation);
+    this.store.onReceiptChanged=this.library?channel=>{if(channel==='*capacity')this.library?.degraded();else if(channel.startsWith('ahp-chat:/')||channel.startsWith('ahp-session:/'))this.library?.point(channel.replace('ahp-chat:/','ahp-session:/'));}:undefined;
     await this.repairArchiveProjection();
     await this.presentation?.checkReady();
     this.defaultWorkingDirectory=await this.workspace(pathToFileURL(this.config.defaultWorkingDirectory??this.roots[0]).href);
     await new Promise<void>((resolve,reject)=>{this.http.once('error',reject);this.http.listen(this.config.port??0,this.config.host??'127.0.0.1',resolve);});
+    void this.library?.reconcile();
     const address=this.http.address();if(!address||typeof address==='string')throw new Error('Missing bound address');
     this.url=`ws://${address.address.includes(':')?'['+address.address+']':address.address}:${address.port}/ahp`;return this;
   }
@@ -278,7 +289,7 @@ export class AmplifierHost {
     peer.socket.send(JSON.stringify(message));
   }
   private notify(method:string,params:Json,channel=ROOT) {const session=params.session??params.summary?.resource;if(channel===ROOT&&['root/sessionAdded','root/sessionSummaryChanged'].includes(method)&&typeof session==='string'&&this.presentation?.hidden(session))return;for(const peer of this.peers)if(peer.subscriptions.has(channel))this.send(peer,{jsonrpc:'2.0',method,params});}
-  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
+  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{libraryQuery:!!this.library,receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
   private terminalList(){return this.store.db.prepare("SELECT uri,payload FROM terminals WHERE lifecycle='running' ORDER BY modified DESC LIMIT 128").all().map(row=>{const state=JSON.parse(row.payload as string);return {resource:row.uri,title:state.title,claim:state.claim,lifecycle:state.lifecycle};});}
   private terminalState(uri:string):TerminalState|undefined {const row=this.store.db.prepare('SELECT payload FROM terminals WHERE uri=?').get(uri);return row?JSON.parse(row.payload as string):undefined;}
   private terminalEvent(session:string,event:Parameters<NonNullable<AgentHandlers['terminal']>>[0]) {
@@ -1627,9 +1638,36 @@ export class AmplifierHost {
       this.store.transaction(()=>{for(const row of rows)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(row.uri,row.is_archived);});
     }
   }
+  private libraryUnknown(uri:string):boolean {
+    const chat=chatURI(uri);
+    return !!this.store.db.prepare("SELECT 1 FROM receipts WHERE channel IN (?,?) AND json_extract(payload,'$.status')='unknown' LIMIT 1").get(uri,chat)
+      || !!this.store.db.prepare("SELECT 1 FROM relocations WHERE uri=? AND status='unknown' UNION ALL SELECT 1 FROM transfer_fences WHERE session=? AND status='unknown' UNION ALL SELECT 1 FROM transfer_commands WHERE session=? AND status='unknown' UNION ALL SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status='unknown' UNION ALL SELECT 1 FROM history_edits WHERE session=? AND status='unknown' UNION ALL SELECT 1 FROM steering_intents WHERE chat=? AND status='unknown' UNION ALL SELECT 1 FROM import_adoptions WHERE session=? AND status='unknown' LIMIT 1").get(uri,uri,uri,uri,uri,uri,chat,uri);
+  }
+  private libraryMetadata(uri:string):CatalogRecord|undefined {
+    const row=this.store.db.prepare('SELECT engine_id,native_id,cwd,summary,state FROM sessions WHERE uri=?').get(uri);if(!row)return;
+    const summary=JSON.parse(String(row.summary)),state=JSON.parse(String(row.state));
+    return {uri,engineId:String(row.engine_id),nativeSessionId:row.native_id?String(row.native_id):undefined,workingDirectory:String(row.cwd),title:summary.title,createdAt:summary.createdAt,modifiedAt:summary.modifiedAt,status:summary.status,isArchived:!!(summary.status&SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present',...(state._meta?.['amplifier.dev/location']?{location:state._meta['amplifier.dev/location']}:{})};
+  }
+  private libraryLiveFacts():LiveFact[] {
+    const uris=new Set([...this.active.keys(),...this.starting.keys()]);if(uris.size>64)throw Error('Live library fact capacity exceeded');
+    const items:LiveFact[]=[];
+    for(const uri of uris){const row=this.libraryMetadata(uri);if(!row)continue;const status=Number(row.status)||0,active=this.active.get(uri),unknown=this.libraryUnknown(uri);
+      items.push({uri,runtime:unknown?'unknown':status&16?'input-needed':active?.busy||active?.finishing||this.starting.has(uri)?'working':'idle',effect:unknown?'unknown':status&SessionStatus.Error?'error':active?.busy?'unverified':'settled',modifiedAt:active?.busy&&active.started?active.started/1000:Date.parse(row.modifiedAt)/1000});}
+    return items;
+  }
+  /** Trusted Workspace callback. Grants are intersected, never widened by caller roots. */
+  async queryLibrary(params:LibraryQuery){
+    if(!this.library)throw new RpcFault(-32601,'Versioned library query unavailable');
+    if(!Array.isArray(params.allowedWorkspaceRoots)||params.allowedWorkspaceRoots.length>128)throw new RpcFault(-32602,'Workspace owner grants required');
+    const roots=new Set<string>();for(const grant of params.allowedWorkspaceRoots){if(typeof grant!=='string'||!isAbsolute(grant))throw new RpcFault(-32602,'Absolute workspace grant required');const candidate=resolve(grant);for(const host of this.roots){const within=(child:string,parent:string)=>child===parent||child.startsWith(parent.endsWith('/')?parent:parent+'/');if(within(candidate,host))roots.add(candidate);else if(within(host,candidate))roots.add(host);}}
+    try{return await this.withConversationCatalogRead(()=>this.library!.query({...params,allowedWorkspaceRoots:[...roots],allowedManagedRoots:this.managed?[this.managed.root]:[]}));}
+    catch(error){if((error as any).code===-32014)return {version:1 as const,items:[],available:false,refreshRequired:true,reason:'library-changed-or-expired'};throw error;}
+  }
+  reconcileLibrary(){return this.library?.reconcile()??Promise.resolve();}
   private async syncCatalog(record:SessionRecord) {
     if(!this.config.catalog)return;
-    await this.config.catalog.upsert({uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,isArchived:!!(record.summary.status & SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present',...((record.state._meta?.['amplifier.dev/location'])?{location:record.state._meta!['amplifier.dev/location'] as ManagedLocation}:{})});
+    const projection:CatalogRecord={uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,isArchived:!!(record.summary.status & SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present',...((record.state._meta?.['amplifier.dev/location'])?{location:record.state._meta!['amplifier.dev/location'] as ManagedLocation}:{})};
+    if(this.library)await this.library.write(projection);else await this.config.catalog.upsert(projection);
     if(this.presentation){const indexed=await this.config.catalog.get(record.uri);if(indexed?.nativeSessionId)this.presentation.retainMapping(indexed as unknown as Json);}
     if(this.config.catalog.projectSessionArchives)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(record.uri,Number(!!(record.summary.status & SessionStatus.IsArchived)));
   }
@@ -1669,6 +1707,7 @@ export class AmplifierHost {
       return this.store.append(channel,action,origin,rejectionReason);
     });
     if(record&&!rejectionReason){if(record.chat.activeTurn)this.hotRecords.set(record.uri,record);else this.hotRecords.delete(record.uri);}
+    if(record&&!rejectionReason&&['chat/turnStarted','chat/turnResume','chat/turnComplete','chat/turnCancelled','chat/error','chat/inputRequested','session/inputNeededSet','session/inputNeededRemoved'].includes(action.type))this.library?.point(record.uri);
     for(const peer of this.peers)if(peer.subscriptions.has(channel)||origin?.clientId===peer.clientId)this.send(peer,{jsonrpc:'2.0',method:'action',params:envelope});
     for(const observer of this.observers)if(observer.session===channel||observer.chat===channel){
       const bytes=Buffer.byteLength(JSON.stringify(envelope));
@@ -2657,7 +2696,7 @@ export class AmplifierHost {
     for(const peer of this.peers)peer.socket.terminate();
     const agents=[...this.active.values()];await Promise.all(agents.map(active=>{active.retireReason='host-shutdown';return active.agent.retire();}));await Promise.all([...this.stoppedCallbacks]);await Promise.allSettled(agents.map(active=>active.run));await Promise.all([...this.settledCallbacks]);this.active.clear();
     await new Promise<void>(resolve=>this.ws.close(()=>resolve()));await new Promise<void>(resolve=>this.http.close(()=>resolve()));
-    await this.presentation?.close();await this.config.catalog?.close?.();this.managed?.close();this.store.close();
+    this.store.onReceiptChanged=undefined;await this.library?.close();await this.presentation?.close();await this.config.catalog?.close?.();this.managed?.close();this.store.close();
   }
 }
 
