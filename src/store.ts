@@ -24,6 +24,9 @@ export class Store {
   private replayBytes=0;
   private lease:OwnerLease;
   private transactionOpen=false;
+  onReceiptChanged?:(channel:string)=>void;
+  private receiptChanges=new Set<string>();
+  private notifyReceipt(channel:string){try{this.onReceiptChanged?.(channel);}catch{/* Observers cannot change a committed receipt. */}}
   constructor(directory: string, readonly replayLimit = 4096) {
     mkdirSync(directory, {recursive: true, mode: 0o700});
     this.lease=new OwnerLease(directory);
@@ -114,8 +117,8 @@ export class Store {
     if(this.transactionOpen)return work();
     this.db.exec('BEGIN IMMEDIATE');
     this.transactionOpen=true;
-    try { const result = work(); this.db.exec('COMMIT'); return result; }
-    catch (error) { this.db.exec('ROLLBACK'); throw error; }
+    try { const result = work(); this.db.exec('COMMIT');this.transactionOpen=false;const channels=[...this.receiptChanges];this.receiptChanges.clear();for(const channel of channels)this.notifyReceipt(channel);return result; }
+    catch (error) {this.receiptChanges.clear();if(this.transactionOpen)this.db.exec('ROLLBACK');throw error;}
     finally {this.transactionOpen=false;}
   }
   get(uri: string): SessionRecord | undefined {
@@ -200,6 +203,7 @@ export class Store {
     const receipt = this.receipt(commandId);
     if (!receipt) throw new Error('Unknown command identity');
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,status,detail,updatedAt:new Date().toISOString()}),commandId);
+    if(receipt.status!==status){if(this.transactionOpen){if(this.receiptChanges.size<128)this.receiptChanges.add(receipt.channel);else this.receiptChanges.add('*capacity');}else this.notifyReceipt(receipt.channel);}
   }
   annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'|'nativeInputOutcome'>) {
     const receipt=this.receipt(commandId);if(!receipt)throw new Error('Unknown command identity');

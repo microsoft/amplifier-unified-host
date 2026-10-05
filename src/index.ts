@@ -19,3 +19,5 @@ export {PRESENTATION_LIMITS} from './presentation.js';
 
 export type {SessionMetadataAdapter,SessionMetadataContext,SessionTitleSnapshot,SessionTitleCommitContext,SessionTitleWriteContext,SessionTitleCommitResult} from './session-metadata.js';
 export {SESSION_METADATA_KEY} from './session-metadata.js';
+
+export type {LibraryQuery,LibraryRead,HostObservation,LiveFact} from './library-index.js';
