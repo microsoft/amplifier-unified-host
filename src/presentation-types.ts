@@ -33,6 +33,8 @@ export interface VisibilityProjectionRequest {
 export interface VisibilityProjectionReceipt {source:string;commandId:string;revision:number;projected:number;}
 export interface PresentationReadiness {
  enabled:boolean;ready:boolean;revision:number;source?:string;projectionRevision?:number;
+ /** Exact derived database qualified with this retained visibility generation. */
+ acknowledgedIndexIncarnation?:string;
  phase:'disabled'|'checking'|'ready'|'applying'|'unknown'|'rebuilding';reason?:string;
 }
 export interface PresentationRebuild {commandId:string;expectedRevision:number;}

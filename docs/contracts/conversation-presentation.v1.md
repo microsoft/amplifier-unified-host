@@ -117,6 +117,36 @@ command references rather than canonical paths or private before-images.
 
 ## Catalog reconstruction and restart
 
+After successful qualification, the host retains the catalog's acknowledged
+`indexIncarnation` in its existing presentation state. On subsequent list reads,
+including after process restart, an unchanged database identity, projection
+source, and exact checkpoint allow browsing already indexed metadata while
+discovery refreshes in the background. This does not claim complete discovery
+or qualify an execution, deletion, migration, or reconstruction operation.
+
+The read checks the full retained presentation state and catalog checkpoint
+before and after its callback. Only settled `ready` or `checking` phases without
+an active presentation transaction qualify. An absent projection is legitimate
+only at zero projection and zero policy revisions. Unknown effects, changed
+identity, missing positive checkpoints, malformed status, or concurrent policy
+changes refuse the result. The read does not write state, scan sources, launch
+agents, wake hints, or reconcile receipts. Workspace presence and native/product
+visibility filters still apply before pagination; indexed observations may lag
+background discovery.
+
+Catalog peers advertising neither identity nor projection presence retain the
+previous qualification path. Existing installations without an acknowledgment
+must qualify once before using retained reads. A changed database identity needs
+explicit reconstruction; a completed scan alone cannot rebind it. In-place
+rollback or live replacement preserving the same database UUID is unsupported.
+
+The retained-read unit checks cover state/identity races and old peers. The
+`retained-catalog-read.integration.test.ts` checks use an independently packaged
+Catalog 15+ (`PRESENTATION_CATALOG_PYTHON`, optionally
+`PRESENTATION_CATALOG_WHEEL`) with real process/store restarts, bounded filtered
+pages, unchanged host state, and database replacement. Controlled refresh status
+in that fixture is not a measurement of a full historical estate scan.
+
 The host's projection source UUID survives process restart and catalog loss.
 Each original bounded catalog page is recorded before dispatch. Listing is closed
 before incomplete projection can escape. No uncertain page is automatically
