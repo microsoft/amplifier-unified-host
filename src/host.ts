@@ -1,5 +1,5 @@
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
-import {PUBLIC_MESSAGE_META,capturePublicMessage,supportsPublicOriginal,mountedPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
+import {PUBLIC_MESSAGE_META,publicMessage,capturePublicMessage,supportsPublicOriginal,mountedPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
@@ -16,7 +16,7 @@ import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import { realpath, stat, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
 import { isAbsolute, relative, join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
+import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, MessageAttachmentKind, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { Store, type SessionRecord } from './store.js';
 import { AcpProcess, type EngineConfig, type AgentHandlers } from './acp.js';
@@ -575,7 +575,7 @@ export class AmplifierHost {
     let uri:string|undefined,access='unavailable';
     if(card.reference.owner==='resources'){
       if(!row.copySource){const original=resourcesBodyUri(card.reference.id);if(original?.searchParams.get('session')===record.uri)uri=original.href;}
-      else if(this.config.publicOriginalResources){try{const grant=await this.config.publicOriginalResources.resolveOriginalAttachment(record.uri,card.reference);uri=qualifiedAccessUri(grant,record.uri,card.reference);if(grant?.status==='unknown'||grant?.status==='pending')access=grant.status;}catch{access='unknown';}}
+      if(!uri&&this.config.publicOriginalResources){try{const grant=await this.config.publicOriginalResources.resolveOriginalAttachment(record.uri,card.reference);uri=qualifiedAccessUri(grant,record.uri,card.reference);if(grant?.status==='unknown'||grant?.status==='pending')access=grant.status;}catch{access='unknown';}}
     }
     // A retained descriptor is visible even when target access is not qualified.
     return uri?{type:'resource',label:card.name,contentType:card.mimeType,uri,_meta:{'amplifier.dev/publicAttachment':{...metadata,access:'qualified'}}}:{type:'simple',label:card.name,_meta:{'amplifier.dev/publicAttachment':{...metadata,access}}};
@@ -646,7 +646,7 @@ export class AmplifierHost {
     if(attachments.length)message.attachments=attachments;
     return message;
   }
-  private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string,before?:{beforeTurnId:string;expectedRevision:string}):Promise<{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]}> {
+  private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string,before?:{beforeTurnId:string;expectedRevision:string;includeEditContext?:boolean}):Promise<{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[];editContext?:Json}> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
     if(!engine||!record.nativeSessionId)throw new RpcFault(-32000,'Native history reader is unavailable; no empty transcript was substituted');
@@ -656,12 +656,13 @@ export class AmplifierHost {
       const init=await agent.initialize();
       const capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
       if(capability?.version!==1||capability?.paging!=='complete-turns'||capability?.passive!==true)throw new RpcFault(-32601,'Agent does not advertise a passive native history reader');
-      let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[];
+      let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[],editContext:Json|undefined;
       do {
         const publicCapability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.publicMessagePreservation;
         const includePublicRows=!before&&publicCapability?.version===1&&publicCapability.publicRows===true;
         const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(includePublicRows?{includePublicRows:true}:{}),...(before??{}),...(next?{cursor:next}:{})}) as Json;
         if(!Array.isArray(result.turnGroups)||typeof result.revision!=='string')throw new Error('Malformed native history page');
+        if(before?.includeEditContext){if(result.editContext?.version!==1||result.editContext.targetMessageId!==before.beforeTurnId||!Object.hasOwn(result.editContext,'publicMessage'))throw new Error('Native edit context is unavailable');editContext=result.editContext;}
         const publicRows=includePublicRows?this.publicRows(record,result):[];
         if(revision&&revision!==result.revision)throw new RpcFault(-32013,'Native history changed while assembling the selected window');
         if(result.nextCursor&&(!result.turnGroups.length||result.nextCursor===next))throw new RpcFault(-32013,'Native history cursor did not advance');
@@ -706,7 +707,7 @@ export class AmplifierHost {
       if(fresh&&fresh.engineId===record.engineId&&fresh.nativeSessionId===record.nativeSessionId&&fresh.workingDirectory===record.workingDirectory&&JSON.stringify((fresh.state._meta?.['amplifier.dev/acp'] as Json|undefined)?.capabilities)!==JSON.stringify(init.agentCapabilities)) {
         this.emit(record.uri,{type:'session/metaChanged',_meta:{...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:init.agentCapabilities}}} as StateAction);
       }
-      return {turns,nextCursor,revision,diagnostics};
+      return {turns,nextCursor,revision,diagnostics,...(editContext?{editContext}:{})};
     } finally {this.passiveReads--;await agent.retire();}
   }
   private rememberMixedCursor(chat:string,page:{turns:Turn[];hasOlder:boolean;revision:string}) {
@@ -2197,8 +2198,20 @@ export class AmplifierHost {
     this.guardRetirement(active);
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
-    const publicOriginal=this.captureOriginal(active,action.message,action.turnId,special?.operation??'prompt');
-    const blocks=await this.prompt(action.message,record);
+    const editCapability=(active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.historyEdits;
+    const historyPrefix=special?.operation==='history.revise'?await this.nativeHistory(record,50,undefined,{beforeTurnId:special.args.targetMessageId,expectedRevision:special.args.expectedHistoryRevision,...(editCapability?.originalContextVersion===1?{includeEditContext:true}:{})}):undefined;
+    let editOriginal:PublicMessageV1|undefined;
+    if(historyPrefix?.editContext?.publicMessage){
+      const original=publicMessage(historyPrefix.editContext.publicMessage);
+      const cards=original.blocks.filter((block):block is PublicCard=>block.type==='attachment');
+      if(cards.some(card=>card.reference.owner!=='resources')||cards.length&&!this.config.resolvePromptAttachment)throw new Error('Original attachment context cannot be resolved for this edit');
+      action={...action,message:{...action.message,...(cards.length?{attachments:cards.map(card=>({type:MessageAttachmentKind.Resource,label:card.name,contentType:card.mimeType,uri:card.reference.id}))}:{})}};
+      editOriginal={...original,inputId:action.turnId,blocks:[{type:'text',text:action.message.text},...cards]};
+    }
+    const captured=this.captureOriginal(active,action.message,action.turnId,special?.operation??'prompt');
+    if(editOriginal&&!captured)throw new Error('The mounted agent cannot preserve original context for this edit');
+    const publicOriginal=editOriginal??captured;
+    const blocks=await this.prompt(action.message,record,true,!!editOriginal);
     this.checkContentCapabilities(active,blocks);
     const reply=this.messageReply(action.message);
     if(reply){
@@ -2210,13 +2223,14 @@ export class AmplifierHost {
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
       if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
+    const historyArgs=special?.operation==='history.revise'?special.args:undefined;
+    if(historyPrefix?.editContext&&special)special={...special,args:{...special.args,prompt:blocks}};
     const params=this.inputParams(active,record,action.turnId,action.message,blocks,special,publicOriginal);
-    const historyPrefix=special?.operation==='history.revise'?await this.nativeHistory(record,50,undefined,{beforeTurnId:special.args.targetMessageId,expectedRevision:special.args.expectedHistoryRevision}):undefined;
-    this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(special.args));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
+    this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(historyArgs));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
     this.touchAgent(active);active.busy=true;active.generationId=undefined;active.steeringMount=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();this.publishSteeringSupport(record.uri,active);
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
-    active.historyRevision=historyPrefix?{args:special!.args,prefix:historyPrefix,confirmed:false}:undefined;
+    active.historyRevision=historyPrefix?{args:historyArgs!,prefix:historyPrefix,confirmed:false}:undefined;
     if(special?.operation==='history.revise')active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};
     else if(special?.operation==='observation.submit'){active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};active.observationAdmission={inputId:action.turnId,watchId:special.args.watchId,taskId:special.args.taskId,taskRevision:special.args.taskRevision,outcomeDigest:createHash('sha256').update(JSON.stringify(special.args.outcome)).digest('hex'),expectedExecutionRevision:special.expected!.executionRevision,expectedInterruptionRevision:special.expected!.interruptionRevision,expectedConfigurationHash:special.expected!.configurationHash,admittedExecutionRevision:this.store.revisions(record.uri).executionRevision};this.store.annotateReceipt(action.turnId,{observationAdmission:active.observationAdmission});}else this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,params,special);
       });
@@ -2433,13 +2447,13 @@ export class AmplifierHost {
     if(!supportsPublicOriginal(capability,route,!!message.attachments?.length)||!supportsPublicOriginal(mountedPublicOriginal(capability,active.publicOriginalMount),route,!!message.attachments?.length))return;
     return capturePublicMessage(message,inputId);
   }
-  private async prompt(message:Message,record:SessionRecord,resolveReferences=true):Promise<ContentBlock[]> {
+  private async prompt(message:Message,record:SessionRecord,resolveReferences=true,requireResolvedOriginals=false):Promise<ContentBlock[]> {
     this.messageReply(message);
     if(message.model||message.agent)throw new Error('Per-message model/custom-agent selection is not advertised; use session configuration');
     const blocks:ContentBlock[]=[{type:'text',text:message.text}];
     if((message.attachments?.length??0)>16)throw new RpcFault(-32602,'At most sixteen attachments per input');
     for(const attachment of message.attachments??[]) {
-      if(attachment.type==='resource'&&resolveReferences&&this.config.resolvePromptAttachment){const resolved=await this.config.resolvePromptAttachment({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.executionDirectory??record.workingDirectory},structuredClone(attachment));if(resolved!==undefined){if(!Array.isArray(resolved)||resolved.length>16)throw new RpcFault(-32602,'Attachment resolver exceeded block count');blocks.push(...resolved);continue;}}
+      if(attachment.type==='resource'&&resolveReferences&&this.config.resolvePromptAttachment){const resolved=await this.config.resolvePromptAttachment({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.executionDirectory??record.workingDirectory},structuredClone(attachment));if(resolved!==undefined){if(!Array.isArray(resolved)||resolved.length>16)throw new RpcFault(-32602,'Attachment resolver exceeded block count');if(requireResolvedOriginals&&!resolved.length)throw new Error('Original attachment context is unavailable');blocks.push(...resolved);continue;}if(requireResolvedOriginals)throw new Error('Original attachment context is unavailable');}
       if(attachment.type==='simple'&&attachment.modelRepresentation)blocks.push({type:'text',text:attachment.modelRepresentation});
       else if(attachment.type==='resource')blocks.push({type:'resource_link',uri:attachment.uri,name:attachment.label,mimeType:attachment.contentType});
       else if(attachment.type==='embeddedResource') {
