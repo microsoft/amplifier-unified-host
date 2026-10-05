@@ -12,6 +12,7 @@ export interface QuiescenceContext {fenceId:string;commandId:string;purpose:Quie
 export interface ServiceReleaseProof extends QuiescenceProof {
  kind:'service-lifecycle';serviceOutcome:'resumed'|'stop-refused';expected:ServiceIdentity;observed:ServiceIdentity;
  resumeCommandId?:string;exitReceiptId?:string;readyReceiptId?:string;refusalReceiptId?:string;
+ activation?:{schema:'distribution-service-activation-v1';target:{id:string;version:string;revision:string;digest:string}};
 }
 export interface ServiceLifecycleConfig {
  /** Trusted launcher identity: instanceId is unique to this actual runtime launch. */
@@ -21,8 +22,9 @@ export interface ServiceLifecycleConfig {
 }
 export interface ServiceStopAdmission {
  admitted:boolean;intakeClosed:boolean;purpose:'service-stop';expected:ServiceIdentity;
+ phase?:'closed'|'held';
  fenceId?:string;commandId?:string;executed?:false;reason?:string;work?:WorkCounts;fence?:QuiescenceFence;
- evidence?:{activeWork:0;intakeClosed:true;instanceId:string;dataScope:string;observedAt:number};
+ evidence?:{activeWork:number|'unknown';intakeClosed:true;instanceId:string;dataScope:string;observedAt:number};
 }
 export interface ServiceStopReleaseResult {
  released:true;intakeClosed:false;purpose:'service-stop';fenceId:string;commandId:string;
@@ -65,7 +67,7 @@ export interface QuiescenceConfig {
  onMayBeIdle?:()=>void;
  timeoutMs?:number;
 }
-export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;admissionStage?:'participants'|'native-retirement'|'owner-exclusion'|'held';}
+export interface QuiescenceFence extends QuiescenceContext {phase:'checking'|'closed'|'held'|'unknown'|'releasing';owners:string[];observedAt:number;reason?:string;admissionStage?:'participants'|'native-retirement'|'owner-exclusion'|'held'|'service-drain';admissionModel?:'shared-service-v1';}
 export interface WorkCounts {counts:Record<string,number>;gaps:string[];}
 export class QuiescenceError extends Error {
  readonly code=-32014;
@@ -86,7 +88,9 @@ export class QuiescenceGate {
  private changing=false;
  // A timeout is not cancellation: late owner work must settle before an abort can be admitted.
  private pending=new Set<Promise<unknown>>();
- constructor(private db:DatabaseSync,private config:QuiescenceConfig|undefined,private requirements:string[],private inspectWork:()=>WorkCounts,private retire:()=>Promise<{ready:boolean;reason?:string;unknown?:boolean}>,private hasResidents:()=>boolean=()=>false) {
+ private serviceDrain?:Promise<ServiceStopReceipt>;
+ private drainWake?:()=>void;
+ constructor(private db:DatabaseSync,private config:QuiescenceConfig|undefined,private requirements:string[],private inspectWork:()=>WorkCounts,private retire:()=>Promise<{ready:boolean;reason?:string;unknown?:boolean}>,private hasResidents:()=>boolean=()=>false,private inspectServiceWork:()=>WorkCounts=inspectWork) {
   if(config){
    token(config.instanceId,'launch identity');token(config.dataScope,'data scope');
    if(!Array.isArray(config.requiredOwners)||config.requiredOwners.length>128||!Array.isArray(config.participants)||config.participants.length>128)throw Error('Bounded quiescence owner declarations required');
@@ -103,7 +107,7 @@ export class QuiescenceGate {
   });
  }
  private fence():QuiescenceFence|undefined {const row=this.db.prepare('SELECT payload FROM host_quiescence_fence WHERE id=1').get();return row?JSON.parse(String(row.payload)):undefined;}
- private save(fence:QuiescenceFence){this.db.prepare('INSERT INTO host_quiescence_fence VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(JSON.stringify(fence));this.result(fence.commandId,this.bindResult(fence,{admitted:fence.phase==='held',fence:structuredClone(fence),intakeClosed:true}));}
+ private save(fence:QuiescenceFence){this.db.prepare('INSERT INTO host_quiescence_fence VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(JSON.stringify(fence));this.result(fence.commandId,this.bindResult(fence,{admitted:fence.phase==='held',fence:structuredClone(fence),intakeClosed:true,...(fence.admissionModel==='shared-service-v1'?{fenceId:fence.fenceId,commandId:fence.commandId}: {})}));}
  private result(commandId:string,result:unknown){this.db.prepare('UPDATE host_quiescence_commands SET payload=? WHERE command_id=?').run(JSON.stringify(result),commandId);}
  private bindResult(fence:QuiescenceFence,result:any){return fence.purpose==='service-stop'?{...result,purpose:'service-stop',expected:fence.serviceIdentity}:result;}
  private clear(fence:QuiescenceFence,result:unknown){this.db.exec('BEGIN IMMEDIATE');try{this.result(fence.commandId,this.bindResult(fence,result));this.db.prepare('DELETE FROM host_quiescence_fence WHERE id=1').run();this.db.exec('COMMIT');}catch(e){this.db.exec('ROLLBACK');throw e;}}
@@ -121,7 +125,7 @@ export class QuiescenceGate {
  /** Existing result delivery must finish even when an uncertain fence remains held. It grants no new admission. */
  async continuation<T>(work:()=>Promise<T>):Promise<T>{this.continuations++;try{return await this.scope.run({active:false},work);}finally{this.continuations--;this.maybeIdle();}}
  external<T>(ownerId:string,work:()=>Promise<T>):Promise<T>{
-  token(ownerId,'external owner');if(this.config&&!this.config.requiredOwners.includes(ownerId)&&!this.config.participants.some(p=>p.id===ownerId))throw new QuiescenceError('External mutation owner is not declared',{executed:false});
+  token(ownerId,'external owner');
   return this.run(work);
  }
  /** Trusted native snapshot/reset I/O under this held fence; no normal admission is inherited. */
@@ -132,7 +136,7 @@ export class QuiescenceGate {
   try{return await this.scope.run({active:false},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{this.maintenance--;}
  }
  workChanged(){this.maybeIdle();}
- private maybeIdle(){if(this.calls||this.continuations||this.fence())return;queueMicrotask(()=>{try{this.config?.onMayBeIdle?.();}catch{/* Advisory wakeup never changes operation truth. */}});}
+ private maybeIdle(){this.drainWake?.();if(this.calls||this.continuations)return;queueMicrotask(()=>{try{this.config?.onMayBeIdle?.();}catch{/* Advisory wakeup never changes operation truth. */}});}
  private work():WorkCounts{const work=this.inspectWork();return {counts:{...work.counts,admissions:this.calls,continuations:this.continuations},gaps:[...work.gaps,...this.requirements.filter(id=>id.startsWith('uncovered-')||!this.config?.participants.some(p=>p.id===id))]};}
  private async deadline<T>(promise:Promise<T>):Promise<T>{let timer:ReturnType<typeof setTimeout>|undefined;this.pending.add(promise);void promise.then(()=>this.pending.delete(promise),()=>this.pending.delete(promise));try{return await Promise.race([promise,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('quiescence-observation-timeout')),this.config?.timeoutMs??10000);timer.unref();})]);}finally{clearTimeout(timer);}}
  private async refuse(fence:QuiescenceFence,reason:string,work?:WorkCounts){
@@ -145,9 +149,43 @@ export class QuiescenceGate {
   return this.admitBound(input);
  }
  async admitServiceStop(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
+  const closed=await this.closeServiceIntake(input);
+  if(!closed.intakeClosed||'released' in closed)return closed;
+  const fence=this.fence();
+  if(!fence||fence.fenceId!==closed.fenceId||fence.admissionModel!=='shared-service-v1')throw new QuiescenceError('Legacy service holds are not shared drain proof',{executed:false});
+  if(fence.phase==='held')return closed;
+  if(fence.phase==='unknown'&&fence.reason!=='service-drain-unconfirmed')return closed;
+  if(this.serviceDrain)return this.serviceDrain;
+  this.serviceDrain=(async()=>{
+   const until=Date.now()+(this.config?.timeoutMs??10000);
+   while(true){
+    const current=this.fence();if(!current||current.fenceId!==fence.fenceId||current.commandId!==fence.commandId)throw new QuiescenceError('Service drain fence changed',{executed:false});
+    const work=this.serviceWork();
+    if(!work.gaps.length&&Object.values(work.counts).every(n=>Number.isSafeInteger(n)&&n===0)){
+     current.phase='held';current.observedAt=Date.now();delete current.reason;this.save(current);
+     const result=this.serviceClosedResult(current,work);this.result(current.commandId,result);return result;
+    }
+    const left=until-Date.now();if(left<=0)return this.unknown(current,'service-drain-unconfirmed');
+    await new Promise<void>(resolve=>{const wake=()=>{clearTimeout(timer);if(this.drainWake===wake)this.drainWake=undefined;resolve();};const timer=setTimeout(wake,left);this.drainWake=wake;});
+   }
+  })().finally(()=>{this.serviceDrain=undefined;this.drainWake=undefined;});return this.serviceDrain;
+ }
+ private serviceWork():WorkCounts {const work=this.inspectServiceWork();return {counts:{...work.counts,admissions:this.calls,continuations:this.continuations,maintenance:this.maintenance},gaps:[...work.gaps]};}
+ private serviceClosedResult(fence:QuiescenceFence,work:WorkCounts):ServiceStopAdmission {
+  const values=Object.values(work.counts),activeWork=work.gaps.length||values.some(n=>!Number.isSafeInteger(n)||n<0)?'unknown':values.reduce((sum,n)=>sum+n,0);
+  return {admitted:true,intakeClosed:true,purpose:'service-stop',phase:fence.phase==='held'?'held':'closed',expected:structuredClone(fence.serviceIdentity!),fenceId:fence.fenceId,commandId:fence.commandId,fence:structuredClone(fence),work,evidence:{activeWork,intakeClosed:true,instanceId:fence.instanceId,dataScope:fence.dataScope,observedAt:Date.now()}};
+ }
+ /** Close the shared local gate before any await; closure is not proof that work drained. */
+ async closeServiceIntake(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
   const expected=identity(input.expected),configured=this.config?.serviceLifecycle;
   if(!configured||!sameIdentity(expected,configured.identity))throw new QuiescenceError('Service stop requires the exact configured running service identity',{executed:false});
-  return this.admitBound({...input,purpose:'service-stop',serviceIdentity:expected});
+  token(input.commandId,'service stop identity');if(input.retryRefused!==undefined&&typeof input.retryRefused!=='boolean')throw Error('retryRefused must be an explicit boolean');
+  const signature=digest(['shared-service-v1',input.commandId,expected]),old=this.db.prepare('SELECT signature,payload FROM host_quiescence_commands WHERE command_id=?').get(input.commandId);
+  if(old){if(old.signature!==signature)throw new QuiescenceError('Service identity differs or belongs to legacy admission',{executed:false});return JSON.parse(String(old.payload));}
+  if(this.fence()||this.changing)throw new QuiescenceError('Existing quiescence fence requires authoritative reconciliation',{executed:false,...this.inspect()});
+  const fence:QuiescenceFence={commandId:input.commandId,purpose:'service-stop',fenceId:randomUUID(),instanceId:expected.instanceId,dataScope:expected.dataScope,phase:'closed',owners:[],observedAt:Date.now(),serviceIdentity:expected,admissionStage:'service-drain',admissionModel:'shared-service-v1'};
+  this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO host_quiescence_commands VALUES(?,?,?)').run(input.commandId,signature,'{}');this.save(fence);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
+  const result=this.serviceClosedResult(fence,this.serviceWork());this.result(input.commandId,result);return result;
  }
  inspectServiceLifecycle(){const fence=this.fence();return {enabled:!!this.config?.serviceLifecycle,identity:this.config?.serviceLifecycle?identity(this.config.serviceLifecycle.identity):undefined,intakeClosed:!!fence,fence:fence?.purpose==='service-stop'?fence:undefined};}
  serviceStopReceipt(commandId:string):ServiceStopReceipt|undefined{const result=this.receipt(commandId);if(!result)return undefined;if(result.purpose!=='service-stop'&&result.fence?.purpose!=='service-stop')throw new QuiescenceError('Command is not a service stop receipt',{executed:false});return result;}
@@ -246,7 +284,7 @@ export class QuiescenceGate {
  async releaseServiceStop(input:ServiceStopReleaseRequest):Promise<ServiceStopReceipt>{
   token(input.fenceId,'fence identity');token(input.commandId,'service stop identity');
   if(!['resumed','stop-refused','unknown'].includes(input.outcome))throw new QuiescenceError('Unknown service stop outcome',{executed:false});
-  if(this.changing||this.pending.size||this.maintenance)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
+  if(this.changing||this.pending.size||this.maintenance||this.serviceDrain)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
   const current=this.fence(),row=this.db.prepare('SELECT * FROM host_service_releases WHERE fence_id=?').get(input.fenceId);
   const exact=current?.fenceId===input.fenceId&&current.commandId===input.commandId;
   const completed=row?.state==='released'&&row.command_id===input.commandId;
@@ -267,11 +305,16 @@ export class QuiescenceGate {
   try{
    const proof=await this.deadline(configured.verifyRelease({...structuredClone(fence),outcome:input.outcome,resumeCommandId:input.resumeCommandId,evidence:input.evidence}));
    const expected=identity(fence.serviceIdentity),observed=identity(proof?.observed);
-   if(!proof||proof.kind!=='service-lifecycle'||proof.verified!==true||proof.fenceId!==fence.fenceId||proof.commandId!==fence.commandId||proof.serviceOutcome!==input.outcome||proof.dataScope!==fence.dataScope||proof.instanceId!==observed.instanceId||!sameIdentity(proof.expected,expected)||!sameIdentity(observed,configured.identity)||!sameIdentity({...observed,instanceId:expected.instanceId},expected)||expected.instanceId!==fence.instanceId||expected.dataScope!==fence.dataScope)throw Error('Service proof does not bind installation, scope, owner, release and exact running instance');
+   if(!proof||proof.kind!=='service-lifecycle'||proof.verified!==true||proof.fenceId!==fence.fenceId||proof.commandId!==fence.commandId||proof.serviceOutcome!==input.outcome||proof.dataScope!==fence.dataScope||proof.instanceId!==observed.instanceId||!sameIdentity(proof.expected,expected)||!sameIdentity(observed,configured.identity)||['installationId','dataScope','ownerId'].some(key=>expected[key as keyof ServiceIdentity]!==observed[key as keyof ServiceIdentity])||expected.instanceId!==fence.instanceId||expected.dataScope!==fence.dataScope)throw Error('Service proof does not bind installation, scope, owner, release and exact running instance');
    token(proof.receiptId,'service settlement receipt');
    if(input.outcome==='resumed'){
     if(proof.outcome!=='ready'||observed.instanceId===expected.instanceId||proof.resumeCommandId!==input.resumeCommandId||proof.refusalReceiptId!==undefined)throw Error('Resumed service proof must identify the distinct confirmed replacement');
     token(proof.exitReceiptId,'service exit receipt');token(proof.readyReceiptId,'service readiness receipt');
+    if(observed.releaseDigest!==expected.releaseDigest){
+     const activation=proof.activation;
+     if(activation?.schema!=='distribution-service-activation-v1'||!activation.target||activation.target.digest!==observed.releaseDigest||Object.keys(activation).sort().join(',')!=='schema,target'||Object.keys(activation.target).sort().join(',')!=='digest,id,revision,version')throw Error('Cross-release service readiness requires its authenticated exact activation target');
+     for(const key of ['id','version','revision','digest'] as const)token(activation.target[key],'activation '+key);
+    }else if(proof.activation!==undefined)throw Error('Same-release service readiness cannot claim cross-release activation');
    }else{
     if(proof.outcome!=='unchanged'||!sameIdentity(observed,expected)||proof.resumeCommandId!==undefined||proof.exitReceiptId!==undefined||proof.readyReceiptId!==undefined)throw Error('Refused service stop must prove the unchanged original instance');
     token(proof.refusalReceiptId,'no-effect stop refusal receipt');

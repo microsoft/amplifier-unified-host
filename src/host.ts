@@ -1,4 +1,5 @@
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
+import {AsyncLocalStorage} from 'node:async_hooks';
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
 import {ConversationPresentation,type PresentationMetadata} from './presentation.js';
@@ -103,7 +104,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {retirementCommandId?:string;finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {admittedControls?:number;retirementCommandId?:string;finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -115,6 +116,7 @@ const independentRequests=new Set(['x-amplifier/capabilityAction','x-commandRece
 const bounded=(value:unknown,def:number,max:number)=>{if(value===undefined)return def;if(!Number.isSafeInteger(value)||Number(value)<1||Number(value)>max)throw new RpcFault(-32602,`Expected integer between 1 and ${max}`);return Number(value);};
 
 export class AmplifierHost {
+  private nativeContinuation=new AsyncLocalStorage<{live:boolean;session:string;nativeId:string;active:Active;turnId?:string}>();
   readonly store:Store;
   private intake:QuiescenceGate;
   private presentation?:ConversationPresentation;
@@ -181,7 +183,7 @@ export class AmplifierHost {
     }
     const coverage=config.quiescence?.coverage;
     const requirements=[...new Set(Object.entries(config.capabilities?.manifest.actions??{}).filter(([name])=>!config.capabilities?.quiescenceAccess?.[name]).map(([,action])=>coverage?.capabilities?.[action.topic]??'uncovered-capability:'+action.topic)),...(config.resourceProviders??[]).filter(provider=>provider.write).map(provider=>coverage?.resources?.[provider.scheme]??'uncovered-resource:'+provider.scheme),...(config.nativeHostRequest||config.nativeEvent?(coverage?.nativeHostOwners?.length?coverage.nativeHostOwners:[coverage?.nativeHost??'uncovered-native-host']):[])];
-    this.intake=new QuiescenceGate(this.store.db,config.quiescence,requirements,()=>this.quiescenceWork(),()=>this.quiesceAgents(),()=>this.active.size>0);
+    this.intake=new QuiescenceGate(this.store.db,config.quiescence,requirements,()=>this.quiescenceWork(),()=>this.quiesceAgents(),()=>this.active.size>0,()=>this.quiescenceWork(true));
     if(config.conversationPresentation){
       const catalog=config.catalog!;
       this.presentation=new ConversationPresentation(this.store.db,{
@@ -304,7 +306,7 @@ export class AmplifierHost {
       const state=this.terminalState(uri)!;
       if(Buffer.byteLength(JSON.stringify(state.content))+Buffer.byteLength(event.data??'')>256*1024)this.emit(uri,{type:'terminal/cleared'} as StateAction);
       this.emit(uri,{type:'terminal/data',data:event.data??''} as StateAction);
-    } else {this.emit(uri,{type:'terminal/exited',exitCode:event.exitCode} as StateAction);this.emit(ROOT,{type:'root/terminalsChanged',terminals:this.terminalList()} as StateAction);}
+    } else {this.emit(uri,{type:'terminal/exited',exitCode:event.exitCode} as StateAction);this.emit(ROOT,{type:'root/terminalsChanged',terminals:this.terminalList()} as StateAction);this.intake.workChanged();}
   }
   private withLock<T>(uri:string,work:()=>Promise<T>):Promise<T> {
     const prior=this.resourceLocks.get(uri)??Promise.resolve();
@@ -354,8 +356,9 @@ export class AmplifierHost {
   /** Only an actual dispatched use renews LRU/grace; validation and passive polls do not. */
   private async withAgentUse<T>(active:Active,request:()=>Promise<T>,use=true):Promise<T> {
     active.controlDepth=(active.controlDepth??0)+1;
+    if(use)active.admittedControls=(active.admittedControls??0)+1;
     if(use)this.touchAgent(active);
-    try{return await request();}finally{active.controlDepth--;if(use)this.touchAgent(active);}
+    try{return await request();}finally{active.controlDepth--;if(use){active.admittedControls!--;this.touchAgent(active);}this.intake.workChanged();}
   }
   private nativeControlIsUse(operation:string) {
     // Exact known read contracts, not suffix heuristics: snapshots persist state and are use.
@@ -1493,7 +1496,7 @@ export class AmplifierHost {
   /** Trusted persistence callback runs only after the selected title CAS passes. */
   async commitSessionTitle(session:string,expected:{commandId:string;expectedTitleRevision?:string},persist:(context:Readonly<SessionTitleCommitContext>)=>Promise<SessionTitleCommitResult>):Promise<SessionTitleCommitResult> {
     const commandId=expected?.commandId,expectedTitleRevision=expected?.expectedTitleRevision;this.titleToken(commandId,'original command identity');if(expectedTitleRevision!==undefined)this.titleToken(expectedTitleRevision,'expected title revision');if(typeof persist!=='function')throw new RpcFault(-32602,'Trusted title persistence callback required');
-    return this.intake.run(async()=>{const record=await this.record(session);return this.withLock(record.uri,async()=>{
+    return this.selectedCompletion(session,async()=>{const record=await this.record(session);return this.withLock(record.uri,async()=>{
       const current=this.getRecord(record.uri)!,before=await this.titleSnapshot(current);
       if(expectedTitleRevision!==undefined&&before.titleRevision!==expectedTitleRevision)return {applied:false,...before};
       const result=await persist(Object.freeze({...this.titleContext(current),...structuredClone(before),commandId}));
@@ -1595,11 +1598,11 @@ export class AmplifierHost {
       const agent=new AcpProcess(engine,record.executionDirectory??record.workingDirectory,{
         hostCapabilities:this.config.nativeHostCapabilities,
         hostRuntimeRetention:true,
-        admitEffect:work=>this.intake.run(work),
+        admitEffect:work=>this.admittedNativeWork(uri,active,work),
         update:params=>{
           const bytes=Buffer.byteLength(JSON.stringify(params));active.updateCount=(active.updateCount??0)+1;active.updateBytes=(active.updateBytes??0)+bytes;
           if(active.updateCount>512||active.updateBytes>8*1024*1024){agent.process.kill();return Promise.reject(new Error('ACP update queue capacity exceeded; execution outcome requires reconciliation'));}
-          const update=(active.updates??Promise.resolve()).then(()=>this.update(uri,params)).finally(()=>{active.updateCount!--;active.updateBytes!-=bytes;});active.updates=update;return update;
+          const update=(active.updates??Promise.resolve()).then(()=>this.update(uri,params)).finally(()=>{active.updateCount!--;active.updateBytes!-=bytes;this.intake.workChanged();});active.updates=update;return update;
         },permission:async params=>{await active.updates;return this.permission(uri,params);},
         terminal:event=>this.terminalEvent(uri,event),
         stopped:event=>this.notifyAgentStopped(uri,active,active.retireReason??'process-closed',event),
@@ -1615,20 +1618,35 @@ export class AmplifierHost {
             if(!this.getRecord(uri)?.nativeSessionId){active.pendingHints??=[];if(active.pendingHints.length<64)active.pendingHints.push(dirname(event.metadataPath));}
             else await this.catalogHint(dirname(event.metadataPath));
           }
-          if(agent.nativeId&&this.config.nativeEvent)await this.intake.continuation(()=>this.config.nativeEvent!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params));
+          if(agent.nativeId&&this.config.nativeEvent){const callback=()=>this.config.nativeEvent!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params);if(this.nativeWorkAdmitted(uri,active))await this.admittedNativeWork(uri,active,callback);else await this.intake.continuation(callback);}
         },
         ...(this.config.nativeHostRequest?{hostRequest:async(_method:string,params:Json)=>{
           const observation=params.operation==='operations.observe'&&this.config.nativeHostCapabilities?.features?.operations===true;
           if(!agent.nativeId||agent.closed||this.active.get(uri)!==active||active.stopNotified||(!active.busy&&!active.controlDepth&&!observation))throw new Error('Host capability requires an admitted native turn, scoped native control or negotiated owned-operation observation');
           let bytes=0;
           if(observation){const args=params.args as Json|undefined;bytes=Buffer.byteLength(JSON.stringify(args??{}));if(typeof args?.runtimeSessionId!=='string'||!args.runtimeSessionId||args.runtimeSessionId.length>512||!args.event||typeof args.event!=='object'||Array.isArray(args.event)||bytes>256*1024||(active.observationPending??0)>=32||(active.observationBytes??0)+bytes>1024*1024)throw new Error('Owned operation observation exceeded its scoped callback bounds');active.observationPending=(active.observationPending??0)+1;active.observationBytes=(active.observationBytes??0)+bytes;}
-          try{return await this.intake.continuation(()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params));}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}}
+          try{const callback=()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params);return observation&&!this.nativeWorkAdmitted(uri,active)?await this.intake.continuation(callback):await this.admittedNativeWork(uri,active,callback);}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}this.intake.workChanged();}
         }}:{}),
       });active.agent=agent;this.touchAgent(active);this.active.set(uri,active);
       try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));this.touchAgent(active);return active;}
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);this.admittedStarts.delete(uri);}
       });
+  }
+  private nativeWorkAdmitted(session:string,active:Active){return this.active.get(session)===active&&!active.agent.closed&&!active.stopNotified&&(this.starting.has(session)||!!active.admittedControls||!!active.turnId&&(active.busy||active.finishing));}
+  private async admittedNativeWork<T>(session:string,active:Active,work:()=>Promise<T>):Promise<T>{
+    if(!this.nativeWorkAdmitted(session,active))throw new RpcFault(-32014,this.intake.inspect().intakeClosed?'Host intake is closed; Native callback has no current admitted startup, turn or control':'Native callback has no current admitted startup, turn or control',{executed:false});
+    const binding={live:true,session,nativeId:active.agent.nativeId??'',active,turnId:active.turnId};
+    try{return await this.intake.continuation(()=>this.nativeContinuation.run(binding,work));}finally{binding.live=false;}
+  }
+  private scopedNativeContinuation(session:string){const binding=this.nativeContinuation.getStore();return !!binding?.live&&binding.session===session&&this.active.get(session)===binding.active&&binding.active.agent.nativeId===binding.nativeId;}
+  private selectedCompletion<T>(session:string,work:()=>Promise<T>):Promise<T>{return this.scopedNativeContinuation(session)?this.intake.continuation(work):this.intake.run(work);}
+  private activeTurnCompletion<T>(session:string,turnId:string|undefined,work:()=>Promise<T>):Promise<T>{const record=this.getRecord(session),active=record?this.active.get(record.uri):undefined;return active?.busy&&active.turnId===turnId&&!active.cancel?this.intake.continuation(work):this.intake.run(work);}
+  /** Reserve completion work synchronously within an exact admitted Native callback. */
+  async withAdmittedNativeContinuation<T>(context:{session:string;nativeSessionId:string},work:()=>Promise<T>):Promise<T>{
+    const parent=this.nativeContinuation.getStore();
+    if(!parent?.live||parent.session!==context.session||parent.nativeId!==context.nativeSessionId||!this.scopedNativeContinuation(context.session))throw new RpcFault(-32014,'Exact admitted Native callback required',{executed:false});
+    const binding={...parent,live:true};try{return await this.intake.continuation(()=>this.nativeContinuation.run(binding,work));}finally{binding.live=false;}
   }
   private async catalogHint(path:string){if(this.presentation)this.presentation.enqueueHint(path);else await this.config.catalog?.hint?.(path);}
   private async repairArchiveProjection() {
@@ -1840,7 +1858,7 @@ export class AmplifierHost {
   }
   /** Caller holds the session mutex. Never drains held/unknown inputs or replays a receipt. */
   private async drainQueue(session:string) {
-    if(this.closing)return;
+    if(this.closing||this.intake.inspect().intakeClosed)return;
     const record=this.getRecord(session),active=this.active.get(session);
     if(!record||record.chat.activeTurn||active?.busy||active?.controlDepth)return;
     const row=this.store.db.prepare("SELECT * FROM queue_intents WHERE chat=? AND status='pending' ORDER BY position LIMIT 1").get(record.chat.resource);
@@ -1861,7 +1879,7 @@ export class AmplifierHost {
     // The standard cancellation action is emitted only when ACP settles.
   }
   async interruptSession(session:string,input:{commandId:string;turnId:string;clientId:string;origin?:'agent'|'ui'}) {
-    return this.intake.run(async()=>{
+    return this.activeTurnCompletion(session,input?.turnId,async()=>{
     if(!input||[input.commandId,input.turnId,input.clientId].some(value=>typeof value!=='string'||!value||value.length>512)||input.origin!==undefined&&!['agent','ui'].includes(input.origin))throw new RpcFault(-32602,'Bounded interruption identity and exact turn are required');
     const record=await this.record(session),signature=createHash('sha256').update(JSON.stringify([record.uri,input.turnId,input.clientId,input.origin??'ui'])).digest('hex');
     return this.withLock(record.uri,async()=>{
@@ -1878,7 +1896,7 @@ export class AmplifierHost {
     if(!Number.isSafeInteger(p.clientSeq)||p.clientSeq<0||!p.action||typeof p.action.type!=='string')throw new RpcFault(-32602,'Invalid dispatch');
     const origin={clientId:peer.clientId!,clientSeq:p.clientSeq},action=p.action as StateAction;
     try {
-      await this.intake.run(async()=>{
+      const execute=async()=>{
       if(peer.seenClientSeq.has(p.clientSeq)||p.clientSeq<=peer.lastClientSeq-1024)throw new Error('Client action sequence was already used or expired');peer.lastClientSeq=Math.max(peer.lastClientSeq,p.clientSeq);peer.seenClientSeq.add(p.clientSeq);for(const seq of peer.seenClientSeq)if(seq<=peer.lastClientSeq-1024)peer.seenClientSeq.delete(seq);
       const record=await this.record(p.channel);
       await this.withLock(record.uri,async()=>{
@@ -1908,7 +1926,7 @@ export class AmplifierHost {
         }
         if(action.type==='chat/toolCallConfirmed') {
           const active=this.active.get(record.uri),pending=active?.permissions.get(action.toolCallId);
-          if(!active||active.turnId!==action.turnId||!pending)throw new Error('Permission request is no longer pending');
+          if(p.channel!==record.chat.resource||!active?.busy||active.turnId!==action.turnId||!pending)throw new Error('Permission request is no longer pending');
           const options=pending.params.options;
           const option=action.selectedOptionId?options.find(o=>o.optionId===action.selectedOptionId):options.find(o=>action.approved?o.kind==='allow_once':o.kind==='reject_once');
           if(!option||action.approved!==option.kind.startsWith('allow_'))throw new Error('Permission option does not match approval');
@@ -1938,7 +1956,11 @@ export class AmplifierHost {
         }
         throw new Error(`Action is unsupported: ${action.type}`);
       });
-      });
+      };
+      const tool=action.type==='chat/toolCallComplete'?this.clientTools.get(action.toolCallId):undefined;
+      const session=p.channel?.startsWith('ahp-chat:/')?'ahp-session:/'+p.channel.slice('ahp-chat:/'.length):undefined,active=session?this.active.get(session):undefined;
+      const completion=action.type==='chat/toolCallComplete'&&!!tool&&tool.clientId===peer.clientId&&tool.chat===p.channel&&tool.turnId===action.turnId||action.type==='chat/toolCallConfirmed'&&!!active?.busy&&active.turnId===action.turnId&&active.permissions.has(action.toolCallId)||action.type==='chat/turnCancelled'&&!!active?.busy&&active.turnId===action.turnId&&!active.cancel;
+      await (completion?this.intake.continuation(execute):this.intake.run(execute));
     } catch(error) {this.emit(p.channel,action,origin,(error as Error).message);}
   }
   private async admitTurn(record:SessionRecord,channel:string,action:Extract<StateAction,{type:'chat/turnStarted'}>,origin:NonNullable<ActionEnvelope['origin']>,special?:SettledInput,trustedAgent=false) {
@@ -2426,9 +2448,9 @@ export class AmplifierHost {
     }
     return retiredAny;
   }
-  private quiescenceWork() {
+  private quiescenceWork(service=false) {
     const active=[...this.active.values()];
-    return {counts:{shuttingDown:this.closing?1:0,startingAgents:this.starting.size,activeTurns:active.filter(a=>a.busy).length,finishingTurns:active.filter(a=>a.finishing).length,activeControls:active.reduce((n,a)=>n+(a.controlDepth??0),0),nativeUpdates:active.reduce((n,a)=>n+(a.updateCount??0)+(a.observationPending??0),0),permissions:active.reduce((n,a)=>n+a.permissions.size,0),clientTools:this.clientTools.size,settledCallbacks:this.settledCallbacks.size,stoppedCallbacks:this.stoppedCallbacks.size,steeringDispositions:this.steeringTimers.size,terminalJobs:Number(this.store.db.prepare("SELECT count(*) n FROM terminals WHERE lifecycle='running'").get()!.n),pendingQueue:Number(this.store.db.prepare("SELECT count(*) n FROM queue_intents WHERE status='pending'").get()!.n),pendingSteering:Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE status IN ('pending','dispatching')").get()!.n)},gaps:active.filter(a=>!a.agent.closed&&((a.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle?.gracefulRetire!==true)).length?['resident-agent-has-no-atomic-retirement']:[]};
+    return {counts:{shuttingDown:this.closing?1:0,startingAgents:this.starting.size,activeTurns:active.filter(a=>a.busy).length,finishingTurns:active.filter(a=>a.finishing).length,activeControls:active.reduce((n,a)=>n+(a.controlDepth??0),0),nativeUpdates:active.reduce((n,a)=>n+(a.updateCount??0)+(a.observationPending??0),0),permissions:active.reduce((n,a)=>n+a.permissions.size,0),clientTools:this.clientTools.size,settledCallbacks:this.settledCallbacks.size,stoppedCallbacks:this.stoppedCallbacks.size,steeringDispositions:this.steeringTimers.size,terminalJobs:Number(this.store.db.prepare("SELECT count(*) n FROM terminals WHERE lifecycle='running'").get()!.n),...(service?{}:{pendingQueue:Number(this.store.db.prepare("SELECT count(*) n FROM queue_intents WHERE status='pending'").get()!.n),pendingSteering:Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE status IN ('pending','dispatching')").get()!.n)})},gaps:!service&&active.filter(a=>!a.agent.closed&&((a.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle?.gracefulRetire!==true)).length?['resident-agent-has-no-atomic-retirement']:[]};
   }
   private async quiesceAgents():Promise<{ready:boolean;reason?:string;unknown?:boolean}> {
     if(this.store.db.prepare("SELECT 1 FROM receipts WHERE client_id='host:retirement' AND json_extract(payload,'$.status') IN ('admitted','unknown') LIMIT 1").get())return {ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
@@ -2492,6 +2514,7 @@ export class AmplifierHost {
   }
   admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'retention-hide'>;retryRefused?:boolean}) {return this.intake.admit(input);}
   admitServiceStop(input:ServiceStopRequest) {return this.intake.admitServiceStop(input);}
+  closeServiceIntake(input:ServiceStopRequest) {return this.intake.closeServiceIntake(input);}
   serviceStopReceipt(commandId:string) {return this.intake.serviceStopReceipt(commandId);}
   inspectServiceLifecycle() {return this.intake.inspectServiceLifecycle();}
   releaseServiceStop(input:ServiceStopReleaseRequest) {return this.intake.releaseServiceStop(input);}
@@ -2637,7 +2660,7 @@ export class AmplifierHost {
     try {const result=await provider.action(request,{actorId:actor.actorId,clientId:actor.clientId??'',origin:actor.origin??'ui',session});this.store.finish(request.commandId,result.accepted?'completed':'failed');for(const topic of result.invalidate??[])this.invalidateCapability(topic,request.channel===ROOT?'host':request.channel);for(const update of result.updates??[])this.invalidateCapability(update.topic,update.scope);return result;}
     catch(error){this.store.finish(request.commandId,'unknown',(error as Error).message);throw error;}
     };
-    return access?this.intake.inspectOnly(execute):this.intake.run(execute);
+    return access?this.intake.inspectOnly(execute):actor.origin==='agent'&&actor.session&&this.scopedNativeContinuation(actor.session)?this.intake.continuation(execute):this.intake.run(execute);
   }
   private finishClientTool(id:string,result:Json) {
     const pending=this.clientTools.get(id);if(!pending)return;this.clientTools.delete(id);clearTimeout(pending.timer);
@@ -2650,7 +2673,7 @@ export class AmplifierHost {
   }
   /** Explicitly targeted AHP client tools; never enumerates or mirrors private UI state. */
   async invokeClientTool(session:string,targetClientId:string,toolName:string,args:Json):Promise<Json> {
-    return this.intake.run(async()=>{
+    return this.selectedCompletion(session,async()=>{
     const record=await this.record(session),active=this.active.get(record.uri);
     if(!active?.busy||!active.turnId)throw new RpcFault(-32009,'Client tool invocation requires an admitted active native turn');
     const client=record.state.activeClients.find(client=>client.clientId===targetClientId);
