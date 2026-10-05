@@ -272,6 +272,28 @@ Process exit alone is insufficient. These limits do not alter safe cold resume
 after definite refusal or confirmed retirement, or settle any prior unknown user
 input. See [durable causal checks](../../test/retirement-durable.test.ts).
 
+## Original context during an explicit history edit
+
+For Native peers advertising `historyEdits.originalContextVersion:1`, Host asks
+the existing passive history-before read for the selected original under the
+expected canonical revision. The user replaces text only. Native owns saved
+public descriptors and frozen quotes; Resources owns attachment access. Host
+resolves the descriptors through its existing attachment port, then forwards
+ordinary ACP content with the settled history revision request. It never accepts
+a client-supplied reconstruction of the original context or reads Resources
+storage directly. Missing context or unsupported mounted preservation refuses
+admission before the history rewrite; no resource-link fallback drops content.
+
+In forks, original opaque references remain unchanged. Existing Resources grant
+resolution also applies to later edited rows carrying those references, even
+though those new rows are not themselves copied rows. A missing grant remains
+unavailable; a public descriptor cannot grant access. No new store, wire method,
+background scan, or replay mechanism is introduced. Ordinary ACP prompts and
+older peers retain their negotiated behavior. The actual-peer test covers both
+context implementations, current/fork edits, frozen quotes, byte-exact file
+access, stale/unavailable refusal, source preservation, and reload without replay.
+See [integration checks](../../test/history-edit-context.integration.test.ts).
+
 ## Generic selected-session title metadata
 
 Optional per-engine `sessionMetadata` ports own canonical title persistence.
