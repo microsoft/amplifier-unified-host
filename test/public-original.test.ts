@@ -54,6 +54,15 @@ test('full resolved request budget rejects before durable admission or Native di
   }finally{await f.close();}
 });
 
+test('dispatch reuses the validated request snapshot despite later resolver-object mutation',async()=>{
+  const resolved={type:'text',text:'validated execution content'};const f=await fixture({config:{resolvePromptAttachment:async()=>[resolved]}});let stop:(()=>void)|undefined;
+  try{
+    stop=await f.host.observeSession(f.session,event=>{if(event.action.type==='chat/turnStarted')resolved.text='changed after durable admission';});
+    const id=randomUUID();await f.host.submitTurn(f.session,{commandId:id,text:'literal original',clientId:'caller',attachments:[{type:'resource',label:'a.txt',contentType:'text/plain',uri:`amplifier-attachment://${randomUUID()}/body?session=${encodeURIComponent(f.session)}`} ]});await wait(()=>f.host.store.receipt(id)?.status==='completed');
+    const prompt=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(resolved.text,'changed after durable admission');assert.equal(prompt.prompt[1].text,'validated execution content');assert.equal(prompt._meta['amplifier.dev/publicMessage'].blocks[0].text,'literal original');
+  }finally{stop?.();await f.close();}
+});
+
 test('runtime-negotiated capture requires a positive mounted report and preserves ordinary Host intent otherwise',async()=>{
   const declared={...capability,runtimeNegotiated:true},negative={version:1,supported:false,originalAuthority:'host',reason:'shared-request-view-unavailable'};
   for(const mounted of [undefined,negative,{...declared,supported:true}]){
