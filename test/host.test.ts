@@ -813,6 +813,11 @@ test('native mixed window refuses an unindexed ordering gap without scanning all
     const record=f.host.store.get(session)!;record.chat._meta={'amplifier.dev/history':{source:'native'}};f.host.store.save(record);
     await assert.rejects(client.subscribe(chat,{view:{turns:2}}),(error:any)=>error.code===-32013&&error.data?.reason==='unindexed-ordering-boundary');
     assert.equal((await readFile(log+'.passive','utf8')).trim(),'page');assert.equal(f.host.store.receipt(input.turnId)?.status,'completed');assert.equal(f.host.store.turns(chat).turns.length,1);
+    const context=await f.host.readSessionContext(session,2);
+    assert.deepEqual(context.historyContext,{source:'native',complete:false,reason:'unindexed-ordering-boundary'});
+    assert.deepEqual(context.messages.map(row=>row.text),['voice 4998','voice 4999']);
+    assert.equal(f.host.store.turns(chat).turns.length,1,'context reads do not rebaseline or widen shared history');
+    assert.equal((await readFile(log+'.passive','utf8')).trim().split('\n').length,3,'only bounded pages are read');
   }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
 });
 

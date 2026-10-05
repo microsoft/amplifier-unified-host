@@ -1346,7 +1346,8 @@ export class AmplifierHost {
     const limit=bounded(input.limit,50,50),selected=await this.record(session);
     return this.withLock(selected.uri,async()=>{
       const record=this.getRecord(selected.uri)!;
-      if(this.active.get(record.uri)?.busy||this.active.get(record.uri)?.controlDepth||record.chat.activeTurn||this.store.unknown(record.chat.resource)||this.relocationFence(record.uri)||this.transferFence(record.uri))throw new RpcFault(-32011,'History refresh requires conclusively idle execution; active or unknown inputs were preserved',{executed:false});
+      const uncertain=!!(this.store.unknown(record.chat.resource)||this.relocationFence(record.uri)||this.transferFence(record.uri));
+      if(this.active.get(record.uri)?.busy||this.active.get(record.uri)?.controlDepth||record.chat.activeTurn||uncertain)throw new RpcFault(-32011,'History refresh requires conclusively idle execution; active or unknown inputs were preserved',{executed:false,reason:uncertain?'history-unsettled':'history-busy',retryable:!uncertain});
       const page=await this.nativeHistory(record,limit);
       if(input.expectedHistoryRevision!==undefined&&page.revision!==input.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed before selected refresh',{executed:false});
       if((await this.inspectSessionHistory(record.uri)).historyRevision!==page.revision)throw new RpcFault(-32011,'Native history changed during selected refresh',{executed:false});
@@ -2441,7 +2442,18 @@ export class AmplifierHost {
   async readSessionContext(session:string,limit=12) {
     limit=bounded(limit,12,50);const record=await this.record(session);let turns:Array<Turn|NonNullable<ChatState['activeTurn']>>=this.store.turns(record.chat.resource,limit).turns;
     const generations=turns.filter(turn=>'state' in turn&&turn.state==='complete').slice(-8).map(turn=>({event:'generation.finished',generation_id:turn.id,input_ids:[turn.id],status:'completed',completed:true,...turnOutcome(turn.responseParts,true)}));
-    if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native')turns=(await this.selectedHistory(record,limit)).turns;
+    let historyContext:Json={source:'host',complete:false};
+    if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native'){
+      try{turns=(await this.selectedHistory(record,limit)).turns;historyContext={source:'merged',complete:false};}
+      catch(error){
+        if(!(error instanceof RpcFault)||error.code!==-32013||(error.data as Json)?.reason!=='unindexed-ordering-boundary')throw error;
+        // A bounded context snapshot can use canonical recent messages without
+        // inventing the relative order of older host-only turns. Shared history
+        // subscriptions retain their strict reconciliation boundary.
+        turns=(await this.nativeHistory(record,limit)).turns;
+        historyContext={source:'native',complete:false,reason:'unindexed-ordering-boundary'};
+      }
+    }
     const current=this.getRecord(record.uri)!.chat.activeTurn;
     if(current)turns=[...turns.filter(turn=>turn.id!==current.id),current].slice(-limit);
     const messages:Json[]=[];
@@ -2463,7 +2475,7 @@ export class AmplifierHost {
     const actions=Object.keys(this.config.capabilities?.manifest.actions??{});
     return {...state,activity:{status:state.status,activeTurnId:state.activeTurnId??null,executionRevision:state.executionRevision,configurationRevision:state.configurationRevision},
       capabilities:{source:'host-advertisement',topics:Object.keys(this.config.capabilities?.manifest.topics??{}).slice(0,60),actions:actions.slice(0,80),truncated:actions.length>80,nativeTools:'not-inspected',requiresBackendExecution:true},
-      selection:selections,messages:messages.slice(-limit),generations,recentLimit:limit};
+      selection:selections,messages:messages.slice(-limit),generations,recentLimit:limit,historyContext};
   }
   /** Native-only recordings become available on the next standard history read. */
   async invalidateNativeHistory(session:string) {
