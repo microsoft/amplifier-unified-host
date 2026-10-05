@@ -69,10 +69,10 @@ test('only matching generation end clears mounted evidence; restart cannot reuse
   await f.host.nativeControl(f.session,'fixture.report',{type:'generation.started',generation_id:generation,activeInputId:'input',activeSteering:capability});await wait(()=>f.mount()?.supported===true);
   await f.finish('input');
   // Simulate retained metadata from a prior lifetime; no runtime/report is mounted at replacement startup.
-  const record=f.host.store.get(f.session)!;record.state._meta={...record.state._meta,'amplifier.dev/host':{activeSteering:{version:1,supported:true,activeTurnId:'old',generationId:'old'}}};f.host.store.save(record);
+  const record=f.host.store.get(f.session)!;record.state._meta={...record.state._meta,retainedSibling:{keep:true},'amplifier.dev/host':{retainedHostSibling:{keep:true},activeSteering:{version:1,supported:true,activeTurnId:'old',generationId:'old'}}};f.host.store.save(record);
   await f.client.shutdown();await f.host.close();f.setClosed();
   const restarted=await createHost({stateDirectory:join(f.dir,'host'),allowedWorkspaceRoots:[f.dir],engines:[{id:'fixture',command:process.execPath,args:[join(f.dir,'peer.mjs')]}]});
-  try{assert.deepEqual(restarted.store.get(f.session)?.state._meta?.['amplifier.dev/host']?.activeSteering,{version:1,supported:false});}finally{await restarted.close();}
+  try{const metadata=restarted.store.get(f.session)?.state._meta;assert.deepEqual(metadata?.['amplifier.dev/host']?.activeSteering,{version:1,supported:false});assert.deepEqual(metadata?.retainedSibling,{keep:true});assert.deepEqual(metadata?.['amplifier.dev/host']?.retainedHostSibling,{keep:true});}finally{await restarted.close();}
  }finally{await f.close();}
 });
 

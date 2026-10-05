@@ -172,8 +172,6 @@ export class AmplifierHost {
     if(!['127.0.0.1','localhost','::1'].includes(config.host??'127.0.0.1')&&!config.bearerToken)throw new Error('Non-loopback listeners require authenticated gateway/bearer token');
     if(config.conversationPresentation){const c=config.catalog;if(!c?.projectSessionVisibility||!c.sessionVisibilityProjectionStatus||!c.sessionVisibilityProjectionReceipt||!c.status)throw Error('Conversation presentation requires the indexed visibility projection protocol');}
     this.store=new Store(config.stateDirectory,config.replayLimit);
-    // A persisted report cannot attest a mounted generation in this new lifetime.
-    this.store.db.prepare(`UPDATE sessions SET state=json_set(state,'$._meta."amplifier.dev/host".activeSteering',json(?)) WHERE json_type(state,'$._meta."amplifier.dev/host".activeSteering') IS NOT NULL`).run(JSON.stringify({version:1,supported:false}));
     if(!config.conversationPresentation&&this.store.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='presentation_state'").get()){this.store.close();throw Error('Retained conversation presentation authority requires its configured owner; it cannot be disabled to bypass a fence');}
     this.managedFiles=new ManagedFilesJournal(this.store.db);
     try{if(config.managedSessionRoot)this.managed=new ManagedAllocations(config.managedSessionRoot);}catch(error){this.store.close();throw error;}
@@ -226,6 +224,11 @@ export class AmplifierHost {
     });
     this.retireTimer=setInterval(()=>void this.retireIdle(),10000);this.retireTimer.unref();
     this.store.db.exec("UPDATE terminals SET payload=json_set(payload,'$.lifecycle.status','exited'),lifecycle='exited' WHERE lifecycle='running'");
+    // Publish the lifetime reset so replay reconnects also discard old mounted evidence.
+    for(const row of this.store.db.prepare(`SELECT uri FROM sessions WHERE json_type(state,'$._meta."amplifier.dev/host".activeSteering') IS NOT NULL`).all()){
+      const record=this.getRecord(String(row.uri))!,metadata=record.state._meta!,host=metadata['amplifier.dev/host'] as Json;
+      if(JSON.stringify(host.activeSteering)!==JSON.stringify({version:1,supported:false}))this.emit(record.uri,{type:'session/metaChanged',_meta:{...metadata,'amplifier.dev/host':{...host,activeSteering:{version:1,supported:false}}}} as StateAction);
+    }
     // End interrupted projections without replaying the accepted command or past tool work.
     for(const row of this.store.db.prepare("SELECT uri FROM sessions WHERE json_extract(chat,'$.activeTurn') IS NOT NULL").all()) {
       const record=this.getRecord(row.uri as string)!;
