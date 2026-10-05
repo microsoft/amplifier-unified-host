@@ -2838,6 +2838,7 @@ export class AmplifierHost {
   }
   async close() {
     this.closing=true;
+    this.intake.hostClosing();
     clearInterval(this.retireTimer);
     for(const observer of this.observers){observer.closed=true;observer.queue=[];}this.observers.clear();
     for(const peer of this.peers)peer.socket.terminate();

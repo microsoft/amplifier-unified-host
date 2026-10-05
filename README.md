@@ -987,9 +987,12 @@ const admission = await host.admitServiceStop({
 await. Its `admitted:true,phase:'closed'` receipt proves only closure; measured
 `evidence.activeWork` can be nonzero or unknown. `admitServiceStop` uses the same
 command/fence/identity and waits for actual local work to drain, then returns
-`phase:'held',evidence.activeWork:0`. Deadline expiry retains closed, unconfirmed
-state without interrupting or replaying work. An explicit same-command observation
-can finish a timed-out drain; it cannot clear an unknown platform stop outcome.
+`phase:'held',evidence.activeWork:0`. Known running work remains pending without a
+duration limit. Losing or timing out the caller's observation does not cancel the
+original drain or change it to unknown. Passive reads of the same command receipt
+observe its eventual settlement without replaying admission. Host shutdown/restart,
+unmeasurable work and unknown platform stop outcomes still require authenticated
+reconciliation; a sampled idle state cannot clear them.
 New starts and configuration remain closed while exact admitted tool results,
 approvals, cancellation, startup/turn/control callbacks and completion projections
 continue under counted, expiring authority. Durable waiting intents, business
