@@ -1,3 +1,4 @@
+import {turnOutcome} from './turn-outcome.js';
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
 import {PUBLIC_MESSAGE_META,publicMessage,capturePublicMessage,supportsPublicOriginal,mountedPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
@@ -2412,8 +2413,8 @@ export class AmplifierHost {
     finally {clearTimeout(timer);}
     const current=this.store.receipt(commandId)!,row=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,commandId);
     const turn=row?JSON.parse(row.payload as string):undefined;
-    const text=(turn?.responseParts??[]).filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n').slice(0,50000);
-    return {generation_id:commandId,status:current.status,completed:current.status==='completed',text,detail:current.detail,...(current.retryEligibility?{executed:false,retryEligibility:current.retryEligibility,observationAdmission:current.observationAdmission}:{}),workContinues:['admitted','dispatching'].includes(current.status)};
+    const outcome=turnOutcome(turn?.responseParts??[],current.status==='completed');
+    return {generation_id:commandId,status:current.status,completed:current.status==='completed',...outcome,detail:current.detail,...(current.retryEligibility?{executed:false,retryEligibility:current.retryEligibility,observationAdmission:current.observationAdmission}:{}),workContinues:['admitted','dispatching'].includes(current.status)};
   }
   /** Exact host-indexed input, never a recent-window search or eager native transcript read. */
   async readUserMessage(session:string,messageId:string,options:{maxBytes?:number}={}):Promise<Json> {
@@ -2439,7 +2440,7 @@ export class AmplifierHost {
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
     limit=bounded(limit,12,50);const record=await this.record(session);let turns:Array<Turn|NonNullable<ChatState['activeTurn']>>=this.store.turns(record.chat.resource,limit).turns;
-    const generations=turns.filter(turn=>'state' in turn&&turn.state==='complete').slice(-8).map(turn=>({event:'generation.finished',generation_id:turn.id,input_ids:[turn.id],text:turn.responseParts.filter(part=>part.kind==='markdown').map(part=>(part as any).content??'').join('\n').slice(0,12000)}));
+    const generations=turns.filter(turn=>'state' in turn&&turn.state==='complete').slice(-8).map(turn=>({event:'generation.finished',generation_id:turn.id,input_ids:[turn.id],status:'completed',completed:true,...turnOutcome(turn.responseParts,true)}));
     if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native')turns=(await this.selectedHistory(record,limit)).turns;
     const current=this.getRecord(record.uri)!.chat.activeTurn;
     if(current)turns=[...turns.filter(turn=>turn.id!==current.id),current].slice(-limit);
@@ -2457,7 +2458,12 @@ export class AmplifierHost {
       const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
       if(text&&!voiceDelivery)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
     }
-    return {...await this.inspectSession(session),status:record.chat.status,messages:messages.slice(-limit),generations,recentLimit:limit};
+    const state=await this.inspectSession(session);
+    const selections=Object.entries(record.state.config?.values??{}).filter(([key])=>['model','provider','reasoning_effort','reasoning','thinking','bundle','mode'].includes(key)).map(([id,value])=>({id,value:String(value).slice(0,300)}));
+    const actions=Object.keys(this.config.capabilities?.manifest.actions??{});
+    return {...state,activity:{status:state.status,activeTurnId:state.activeTurnId??null,executionRevision:state.executionRevision,configurationRevision:state.configurationRevision},
+      capabilities:{source:'host-advertisement',topics:Object.keys(this.config.capabilities?.manifest.topics??{}).slice(0,60),actions:actions.slice(0,80),truncated:actions.length>80,nativeTools:'not-inspected',requiresBackendExecution:true},
+      selection:selections,messages:messages.slice(-limit),generations,recentLimit:limit};
   }
   /** Native-only recordings become available on the next standard history read. */
   async invalidateNativeHistory(session:string) {
