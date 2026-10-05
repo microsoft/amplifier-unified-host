@@ -559,8 +559,12 @@ and agent capability owners. This requires the selected native agent's
 `activeSteering` v1 request-boundary capability. A pending message can be edited,
 replaced or removed before consumption. While idle it stays on disk without
 starting a runtime. Once a generation starts, the host captures its immutable
-turn/generation identity, durably reserves the input ID, removes the pending
-message using the standard AHP action, and invokes negotiated `steer.submit`.
+turn/generation identity, durably reserves the input ID and appends a standard
+`systemNotification` containing `Steering submitted: ` plus the exact original
+text in that same turn. The notice and receipt commit before its publication,
+pending-message removal, and negotiated `steer.submit`. Its
+`amplifier.dev/steering` metadata contains only `inputId` and `activeTurnId`;
+submission does not claim application or a physical Native history identity.
 It never starts a second prompt collector. The mounted loop may still refuse an
 unsupported provider mode; no legacy steering fallback is used.
 
@@ -573,7 +577,12 @@ to a later turn. Restart also holds pending input; uncertain delivered input
 fences execution. An explicit edit can re-arm an unconsumed held intent. A new ID
 is needed for a distinct request after a consumed intent. Exact message lookup
 preserves admitted steering provenance, and bounded selected context includes
-confirmed applied corrections. No required history is fabricated or discarded.
+confirmed applied corrections. Bounded explicit idle history refresh retains the
+whole live response when any admitted steering original lacks a matching
+canonical user steering descriptor (Native input v1, exact ID, original turn,
+and exact text). Fully matched turns can refresh independently. The reply reports
+`retainedTurns` and `unresolvedSteeringInputs`; clients resubscribe to the selected
+view. No required history is fabricated or discarded.
 
 Pending steering is bounded by 1,024 intents / 16 MiB globally and one editable
 pending message per chat. At most 16 delivery calls and 50 unconfirmed steering

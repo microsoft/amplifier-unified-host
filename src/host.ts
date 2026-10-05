@@ -1332,12 +1332,26 @@ export class AmplifierHost {
       const page=await this.nativeHistory(record,limit);
       if(input.expectedHistoryRevision!==undefined&&page.revision!==input.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed before selected refresh',{executed:false});
       if((await this.inspectSessionHistory(record.uri)).historyRevision!==page.revision)throw new RpcFault(-32011,'Native history changed during selected refresh',{executed:false});
-      let refreshedTurns=0;
+      let refreshedTurns=0,retainedTurns=0,unresolvedSteeringInputs=0;
       this.store.transaction(()=>{
         for(const canonical of page.turns){
           const row=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,canonical.id);
           if(!row||this.store.receipt(canonical.id)?.status!=='completed')continue;
           const live=JSON.parse(String(row.payload)) as Turn;
+          const canonicalInputs=new Map<string,string>(),conflictingInputs=new Set<string>();
+          for(const part of canonical.responseParts){
+            if(part.kind!=='systemNotification')continue;
+            const history=part._meta?.['amplifier.dev/history'] as Json|undefined,input=history?.nativeInput,message=history?.message,locator=history?.rowLocator;
+            if(history?.inputOrigin!=='steering'||history.activeInputId!==canonical.id||input?.version!==1||input.kind!=='steer'||typeof input.id!=='string'||!input.id||input.id.length>128||/[\x00-\x1f\x7f]/.test(input.id)||typeof history.messageId!=='string'||!history.messageId||message?.origin?.kind!=='user'||typeof message.text!=='string')continue;
+            if(locator&&(locator.sessionId!==record.nativeSessionId||locator.messageId!==history.messageId))continue;
+            if(canonicalInputs.has(input.id)&&canonicalInputs.get(input.id)!==message.text)conflictingInputs.add(input.id);
+            canonicalInputs.set(input.id,message.text);
+          }
+          let missing=0;
+          for(const input of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status IN ('dispatching','applied','held','unknown')").iterate(record.chat.resource,canonical.id))if(conflictingInputs.has(String(input.id))||canonicalInputs.get(String(input.id))!==JSON.parse(String(input.message)).text)missing++;
+          // A bounded page's absence is not cancellation. Keep this whole live
+          // response rather than dropping originals or guessing fragment order.
+          if(missing){retainedTurns++;unresolvedSteeringInputs+=missing;continue;}
           // Native history is canonical for persisted response boundaries; the
           // live host remains authority for admission outcome and input provenance.
           const responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
@@ -1347,7 +1361,7 @@ export class AmplifierHost {
         }
         record.chat._meta={...record.chat._meta,'amplifier.dev/history':{source:'native',available:true,revision:page.revision,diagnostics:page.diagnostics}};this.store.save(record);
       });
-      return {refreshed:true,chat:record.chat.resource,revision:page.revision,refreshedTurns,view:{turns:limit},requiresSubscribe:true};
+      return {refreshed:true,chat:record.chat.resource,revision:page.revision,refreshedTurns,retainedTurns,unresolvedSteeringInputs,view:{turns:limit},requiresSubscribe:true};
     });
       });
   }
@@ -1857,7 +1871,7 @@ export class AmplifierHost {
     if(this.presentation){const indexed=await this.config.catalog.get(record.uri);if(indexed?.nativeSessionId)this.presentation.retainMapping(indexed as unknown as Json);}
     if(this.config.catalog.projectSessionArchives)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(record.uri,Number(!!(record.summary.status & SessionStatus.IsArchived)));
   }
-  private emit(channel:string,action:StateAction,origin?:ActionEnvelope['origin'],rejectionReason?:string):ActionEnvelope {
+  private emit(channel:string,action:StateAction,origin?:ActionEnvelope['origin'],rejectionReason?:string,publication?:{commit?:()=>void}):ActionEnvelope {
     let previous=this.getRecord(channel);
     // Read is shared session metadata. Record a standard unread action at work
     // boundaries so the session reducer cannot preserve an obsolete read flag.
@@ -1892,20 +1906,23 @@ export class AmplifierHost {
       }
       return this.store.append(channel,action,origin,rejectionReason);
     });
-    if(record&&!rejectionReason){if(record.chat.activeTurn)this.hotRecords.set(record.uri,record);else this.hotRecords.delete(record.uri);}
-    if(record&&!rejectionReason&&['chat/turnStarted','chat/turnResume','chat/turnComplete','chat/turnCancelled','chat/error','chat/inputRequested','session/inputNeededSet','session/inputNeededRemoved'].includes(action.type))this.library?.point(record.uri);
-    for(const peer of this.peers)if(peer.subscriptions.has(channel)||origin?.clientId===peer.clientId)this.send(peer,{jsonrpc:'2.0',method:'action',params:envelope});
-    for(const observer of this.observers)if(observer.session===channel||observer.chat===channel){
-      const bytes=Buffer.byteLength(JSON.stringify(envelope));
-      if(observer.queue.length>=128||observer.bytes+bytes>512*1024){observer.closed=true;this.observers.delete(observer);observer.queue=[];try{observer.onError?.(new Error('Scoped observer fell behind; reload selected state'));}catch{}continue;}
-      observer.queue.push(envelope);observer.bytes+=bytes;
-      if(!observer.running){observer.running=true;void(async()=>{try{while(!observer.closed&&observer.queue.length){const event=observer.queue.shift()!;observer.bytes-=Buffer.byteLength(JSON.stringify(event));await observer.listener(structuredClone(event));}}catch(error){observer.closed=true;this.observers.delete(observer);observer.queue=[];try{observer.onError?.(error as Error);}catch{}}finally{observer.running=false;}})();}
-    }
-    if(record&&!rejectionReason&&channel===record.chat.resource&&action.type!=='chat/turnsLoaded'&&JSON.stringify(this.chatSummary(record.chat))!==priorSummary) {
-      const changes=this.chatSummary(record.chat);
-      this.emit(record.uri,{type:'session/chatUpdated',chat:channel,changes:{title:changes.title,status:changes.status,modifiedAt:changes.modifiedAt}} as StateAction);
-      this.notify('root/sessionSummaryChanged',{channel:ROOT,session:record.uri,changes:{status:this.getRecord(record.uri)!.summary.status,modifiedAt:record.chat.modifiedAt}});
-    }
+    const publish=()=>{
+      if(record&&!rejectionReason){if(record.chat.activeTurn)this.hotRecords.set(record.uri,record);else this.hotRecords.delete(record.uri);}
+      if(record&&!rejectionReason&&['chat/turnStarted','chat/turnResume','chat/turnComplete','chat/turnCancelled','chat/error','chat/inputRequested','session/inputNeededSet','session/inputNeededRemoved'].includes(action.type))this.library?.point(record.uri);
+      for(const peer of this.peers)if(peer.subscriptions.has(channel)||origin?.clientId===peer.clientId)this.send(peer,{jsonrpc:'2.0',method:'action',params:envelope});
+      for(const observer of this.observers)if(observer.session===channel||observer.chat===channel){
+        const bytes=Buffer.byteLength(JSON.stringify(envelope));
+        if(observer.queue.length>=128||observer.bytes+bytes>512*1024){observer.closed=true;this.observers.delete(observer);observer.queue=[];try{observer.onError?.(new Error('Scoped observer fell behind; reload selected state'));}catch{}continue;}
+        observer.queue.push(envelope);observer.bytes+=bytes;
+        if(!observer.running){observer.running=true;void(async()=>{try{while(!observer.closed&&observer.queue.length){const event=observer.queue.shift()!;observer.bytes-=Buffer.byteLength(JSON.stringify(event));await observer.listener(structuredClone(event));}}catch(error){observer.closed=true;this.observers.delete(observer);observer.queue=[];try{observer.onError?.(error as Error);}catch{}}finally{observer.running=false;}})();}
+      }
+      if(record&&!rejectionReason&&channel===record.chat.resource&&action.type!=='chat/turnsLoaded'&&JSON.stringify(this.chatSummary(record.chat))!==priorSummary) {
+        const changes=this.chatSummary(record.chat);
+        this.emit(record.uri,{type:'session/chatUpdated',chat:channel,changes:{title:changes.title,status:changes.status,modifiedAt:changes.modifiedAt}} as StateAction);
+        this.notify('root/sessionSummaryChanged',{channel:ROOT,session:record.uri,changes:{status:this.getRecord(record.uri)!.summary.status,modifiedAt:record.chat.modifiedAt}});
+      }
+    };
+    if(publication)publication.commit=publish;else publish();
     return envelope;
   }
   private queueMessage(message:Message,held:boolean,reason?:string):Message {
@@ -2004,7 +2021,14 @@ export class AmplifierHost {
     const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
     const original=this.captureOriginal(active,message,id,'steer.submit');
     const params=this.inputWireParams({sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})});
-    this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);});
+    const submitted={type:'chat/responsePart',turnId:activeInputId,part:{kind:'systemNotification',content:'Steering submitted: '+message.text,_meta:{'amplifier.dev/steering':{inputId:id,activeTurnId:activeInputId}}}} as StateAction;
+    const projectionBytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(submitted));
+    if(projectionBytes>(this.config.maxActiveProjectionBytes??8*1024*1024))throw new RpcFault(-32000,'Active steering view exceeds its byte budget; original pending input is retained',{executed:false});
+    const publication:{commit?:()=>void}={};
+    // Preserve the admitted original in the same durable turn before removing
+    // its single pending slot or making a Native request. Submitted is not applied.
+    this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);this.emit(record.chat.resource,submitted,undefined,undefined,publication);});
+    active.projectionBytes=projectionBytes;publication.commit!();
     this.emit(record.chat.resource,{type:'chat/pendingMessageRemoved',kind:'steering',id} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(id);this.store.finish(id,'dispatching');
     let acceptanceTimer:ReturnType<typeof setTimeout>|undefined;
     const request=this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',params));

@@ -115,10 +115,11 @@ export class Store {
   get count(): number { return Number(this.db.prepare('SELECT count(*) AS n FROM sessions').get()!.n); }
   transaction<T>(work: () => T): T {
     if(this.transactionOpen)return work();
+    const replayBytes=this.replayBytes;
     this.db.exec('BEGIN IMMEDIATE');
     this.transactionOpen=true;
     try { const result = work(); this.db.exec('COMMIT');this.transactionOpen=false;const channels=[...this.receiptChanges];this.receiptChanges.clear();for(const channel of channels)this.notifyReceipt(channel);return result; }
-    catch (error) {this.receiptChanges.clear();if(this.transactionOpen)this.db.exec('ROLLBACK');throw error;}
+    catch (error) {this.replayBytes=replayBytes;this.receiptChanges.clear();if(this.transactionOpen)this.db.exec('ROLLBACK');throw error;}
     finally {this.transactionOpen=false;}
   }
   get(uri: string): SessionRecord | undefined {
