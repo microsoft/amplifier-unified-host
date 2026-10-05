@@ -11,7 +11,9 @@ for await(const line of createInterface({input:process.stdin})){
   if(config.instance!==undefined&&config.instance!=='configured'||!['first-model','second-model','no-effort'].includes(model)||config.effort!==undefined&&!efforts.includes(config.effort)){
     process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32602,message:'Invalid fixture selection',data:{executed:false,runtimeStarted:false}}})+'\n');continue;
   }
-  const schema={type:'object',properties:{instance:{type:'string',enum:['configured']},model:{type:'string',enum:['first-model','second-model','no-effort']},...(efforts.length?{effort:{type:'string',enum:efforts}}:{})},required:['instance','model']};
+  const schema={type:'object',properties:{instance:{type:'string',title:'Provider instance',enum:['configured']},model:{type:'string',title:'Model',enum:['first-model','second-model','no-effort']},...(efforts.length?{effort:{type:'string',title:'Reasoning effort',enum:efforts}}:{})},required:['instance','model']};
+  if(process.env.MISSING_TITLE)delete schema.properties.model.title;
+  if(process.env.NONSTRING_TITLE)schema.properties.model.title=false;
   const values={instance:'configured',model,...(efforts.length?{effort:config.effort??efforts.at(-1)}:{})};
   if(process.env.BAD_RESOLUTION)values.model='first-model';
   if(process.env.NO_DEFAULT_MODEL)delete values.model;
