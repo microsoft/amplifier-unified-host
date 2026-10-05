@@ -188,6 +188,14 @@ export class QuiescenceGate {
   if(['service-stop','initial-start'].includes(input.purpose as string))throw new QuiescenceError('Service stop requires its identity-bound admission API',{executed:false});
   return this.admitBound(input);
  }
+ /** Explicit offline backup/handoff preparation. Ordinary shutdown never uses
+  * this stronger owner-exclusion path. The retained identity-bound participant
+  * protocol supplies real capture coverage, not a census inferred from exit. */
+ async admitMaintenanceServiceStop(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
+  const expected=identity(input.expected),configured=this.config?.serviceLifecycle;
+  if(!configured||!sameIdentity(expected,configured.identity))throw new QuiescenceError('Maintenance stop requires the exact configured running service identity',{executed:false});
+  return this.admitBound({commandId:input.commandId,purpose:'service-stop',serviceIdentity:expected});
+ }
  async admitServiceStop(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
   const closed=await this.closeServiceIntake(input);
   if(!closed.intakeClosed||'released' in closed)return closed;

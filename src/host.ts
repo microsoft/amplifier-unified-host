@@ -2844,6 +2844,7 @@ export class AmplifierHost {
   }
   admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'initial-start'|'retention-hide'>;retryRefused?:boolean}) {return this.intake.admit(input);}
   admitServiceStop(input:ServiceStopRequest) {return this.intake.admitServiceStop(input);}
+  admitMaintenanceServiceStop(input:ServiceStopRequest) {return this.intake.admitMaintenanceServiceStop(input);}
   closeServiceIntake(input:ServiceStopRequest) {return this.intake.closeServiceIntake(input);}
   serviceStopReceipt(commandId:string) {return this.intake.serviceStopReceipt(commandId);}
   inspectServiceLifecycle() {return this.intake.inspectServiceLifecycle();}

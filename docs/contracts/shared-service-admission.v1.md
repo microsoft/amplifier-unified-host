@@ -52,6 +52,16 @@ locks remain. Retained legacy service holds cannot be reclassified as this new
 shared model. The historical participant-fence fixture suite tests their retained
 release/reconciliation path separately, not ordinary shared admission.
 
+An explicit trusted `admitMaintenanceServiceStop` is available for offline archive
+or existing-state handoff preparation. It uses the existing identity-bound owner
+exclusion and service-specific release protocol: every required owner must support
+and acquire its persisted fence, and Native residents must retire before writer
+exclusion. Busy or unsupported owners refuse; lost acknowledgements remain unknown.
+This separate API never upgrades a shared drain receipt or retries its effect.
+Its command signature is distinct from ordinary shared admission. Only genuinely
+acquired owner coverage may be used by the offline supervisor snapshot contract.
+No browser or ordinary service-stop caller implicitly opts into this operation.
+
 Replacement B restores A's real fence from the same Host DB and starts closed.
 `releaseServiceStop` authenticates exact A, B, stop/resume, confirmed unit exit and
 readiness. Installation/data scope/owner remain constant and B's instance differs.
