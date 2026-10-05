@@ -165,3 +165,31 @@ test('paged grant continuation spans more than64 cards; unknown retry never refo
     targetRows[0]!.publicMessage=structuredClone(targetRows[0]!.publicMessage);(targetRows[0]!.publicMessage.blocks[1] as PublicCard).name='forged.pdf';await assert.rejects(f.host.verifyOriginalForkAttachment({version:2,commandId,target:{row:targetRows[0]!.locator,blockIndex:1}}),/changed/);
   }finally{await f.close();}
 });
+
+for(const originals of [false,true])test(`historical steering stays chronological inside its original turn (${originals?'public originals':'native chunks'})`,async()=>{
+  const f=await fixture({capability:originals?capability:{version:1,routes:[],variants:[]}});try{
+    const native=f.host.store.get(f.session)!.nativeSessionId!;
+    const original='fae0e058-e6ef-4f41-9717-a9c3dd2cd95e',steer='bd01da78-5019-4c83-b2fc-020fc6bb98de',queue='b6f95283-92e4-4a7f-b424-44353fbcd66d';
+    const loc=(messageId:string,position:number)=>({sessionId:native,messageId,position,historyEpoch:null});
+    const a=loc('initial-row',0),b=loc('steering-row',100),c=loc('queue-row',200);
+    const uri=`amplifier-attachment://${randomUUID()}/body?session=ahp-session%3A%2Fsource`;
+    const meta=(locator:any,id:string,extra:any={})=>({'amplifier.dev/history':{messageId:locator.messageId,rowLocator:locator,nativeInput:{version:1,kind:id===steer?'steer':'user',id},inputOrigin:id===steer?'steering':'user',...extra}});
+    const user=(locator:any,id:string,text:string,extra:any={})=>({sessionUpdate:'user_message_chunk',content:{type:'text',text},_meta:meta(locator,id,extra)});
+    const assistant=(text:string,id:string)=>({sessionUpdate:'agent_message_chunk',content:{type:'text',text},_meta:{'amplifier.dev/history':{messageId:id}}});
+    const groups=[{id:original,state:'unknown',updates:[user(a,original,'Initial question'),assistant('Before steering','same-assistant'),{sessionUpdate:'tool_call',toolCallId:'checkpoint',kind:'execute',title:'Checkpoint',status:'completed',rawInput:{command:'checkpoint'},rawOutput:'done'},user(b,steer,'Please mention a document',{activeInputId:original}),{sessionUpdate:'user_message_chunk',content:{type:'resource_link',uri,name:'document.pdf',mimeType:'application/pdf'},_meta:meta(b,steer,{activeInputId:original})},assistant('After steering','same-assistant')]},{id:queue,state:'unknown',updates:[user(c,queue,'Suggest four-word title'),assistant('Four Word Welcome Title','answer-queue')]}];
+    const rows=[{locator:a,publicMessage:{version:1,inputId:original,capture:'host-standard',blocks:[{type:'text',text:'Exact initial question'}]}},{locator:b,publicMessage:{version:1,inputId:steer,capture:'host-standard',blocks:[{type:'text',text:'Exact steering question'},{type:'attachment',reference:{owner:'resources',id:uri},name:'exact-document.pdf',mimeType:'application/pdf'}]}},{locator:c,publicMessage:{version:1,inputId:queue,capture:'host-standard',blocks:[{type:'text',text:'Exact queued question'}]}}];
+    const data=JSON.stringify({[native]:{revision:'recorded-steering',rows,turnGroups:groups}});await writeFile(f.data,data);
+    const page=await (f.host as any).nativeHistory(f.host.store.get(f.session),50),turn=page.turns[0];
+    assert.deepEqual(page.turns.map((t:any)=>t.id),[original,queue]);
+    assert.equal(turn.message.text,originals?'Exact initial question':'Initial question');assert.equal(turn.message.attachments,undefined);
+    assert.deepEqual(turn.responseParts.map((part:any)=>part.kind),['markdown','toolCall','systemNotification','markdown','error']);
+    assert.equal(turn.responseParts[0].content,'Before steering');assert.equal(turn.responseParts[3].content,'After steering');
+    const notification=turn.responseParts[2],history=notification._meta['amplifier.dev/history'];
+    assert.equal(notification.content,`Steering input: ${originals?'Exact steering question':'Please mention a document'}`);
+    assert.equal(history.activeInputId,original);assert.deepEqual(history.rowLocator,b);assert.equal(history.messageId,b.messageId);assert.equal(history.nativeInput.id,steer);
+    assert.equal(history.message.origin.kind,'user');assert.equal(history.message.attachments.length,1);assert.equal(history.message.attachments[0].label,originals?'exact-document.pdf':'document.pdf');
+    assert.equal(turn.responseParts.at(-1).error.errorType,'NATIVE_OUTCOME_UNKNOWN');assert.equal(page.turns[1].message.text,originals?'Exact queued question':'Suggest four-word title');
+    assert.equal(await readFile(f.data,'utf8'),data);await assert.rejects(readFile(f.log));
+    const repeated=await (f.host as any).nativeHistory(f.host.store.get(f.session),50);assert.equal(repeated.turns[0].responseParts.filter((p:any)=>p.kind==='systemNotification').length,1);
+  }finally{await f.close();}
+});
