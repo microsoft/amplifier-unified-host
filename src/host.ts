@@ -1380,8 +1380,13 @@ export class AmplifierHost {
           if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&toolIds(live.responseParts)===toolIds(responseParts)){
             const savedText=responseParts.filter(part=>part.kind==='markdown'),liveText=live.responseParts.filter(part=>part.kind==='markdown');
             if(savedText.length===liveText.length&&savedText.every((part,index)=>responseText([part])===responseText([liveText[index]]))){
-              let textIndex=0;
-              responseParts=live.responseParts.map(part=>part.kind==='markdown'?{...part,_meta:{...(part as Json)._meta,...(savedText[textIndex++] as Json)._meta}}:part);
+              const savedSteering=new Map(responseParts.filter(part=>(part as Json)._meta?.['amplifier.dev/history']?.inputOrigin==='steering').map(part=>[(part as Json)._meta['amplifier.dev/history'].nativeInput.id,part]));
+              const steeringId=(part:Json)=>part._meta?.['amplifier.dev/steering']?.inputId??(part._meta?.['amplifier.dev/history']?.inputOrigin==='steering'?part._meta['amplifier.dev/history'].nativeInput?.id:undefined);
+              const liveSteering=live.responseParts.map(part=>steeringId(part as Json)).filter(Boolean);
+              if(JSON.stringify(liveSteering)===JSON.stringify([...savedSteering.keys()])){
+                let textIndex=0;
+                responseParts=live.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN').map(part=>part.kind==='markdown'?{...part,_meta:{...(part as Json)._meta,...(savedText[textIndex++] as Json)._meta}}:savedSteering.get(steeringId(part as Json))??part);
+              }
             }
           }
 
