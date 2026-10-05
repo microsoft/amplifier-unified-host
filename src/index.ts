@@ -21,3 +21,5 @@ export type {SessionMetadataAdapter,SessionMetadataContext,SessionTitleSnapshot,
 export {SESSION_METADATA_KEY} from './session-metadata.js';
 
 export type {LibraryQuery,LibraryRead,HostObservation,LiveFact} from './library-index.js';
+
+export type * from './public-original.js';

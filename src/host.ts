@@ -1,4 +1,5 @@
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
+import {PUBLIC_MESSAGE_META,capturePublicMessage,supportsPublicOriginal,mountedPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
@@ -72,6 +73,8 @@ export interface HostConfig {
   maxActiveProjectionBytes?:number;steeringOutcomeTimeoutMs?:number;
   /** Resolve committed attachment references only during new execution, never history reads. */
   resolvePromptAttachment?:(context:{session:string;engineId:string;nativeSessionId?:string;workingDirectory:string},attachment:NonNullable<Message['attachments']>[number])=>Promise<ContentBlock[]|undefined>;
+  /** Resources-owned target access, distinct from unchanged public originals. */
+  publicOriginalResources?:PublicOriginalResources;
   resourceProviders?:Array<{scheme:string;read?:(params:Json,context:{clientId:string})=>Promise<Json>;resolve?:(params:Json,context:{clientId:string})=>Promise<Json>;list?:(params:Json,context:{clientId:string})=>Promise<Json>;write?:(params:Json,context:{clientId:string})=>Promise<Json>}>;
   catalog?:Catalog;
   retentionProtection?:RetentionProtection;
@@ -104,7 +107,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {admittedControls?:number;retirementCommandId?:string;finishing?:boolean;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -533,6 +536,85 @@ export class AmplifierHost {
     if(Buffer.byteLength(JSON.stringify({...mapped,diagnostics:result.diagnostics??[]}))>RECALL_LIMITS.maxBytes)throw new RpcFault(-32000,'Complete Recall page exceeds byte capacity; use a smaller turn limit');
     return {...mapped,revision:result.revision,...(result.nextCursor?{nextCursor:this.rememberRecallCursor({scope,cursor:result.nextCursor})}:{}),limits:RECALL_LIMITS,coverage:{source:'native-history',authorization:'unverified-native-history',diagnostics:result.diagnostics??[],omittedUpdates:mapped.omittedUpdates}};
   }
+  private publicRows(record:SessionRecord,result:Json):PersistedPublicRow[] {
+    if(!Array.isArray(result.publicRows)||typeof result.publicRowsComplete!=='boolean')throw new RpcFault(-32000,'Native public row page has no explicit coverage');
+    const rows=result.publicRows.map(persistedPublicRow);
+    if(rows.some(row=>row.locator.sessionId!==record.nativeSessionId)||new Set(rows.map(row=>JSON.stringify(row.locator))).size!==rows.length)throw new RpcFault(-32000,'Native public row page scope or occurrence changed');
+    return rows;
+  }
+  /** Existing passive Native owner reads; no grant or execution effects. */
+  async readPublicOriginalRows(session:string,input:{cursor?:string;rowLocator?:NativeLocator;expectedRevision?:string}={}) {
+    if(!input||typeof input!=='object'||Array.isArray(input)||Object.keys(input).some(key=>!['cursor','rowLocator','expectedRevision'].includes(key))||input.cursor!==undefined&&(typeof input.cursor!=='string'||!input.cursor)||input.expectedRevision!==undefined&&(typeof input.expectedRevision!=='string'||!input.expectedRevision))throw new RpcFault(-32602,'Exact public row read options required');
+    if(input.cursor!==undefined&&input.rowLocator!==undefined)throw new RpcFault(-32602,'Choose public row paging or one exact occurrence');
+    const record=await this.record(session),engine=this.config.engines.find(value=>value.id===record.engineId);
+    if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native public row identity unavailable');
+    const locator=input.rowLocator===undefined?undefined:nativeLocator(input.rowLocator);
+    if(locator&&locator.sessionId!==record.nativeSessionId)throw new RpcFault(-32602,'Public row locator scope changed');
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
+    this.passiveReads++;
+    const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive public row read cannot perform effects');}});
+    try{
+      const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.publicMessagePreservation;
+      if(capability?.version!==1||capability.publicRows!==true||locator&&capability.exactRowRead!==true)throw new RpcFault(-32601,'Native public row reading is not qualified');
+      const result:Json=await agent.client.extMethod('_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,includePublicRows:true,...input});
+      if(typeof result.revision!=='string'||!Array.isArray(result.diagnostics)||input.expectedRevision!==undefined&&result.revision!==input.expectedRevision)throw new RpcFault(-32013,'Native public row revision changed');
+      const rows=this.publicRows(record,result);
+      if(result.nextCursor!==undefined&&result.nextCursor!==null&&(typeof result.nextCursor!=='string'||!result.nextCursor||result.nextCursor===input.cursor))throw new RpcFault(-32013,'Native public row cursor did not advance');
+      if(result.publicRowsComplete&&(result.nextCursor!==undefined&&result.nextCursor!==null))throw new RpcFault(-32000,'Native public row page falsely claims completion');
+      if(locator&&(rows.length!==1||!sameLocator(rows[0]!.locator,locator)||!result.publicRowsComplete||result.nextCursor))throw new RpcFault(-32008,'Exact persisted public row unavailable');
+      return {revision:result.revision,rows,nextCursor:result.nextCursor??null,complete:result.publicRowsComplete,diagnostics:result.diagnostics as unknown[]};
+    }finally{this.passiveReads--;await agent.retire();}
+  }
+  private async publicAttachment(record:SessionRecord,row:PersistedPublicRow,blockIndex:number,card:PublicCard) {
+    const metadata={originalReference:card.reference,rowLocator:row.locator,originalBlockIndex:blockIndex,disposition:row.copySource?.disposition??'original'};
+    let uri:string|undefined,access='unavailable';
+    if(card.reference.owner==='resources'){
+      if(!row.copySource){const original=resourcesBodyUri(card.reference.id);if(original?.searchParams.get('session')===record.uri)uri=original.href;}
+      else if(this.config.publicOriginalResources){try{const grant=await this.config.publicOriginalResources.resolveOriginalAttachment(record.uri,card.reference);uri=qualifiedAccessUri(grant,record.uri,card.reference);if(grant?.status==='unknown'||grant?.status==='pending')access=grant.status;}catch{access='unknown';}}
+    }
+    // A retained descriptor is visible even when target access is not qualified.
+    return uri?{type:'resource',label:card.name,contentType:card.mimeType,uri,_meta:{'amplifier.dev/publicAttachment':{...metadata,access:'qualified'}}}:{type:'simple',label:card.name,_meta:{'amplifier.dev/publicAttachment':{...metadata,access}}};
+  }
+  /** Resources calls this trusted verifier; callers cannot supply card authority. */
+  async verifyOriginalForkAttachment(input:RetainOriginalAttachmentV2):Promise<VerifiedOriginalAttachmentV2> {
+    if(!input||input.version!==2||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>200||Object.keys(input).some(key=>!['version','commandId','target'].includes(key)))throw new RpcFault(-32602,'Exact original attachment operation required');
+    const occurrence=cardOccurrence(input.target),entry=this.store.db.prepare("SELECT * FROM lifecycle_commands WHERE command_id=? AND operation='fork'").get(input.commandId);
+    if(!entry||entry.status!=='completed'||typeof entry.target!=='string')throw new RpcFault(-32011,'Original Native creation has no completed authority');
+    const source=await this.record(String(entry.session)),target=await this.record(String(entry.target)),result=JSON.parse(String(entry.result)),args=JSON.parse(String(entry.payload)),receipt=result.receipt,native=receipt?.result;
+    if(source.engineId!==target.engineId||!source.nativeSessionId||target.nativeSessionId!==occurrence.row.sessionId||receipt?.status!=='completed'||receipt.commandId!==input.commandId||receipt.operation!=='fork'||native?.sessionId!==target.nativeSessionId||native.creationConfirmed!==true||native.preservedSource!==true||native.workReplayed!==false||native.source?.sessionId!==source.nativeSessionId||native.source.historyRevision!==args.expectedHistoryRevision||native.source.throughMessageId!==args.throughMessageId||native.historyCwd!==target.workingDirectory||typeof native.historyRevision!=='string')throw new RpcFault(-32011,'Native fork receipt or exact Host scope changed');
+    const selected=await this.readPublicOriginalRows(target.uri,{rowLocator:occurrence.row}),row=selected.rows[0]!,lineage=row.copySource;
+    if(!lineage||lineage.source.sessionId!==source.nativeSessionId)throw new RpcFault(-32008,'Target row has no immediate source copy proof');
+    const original=(await this.readPublicOriginalRows(source.uri,{rowLocator:lineage.source})).rows[0]!;
+    if(!samePublicMessage(original.publicMessage,row.publicMessage))throw new RpcFault(-32008,'Copied public original changed');
+    const card=row.publicMessage.blocks[occurrence.blockIndex],sourceCard=original.publicMessage.blocks[occurrence.blockIndex];
+    if(card?.type!=='attachment'||sourceCard?.type!=='attachment'||card.reference.owner!=='resources'||!sameCard(card,sourceCard))throw new RpcFault(-32008,'Exact copied Resources card occurrence unavailable');
+    return {version:2,commandId:input.commandId,authority:{commandId:input.commandId,status:'completed',source:{sessionId:source.nativeSessionId,historyRevision:native.source.historyRevision,...(args.throughMessageId?{throughMessageId:args.throughMessageId}:{})},target:{sessionId:target.nativeSessionId!,creationHistoryRevision:native.historyRevision},creationConfirmed:true,preservedSource:true,workReplayed:false},sourceOccurrence:{row:lineage.source,blockIndex:occurrence.blockIndex},targetOccurrence:occurrence,card,disposition:lineage.disposition,sourceHostSession:source.uri,targetHostSession:target.uri,engineId:source.engineId};
+  }
+  /** Explicit grant continuation. Resources owns its retry state; never refork. */
+  async reconcileOriginalForkAttachments(sourceSession:string,commandId:string) {
+    return this.intake.run(async()=>{
+    if(this.closing)throw new RpcFault(-32008,'Host is shutting down');
+    const source=await this.record(sourceSession),entry=this.store.db.prepare("SELECT * FROM lifecycle_commands WHERE command_id=? AND session=? AND operation='fork'").get(commandId,source.uri);
+    if(!entry||entry.status!=='completed'||typeof entry.target!=='string')throw new RpcFault(-32011,'Reconcile Native creation without replay before qualifying grants');
+    const owner=this.config.publicOriginalResources;
+    if(!owner)throw new RpcFault(-32601,'Resources original attachment consumer unavailable');
+    let cursor:string|undefined,revision:string|undefined,qualified=0,unresolved=0,unsupported=0,diagnosticCount=0;
+    do{
+      const page=await this.readPublicOriginalRows(String(entry.target),{...(cursor?{cursor}:{}),...(revision?{expectedRevision:revision}:{})});revision=page.revision;diagnosticCount+=page.diagnostics.length;
+      for(const row of page.rows)if(row.copySource)for(const [blockIndex,card] of row.publicMessage.blocks.entries())if(card.type==='attachment'){
+        if(card.reference.owner!=='resources'){unsupported++;continue;}
+        const request:RetainOriginalAttachmentV2={version:2,commandId,target:{row:row.locator,blockIndex}};
+        await this.verifyOriginalForkAttachment(request);
+        const grant=await owner.retainOriginalAttachment(request);
+        if(grant.commandId!==commandId)throw new RpcFault(-32000,'Resources grant command changed');
+        if(qualifiedAccessUri(grant,String(entry.target),card.reference))qualified++;else unresolved++;
+      }
+      if(!page.nextCursor&&!page.complete)throw new RpcFault(-32008,'Native public row enumeration coverage incomplete');
+      cursor=page.nextCursor??undefined;
+    }while(cursor);
+    return {commandId,targetSession:String(entry.target),qualified,unresolved,unsupported,diagnosticCount,enumeration:diagnosticCount?'partial':'complete',grantCoverage:diagnosticCount||unresolved||unsupported?'partial':'complete',replayed:false};
+    });
+  }
   private async nativeHistory(record:SessionRecord,limit?:number,cursor?:string,before?:{beforeTurnId:string;expectedRevision:string}):Promise<{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]}> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);
@@ -545,8 +627,11 @@ export class AmplifierHost {
       if(capability?.version!==1||capability?.paging!=='complete-turns'||capability?.passive!==true)throw new RpcFault(-32601,'Agent does not advertise a passive native history reader');
       let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[];
       do {
-        const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(before??{}),...(next?{cursor:next}:{})}) as Json;
+        const publicCapability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.publicMessagePreservation;
+        const includePublicRows=!before&&publicCapability?.version===1&&publicCapability.publicRows===true;
+        const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(includePublicRows?{includePublicRows:true}:{}),...(before??{}),...(next?{cursor:next}:{})}) as Json;
         if(!Array.isArray(result.turnGroups)||typeof result.revision!=='string')throw new Error('Malformed native history page');
+        const publicRows=includePublicRows?this.publicRows(record,result):[];
         if(revision&&revision!==result.revision)throw new RpcFault(-32013,'Native history changed while assembling the selected window');
         if(result.nextCursor&&(!result.turnGroups.length||result.nextCursor===next))throw new RpcFault(-32013,'Native history cursor did not advance');
         revision=result.revision;diagnostics.push(...(result.diagnostics??[]));const page:Turn[]=[];
@@ -557,7 +642,23 @@ export class AmplifierHost {
           const inputHistory=(group.updates as Json[]).find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
           const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
           const attachments:any[]=[];
-          for(const content of inputs){if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});else if(content.type==='resource_link')attachments.push({type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});}
+          for(const content of inputs){
+            if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});
+            else if(content.type==='resource_link'){
+              let foreignScope=false;
+              if(content.uri?.startsWith('amplifier-attachment:'))foreignScope=resourcesBodyUri(content.uri)?.searchParams.get('session')!==record.uri;
+              attachments.push(foreignScope?{type:'simple',label:content.name??'Resource',_meta:{'amplifier.dev/publicAttachment':{originalReference:{owner:'resources',id:content.uri},access:'unavailable'}}}:{type:'resource',label:content.name??'Resource',uri:content.uri,contentType:content.mimeType});
+            }
+          }
+          if(publicRows.length){
+            const seen=new Set<string>(),originals:PersistedPublicRow[]=[];
+            for(const update of group.updates as Json[]){const locator=update._meta?.['amplifier.dev/history']?.rowLocator;if(locator){const exact=nativeLocator(locator),row=publicRows.find(value=>sameLocator(value.locator,exact));if(row&&!seen.has(row.locator.messageId)){seen.add(row.locator.messageId);originals.push(row);}}}
+            if(originals.length){
+              message.text=originals.flatMap(row=>row.publicMessage.blocks.filter(block=>block.type==='text').map(block=>block.text)).join('');
+              attachments.length=0;
+              for(const row of originals)for(const [blockIndex,block] of row.publicMessage.blocks.entries())if(block.type==='attachment')attachments.push(await this.publicAttachment(record,row,blockIndex,block));
+            }
+          }
           if(attachments.length)message.attachments=attachments;
           let state=chatReducer({...record.chat,turns:[],activeTurn:undefined},{type:'chat/turnStarted',turnId:group.id,startedAt:group.startedAt??record.summary.createdAt,message} as any);
           const active:Active={agent,busy:true,lastUsed:0,turnId:group.id,tools:new Set(),permissions:new Map()};
@@ -1611,7 +1712,8 @@ export class AmplifierHost {
           if(event) this.steeringEvent(uri,active,event);
           if(event?.type==='history.revised')this.confirmHistoryRevision(uri,active,event);
           if(active.busy&&((event?.type==='input.accepted'&&event.input_id===active.turnId)||(event?.type==='generation.started'&&event.activeInputId===active.turnId)))this.projectPendingTurn(uri,active);
-          if(event?.type==='runtime.ready')active.stopNotified=false;
+          if(event?.type==='runtime.ready'){active.stopNotified=false;active.publicOriginalMount=event.report?.publicMessagePreservation;}
+          if(event?.type==='runtime.closed')active.publicOriginalMount=undefined;
           if(event?.type==='runtime.closed')this.notifyAgentStopped(uri,active,active.retireReason??'runtime-closed');
           if(event?.type==='history.persisted'&&typeof event.metadataPath==='string'&&isAbsolute(event.metadataPath)&&basename(event.metadataPath)==='metadata.json') {
             // The independent catalog validates its configured native roots and reloads metadata.
@@ -1628,7 +1730,7 @@ export class AmplifierHost {
           try{const callback=()=>this.config.nativeHostRequest!({session:uri,nativeSessionId:agent.nativeId!,workingDirectory:record.executionDirectory??record.workingDirectory},params);return observation&&!this.nativeWorkAdmitted(uri,active)?await this.intake.continuation(callback):await this.admittedNativeWork(uri,active,callback);}finally{if(observation){active.observationPending!--;active.observationBytes!-=bytes;}this.intake.workChanged();}
         }}:{}),
       });active.agent=agent;this.touchAgent(active);this.active.set(uri,active);
-      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));this.touchAgent(active);return active;}
+      try {const response=await agent.start(record.nativeSessionId,creation,record.workingDirectory);const fresh=this.getRecord(uri)!,location=response?._meta?.['amplifier.dev/native'] as Json|undefined;if(location&&Object.hasOwn(location,'publicMessagePreservation'))active.publicOriginalMount=location.publicMessagePreservation;if(location?.executionDirectory!==undefined){if(location.historyCwd!==record.workingDirectory||location.executionDirectory!==(record.executionDirectory??record.workingDirectory)||!Number.isSafeInteger(location.executionRevision))throw new Error('Native execution location differs from the authorized host mapping; reconcile before executing');fresh.nativeLocationRevision=location.executionRevision;}fresh.nativeSessionId=agent.nativeId;fresh.state._meta={...fresh.state._meta,'amplifier.dev/acp':{...(fresh.state._meta?.['amplifier.dev/acp'] as Json),capabilities:agent.initialized.agentCapabilities,configOptions:response?.configOptions??[],configOptionsProtocol:response?.configOptions===undefined&&response?.modes?'legacy-mode':'standard',...(response?.modes?{legacyModes:response.modes}: {})}};this.store.save(fresh);await this.syncCatalog(fresh);for(const path of active.pendingHints??[])await this.catalogHint(path);active.pendingHints=[];this.configState(uri,response?.configOptions??this.legacyModeOptions(response?.modes));this.touchAgent(active);return active;}
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);this.admittedStarts.delete(uri);}
       });
@@ -1805,6 +1907,7 @@ export class AmplifierHost {
     const native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
     if(native?.activeSteering?.version!==1||native.activeSteering.mode!=='request_boundary')throw new RpcFault(-32601,'Agent does not advertise generation-anchored request-boundary steering');
     if(!action.message||typeof action.message.text!=='string'||!action.message.text.trim()||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.attachments?.length||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering supports bounded user text; multimodal or per-message configuration is not negotiated');
+    if(supportsPublicOriginal(mountedPublicOriginal(native?.publicMessagePreservation,this.active.get(record.uri)?.publicOriginalMount),'steer.submit'))capturePublicMessage(action.message,action.id);
     const payload=JSON.stringify(action.message);if(Buffer.byteLength(payload)>65536)throw new RpcFault(-32000,'Steering message exceeds byte bound');
     if(prior&&prior.status!=='pending'||this.store.receipt(action.id)||this.store.db.prepare('SELECT 1 FROM queue_intents WHERE id=?').get(action.id))throw new RpcFault(-32011,'Steering identity already consumed or removed; inspect its receipt without replay');
     const capacity=this.store.db.prepare("SELECT count(*) n,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM steering_intents WHERE status IN ('pending','dispatching') AND id!=?").get(action.id)!;
@@ -1826,10 +1929,12 @@ export class AmplifierHost {
     const row=this.store.db.prepare("SELECT * FROM steering_intents WHERE chat=? AND status='pending' AND held=0 LIMIT 1").get(record.chat.resource);if(!row||row.active_turn_id&&row.active_turn_id!==active.turnId)return;
     if((active.steeringRuns?.size??0)>=16||Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").get(record.chat.resource,active.turnId)!.n)>=50)return;
     const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
+    const original=this.captureOriginal(active,message,id,'steer.submit');
+    const params=this.inputWireParams({sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})});
     this.store.transaction(()=>{this.store.admission(record.chat.resource,{kind:'steering',id,message,activeInputId,generationId},id,origin.clientId,origin.clientSeq);this.store.db.prepare("UPDATE steering_intents SET status='dispatching',active_turn_id=?,generation_id=?,projected=0 WHERE id=?").run(activeInputId,generationId,id);});
     this.emit(record.chat.resource,{type:'chat/pendingMessageRemoved',kind:'steering',id} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(id);this.store.finish(id,'dispatching');
     let acceptanceTimer:ReturnType<typeof setTimeout>|undefined;
-    const request=this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text}}));
+    const request=this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',params));
     const pending=Promise.race([request,new Promise<never>((_resolve,reject)=>{acceptanceTimer=setTimeout(()=>reject(new Error('Native steering acceptance deadline expired')),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));acceptanceTimer.unref();})]).then(result=>{
       if(result.accepted===false&&result.executed===false){this.settleSteering(session,id,'held',String(result.reason??'Native steering refused before execution'));return;}
       if(result.accepted!==true||result.inputId!==id||result.activeInputId!==activeInputId||result.generationId!==generationId||!['queued','applied','held','unknown'].includes(String(result.disposition)))throw new Error('Invalid native steering disposition');
@@ -1977,11 +2082,13 @@ export class AmplifierHost {
     if(this.store.unknown(channel))throw new Error('A prior execution outcome is unknown; reconcile native history first');
     if(this.getRecord(record.uri)!.chat.activeTurn)throw new Error('A turn is already running; use pending message actions');
     if(special?.operation!=='observation.submit'&&this.active.get(record.uri)?.agent.retirementOutcome==='unknown')await this.reconcileRetirementUnderLock(record);
-    const blocks=await this.prompt(action.message,record),active=special?.operation==='observation.submit'?this.active.get(record.uri):await this.ensureAgent(record.uri);
+    const active=special?.operation==='observation.submit'?this.active.get(record.uri):await this.ensureAgent(record.uri);
     if(!active||active.agent.closed||special?.operation==='observation.submit'&&active.stopNotified)throw new RpcFault(-32008,'waiting_worker',{executed:false});
     this.guardRetirement(active);
     if(this.closing)throw new Error('Host is shutting down');
     if(active.busy)throw new Error('The previous ACP turn has not finished; wait for its authoritative outcome');
+    const publicOriginal=this.captureOriginal(active,action.message,action.turnId,special?.operation??'prompt');
+    const blocks=await this.prompt(action.message,record);
     this.checkContentCapabilities(active,blocks);
     const reply=this.messageReply(action.message);
     if(reply){
@@ -1993,6 +2100,7 @@ export class AmplifierHost {
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
       if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
+    const params=this.inputParams(active,record,action.turnId,action.message,blocks,special,publicOriginal);
     const historyPrefix=special?.operation==='history.revise'?await this.nativeHistory(record,50,undefined,{beforeTurnId:special.args.targetMessageId,expectedRevision:special.args.expectedHistoryRevision}):undefined;
     this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(special.args));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
@@ -2000,7 +2108,7 @@ export class AmplifierHost {
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
     active.historyRevision=historyPrefix?{args:special!.args,prefix:historyPrefix,confirmed:false}:undefined;
     if(special?.operation==='history.revise')active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};
-    else if(special?.operation==='observation.submit'){active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};active.observationAdmission={inputId:action.turnId,watchId:special.args.watchId,taskId:special.args.taskId,taskRevision:special.args.taskRevision,outcomeDigest:createHash('sha256').update(JSON.stringify(special.args.outcome)).digest('hex'),expectedExecutionRevision:special.expected!.executionRevision,expectedInterruptionRevision:special.expected!.interruptionRevision,expectedConfigurationHash:special.expected!.configurationHash,admittedExecutionRevision:this.store.revisions(record.uri).executionRevision};this.store.annotateReceipt(action.turnId,{observationAdmission:active.observationAdmission});}else this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,blocks,special);
+    else if(special?.operation==='observation.submit'){active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};active.observationAdmission={inputId:action.turnId,watchId:special.args.watchId,taskId:special.args.taskId,taskRevision:special.args.taskRevision,outcomeDigest:createHash('sha256').update(JSON.stringify(special.args.outcome)).digest('hex'),expectedExecutionRevision:special.expected!.executionRevision,expectedInterruptionRevision:special.expected!.interruptionRevision,expectedConfigurationHash:special.expected!.configurationHash,admittedExecutionRevision:this.store.revisions(record.uri).executionRevision};this.store.annotateReceipt(action.turnId,{observationAdmission:active.observationAdmission});}else this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,params,special);
       });
   }
   /** Trusted capability owners submit user-authorized inputs through ordinary admission. */
@@ -2199,13 +2307,29 @@ export class AmplifierHost {
     if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(key=>!['messageId','position','historyEpoch','sourceDigest'].includes(key))||!['messageId','position','historyEpoch'].every(key=>Object.hasOwn(value,key))||!validToken(value.messageId)||!Number.isSafeInteger(value.position)||Number(value.position)<0||(value.historyEpoch!==null&&!validToken(value.historyEpoch))||(Object.hasOwn(value,'sourceDigest')&&(typeof value.sourceDigest!=='string'||!/[a-f0-9]{64}/.test(value.sourceDigest)||value.sourceDigest.length!==64))||Buffer.byteLength(JSON.stringify(value))>2048)throw new RpcFault(-32602,'Exact bounded native message reply reference required',{executed:false,replayed:false});
     return structuredClone(value);
   }
+  /** Resolve and snapshot the exact wire request before durable admission. */
+  private inputWireParams(params:Json):Json {
+    if(Buffer.byteLength(JSON.stringify(params))>8*1024*1024)throw new RpcFault(-32602,'ACP input including public original exceeds the eight MiB wire budget',{executed:false,replayed:false});
+    return structuredClone(params);
+  }
+  private inputParams(active:Active,record:SessionRecord,turnId:string,message:Message,blocks:ContentBlock[],special:SettledInput|undefined,original:PublicMessageV1|undefined):Json {
+    const reply=this.messageReply(message),originalMeta=original?{[PUBLIC_MESSAGE_META]:original}:{};
+    const inputOrigin=String((message._meta?.['amplifier.dev/input'] as Json|undefined)?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
+    const params=special?{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},_meta:{...originalMeta,...(special.operation==='observation.submit'?{'amplifier.dev/native':{requireExisting:true}}:{})}}:{sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...originalMeta,...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{}),...(reply?{'amplifier.dev/messageReply':{...reply,sessionId:record.nativeSessionId}}:{})}};
+    return this.inputWireParams(params);
+  }
+  private captureOriginal(active:Active,message:Message,inputId:string,route:string):PublicMessageV1|undefined {
+    const capability=(active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.publicMessagePreservation;
+    if(!supportsPublicOriginal(capability,route,!!message.attachments?.length)||!supportsPublicOriginal(mountedPublicOriginal(capability,active.publicOriginalMount),route,!!message.attachments?.length))return;
+    return capturePublicMessage(message,inputId);
+  }
   private async prompt(message:Message,record:SessionRecord,resolveReferences=true):Promise<ContentBlock[]> {
     this.messageReply(message);
     if(message.model||message.agent)throw new Error('Per-message model/custom-agent selection is not advertised; use session configuration');
     const blocks:ContentBlock[]=[{type:'text',text:message.text}];
     if((message.attachments?.length??0)>16)throw new RpcFault(-32602,'At most sixteen attachments per input');
     for(const attachment of message.attachments??[]) {
-      if(attachment.type==='resource'&&resolveReferences&&this.config.resolvePromptAttachment){const resolved=await this.config.resolvePromptAttachment({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.executionDirectory??record.workingDirectory},attachment);if(resolved!==undefined){if(!Array.isArray(resolved)||resolved.length>16)throw new RpcFault(-32602,'Attachment resolver exceeded block count');blocks.push(...resolved);continue;}}
+      if(attachment.type==='resource'&&resolveReferences&&this.config.resolvePromptAttachment){const resolved=await this.config.resolvePromptAttachment({session:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.executionDirectory??record.workingDirectory},structuredClone(attachment));if(resolved!==undefined){if(!Array.isArray(resolved)||resolved.length>16)throw new RpcFault(-32602,'Attachment resolver exceeded block count');blocks.push(...resolved);continue;}}
       if(attachment.type==='simple'&&attachment.modelRepresentation)blocks.push({type:'text',text:attachment.modelRepresentation});
       else if(attachment.type==='resource')blocks.push({type:'resource_link',uri:attachment.uri,name:attachment.label,mimeType:attachment.contentType});
       else if(attachment.type==='embeddedResource') {
@@ -2228,13 +2352,12 @@ export class AmplifierHost {
     if(active.historyRevision&&!active.historyRevision.confirmed)throw new Error('Native history rewrite is not confirmed; replacement projection must not precede canonical authority');
     const pending=active.pendingTurn;active.pendingTurn=undefined;this.emit(chatURI(uri),pending.action,pending.origin);
   }
-  private async run(uri:string,active:Active,blocks:ContentBlock[],special?:SettledInput) {
+  private async run(uri:string,active:Active,params:Json,special?:SettledInput) {
     const channel=chatURI(uri),turnId=active.turnId!;let drain=false;
     const message=(active.pendingTurn?.action.message??this.getRecord(uri)!.chat.activeTurn!.message),meta=message._meta as Json|undefined;
     const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':special?.operation==='history.revise'?'history-edit':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
-      const reply=this.messageReply(message);
-      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:special.operation,args:{...special.args,inputId:turnId},...(special.operation==='observation.submit'?{_meta:{'amplifier.dev/native':{requireExisting:true}}}:{})}):await active.agent.client.prompt({sessionId:active.agent.nativeId!,prompt:blocks,_meta:{'amplifier.dev/command':{commandId:turnId},...(inputOrigin==='coordination'?{'amplifier.dev/input':{inputOrigin}}:{}),...(reply?{'amplifier.dev/messageReply':{...reply,sessionId:this.getRecord(uri)!.nativeSessionId}}:{})}});
+      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',params):await active.agent.client.prompt(params as any);
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
         await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
