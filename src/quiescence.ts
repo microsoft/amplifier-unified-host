@@ -3,7 +3,7 @@ import {AsyncLocalStorage} from 'node:async_hooks';
 import {createHash,randomUUID} from 'node:crypto';
 import type {DatabaseSync} from 'node:sqlite';
 
-export type QuiescencePurpose='distribution-update'|'recovery'|'service-stop'|'retention-hide';
+export type QuiescencePurpose='distribution-update'|'recovery'|'service-stop'|'initial-start'|'retention-hide';
 export type QuiescenceOutcome='ready'|'unchanged'|'unknown';
 export interface ServiceIdentity {installationId:string;dataScope:string;ownerId:string;instanceId:string;releaseDigest:string;}
 export interface ServiceStopRequest {commandId:string;expected:ServiceIdentity;retryRefused?:boolean;}
@@ -14,9 +14,23 @@ export interface ServiceReleaseProof extends QuiescenceProof {
  resumeCommandId?:string;exitReceiptId?:string;readyReceiptId?:string;refusalReceiptId?:string;
  activation?:{schema:'distribution-service-activation-v1';target:{id:string;version:string;revision:string;digest:string}};
 }
+export interface ServiceStartReleaseRequest {fenceId:string;commandId:string;evidence?:unknown;}
+export interface ServiceInitialStartProof {
+ kind:'service-initial-start';verified:true;fenceId:string;commandId:string;expected:ServiceIdentity;observed:ServiceIdentity;
+ instanceId:string;dataScope:string;claimReceiptId:string;readyReceiptId:string;receiptId:string;
+ target:{id:string;version:string;revision:string;digest:string};
+}
+export interface ServiceStartReleaseResult {
+ released:true;intakeClosed:false;purpose:'initial-start';fenceId:string;commandId:string;
+ expected:ServiceIdentity;observed:ServiceIdentity;receiptId:string;
+}
 export interface ServiceLifecycleConfig {
  /** Trusted launcher identity: instanceId is unique to this actual runtime launch. */
  identity:ServiceIdentity;
+ /** Trusted pristine provisioning command and the already persisted actual generation. */
+ initialStart?:{commandId:string;identity:ServiceIdentity};
+ /** Authenticates consumed provisioning claim, runtime custody and durable closed readiness. */
+ verifyInitialStart?:(request:Readonly<QuiescenceContext>&{evidence:unknown})=>Promise<ServiceInitialStartProof>;
  /** Authenticates durable platform-owner exit/readiness or definitive no-effect evidence. */
  verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'resumed'|'stop-refused';resumeCommandId?:string;evidence:unknown})=>Promise<ServiceReleaseProof>;
 }
@@ -99,17 +113,39 @@ export class QuiescenceGate {
    if(config.coverage.nativeHostOwners!==undefined){if(!Array.isArray(config.coverage.nativeHostOwners)||!config.coverage.nativeHostOwners.length||config.coverage.nativeHostOwners.length>128)throw Error('Native callback owner coverage must be a nonempty bounded list');for(const owner of config.coverage.nativeHostOwners)token(owner,'native callback owner');}
    if(config.timeoutMs!==undefined&&(!Number.isSafeInteger(config.timeoutMs)||config.timeoutMs<25||config.timeoutMs>30000))throw Error('Quiescence deadline must be25..30000ms');
    if(typeof config.verifyRelease!=='function')throw Error('Authenticated quiescence reconciliation required');
-   if(config.serviceLifecycle){const service=identity(config.serviceLifecycle.identity);if(service.instanceId!==config.instanceId||service.dataScope!==config.dataScope||typeof config.serviceLifecycle.verifyRelease!=='function')throw Error('Service lifecycle identity must match the trusted running host and data scope');}
+   if(config.serviceLifecycle){const service=identity(config.serviceLifecycle.identity);if(service.instanceId!==config.instanceId||service.dataScope!==config.dataScope||typeof config.serviceLifecycle.verifyRelease!=='function')throw Error('Service lifecycle identity must match the trusted running host and data scope');
+    const initial=config.serviceLifecycle.initialStart;if(initial){token(initial.commandId,'initial start identity');if(!sameIdentity(initial.identity,service)||typeof config.serviceLifecycle.verifyInitialStart!=='function')throw Error('Initial start must bind the actual generation and authenticated verifier');}
+   }
   }
   initializeAuthority(db,'quiescence',()=>{db.exec("CREATE TABLE IF NOT EXISTS host_quiescence_fence(id INTEGER PRIMARY KEY CHECK(id=1),payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_commands(command_id TEXT PRIMARY KEY,signature TEXT NOT NULL,payload TEXT NOT NULL); CREATE TABLE IF NOT EXISTS host_quiescence_attempts(id INTEGER PRIMARY KEY AUTOINCREMENT,command_id TEXT NOT NULL,payload TEXT NOT NULL)");
   db.exec("CREATE TABLE IF NOT EXISTS host_service_releases(fence_id TEXT PRIMARY KEY,command_id TEXT NOT NULL,request_signature TEXT NOT NULL,proof_signature TEXT NOT NULL,fence TEXT NOT NULL,proof TEXT NOT NULL,state TEXT NOT NULL,result TEXT)");
-  const old=this.fence();if(old){old.phase='unknown';old.reason='host-restarted';this.save(old);}
+  const old=this.fence(),initial=config?.serviceLifecycle?.initialStart;
+  if(old){
+   // A real retained A stop is never replaced with a fabricated initial generation.
+   if(initial&&(old.purpose!=='initial-start'||old.commandId!==initial.commandId||!old.serviceIdentity||!sameIdentity(old.serviceIdentity,initial.identity)))throw Error('Initial start differs from retained service fence');
+   old.phase='unknown';old.reason='host-restarted';this.save(old);
+  }else if(initial){
+   const expected=identity(initial.identity),signature=digest(['initial-start',initial.commandId,expected]);
+   const prior=db.prepare('SELECT signature,payload FROM host_quiescence_commands WHERE command_id=?').get(initial.commandId);
+   if(prior){
+    if(prior.signature!==signature)throw Error('Initial start identity differs from retained command');
+    const result=JSON.parse(String(prior.payload));
+    // Observing a completed exact generation does not consume another claim or close again.
+    const release=db.prepare("SELECT result FROM host_service_releases WHERE command_id=? AND state='released'").get(initial.commandId);
+    if(!release||canonical(JSON.parse(String(release.result)))!==canonical(result)||result.purpose!=='initial-start'||result.released!==true||!sameIdentity(result.observed,expected))throw Error('Initial start lacks exact retained release');
+   }else{
+    // Existing authoritative service records cannot be relabelled as pristine provisioning.
+    if(db.prepare('SELECT 1 FROM host_quiescence_commands LIMIT 1').get())throw Error('Initial start requires a pristine service lifecycle');
+    const fence:QuiescenceFence={commandId:initial.commandId,purpose:'initial-start',fenceId:randomUUID(),instanceId:expected.instanceId,dataScope:expected.dataScope,phase:'closed',owners:[],observedAt:Date.now(),serviceIdentity:expected};
+    db.prepare('INSERT INTO host_quiescence_commands VALUES(?,?,?)').run(initial.commandId,signature,'{}');this.save(fence);
+   }
+  }
   });
  }
  private fence():QuiescenceFence|undefined {const row=this.db.prepare('SELECT payload FROM host_quiescence_fence WHERE id=1').get();return row?JSON.parse(String(row.payload)):undefined;}
  private save(fence:QuiescenceFence){this.db.prepare('INSERT INTO host_quiescence_fence VALUES(1,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload').run(JSON.stringify(fence));this.result(fence.commandId,this.bindResult(fence,{admitted:fence.phase==='held',fence:structuredClone(fence),intakeClosed:true,...(fence.admissionModel==='shared-service-v1'?{fenceId:fence.fenceId,commandId:fence.commandId}: {})}));}
  private result(commandId:string,result:unknown){this.db.prepare('UPDATE host_quiescence_commands SET payload=? WHERE command_id=?').run(JSON.stringify(result),commandId);}
- private bindResult(fence:QuiescenceFence,result:any){return fence.purpose==='service-stop'?{...result,purpose:'service-stop',expected:fence.serviceIdentity}:result;}
+ private bindResult(fence:QuiescenceFence,result:any){return fence.purpose==='service-stop'?{...result,purpose:'service-stop',expected:fence.serviceIdentity}:fence.purpose==='initial-start'?{...result,purpose:'initial-start',expected:fence.serviceIdentity,fenceId:fence.fenceId,commandId:fence.commandId}:result;}
  private clear(fence:QuiescenceFence,result:unknown){this.db.exec('BEGIN IMMEDIATE');try{this.result(fence.commandId,this.bindResult(fence,result));this.db.prepare('DELETE FROM host_quiescence_fence WHERE id=1').run();this.db.exec('COMMIT');}catch(e){this.db.exec('ROLLBACK');throw e;}}
  inspect(){return {enabled:!!this.config,intakeClosed:!!this.fence(),fence:this.fence(),activeAdmissions:this.calls,continuations:this.continuations,activeMaintenance:this.maintenance};}
  receipt(commandId:string){token(commandId,'command identity');const row=this.db.prepare('SELECT payload FROM host_quiescence_commands WHERE command_id=?').get(commandId);return row?JSON.parse(String(row.payload)):undefined;}
@@ -131,7 +167,7 @@ export class QuiescenceGate {
  /** Trusted native snapshot/reset I/O under this held fence; no normal admission is inherited. */
  async maintain<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T>{
   const fence=this.fence();
-  if(!fence||fence.purpose==='service-stop'||fence.phase!=='held'||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.maintenance)throw new QuiescenceError('Exact idle held maintenance fence required',{executed:false});
+  if(!fence||['service-stop','initial-start'].includes(fence.purpose)||fence.phase!=='held'||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.maintenance)throw new QuiescenceError('Exact idle held maintenance fence required',{executed:false});
   this.maintenance++;
   try{return await this.scope.run({active:false},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{this.maintenance--;}
  }
@@ -144,8 +180,8 @@ export class QuiescenceGate {
   catch(error){return this.unknown(fence,String(error));}
  }
  private unknown(fence:QuiescenceFence,reason:string){fence.phase='unknown';fence.reason=reason.slice(0,500);this.save(fence);return this.receipt(fence.commandId);}
- async admit(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'retention-hide'>;retryRefused?:boolean}) {
-  if((input.purpose as string)==='service-stop')throw new QuiescenceError('Service stop requires its identity-bound admission API',{executed:false});
+ async admit(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'initial-start'|'retention-hide'>;retryRefused?:boolean}) {
+  if(['service-stop','initial-start'].includes(input.purpose as string))throw new QuiescenceError('Service stop requires its identity-bound admission API',{executed:false});
   return this.admitBound(input);
  }
  async admitServiceStop(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
@@ -187,7 +223,7 @@ export class QuiescenceGate {
   this.db.exec('BEGIN IMMEDIATE');try{this.db.prepare('INSERT INTO host_quiescence_commands VALUES(?,?,?)').run(input.commandId,signature,'{}');this.save(fence);this.db.exec('COMMIT');}catch(error){this.db.exec('ROLLBACK');throw error;}
   const result=this.serviceClosedResult(fence,this.serviceWork());this.result(input.commandId,result);return result;
  }
- inspectServiceLifecycle(){const fence=this.fence();return {enabled:!!this.config?.serviceLifecycle,identity:this.config?.serviceLifecycle?identity(this.config.serviceLifecycle.identity):undefined,intakeClosed:!!fence,fence:fence?.purpose==='service-stop'?fence:undefined};}
+ inspectServiceLifecycle(){const fence=this.fence();return {enabled:!!this.config?.serviceLifecycle,identity:this.config?.serviceLifecycle?identity(this.config.serviceLifecycle.identity):undefined,intakeClosed:!!fence,fence:fence&&['service-stop','initial-start'].includes(fence.purpose)?fence:undefined};}
  serviceStopReceipt(commandId:string):ServiceStopReceipt|undefined{const result=this.receipt(commandId);if(!result)return undefined;if(result.purpose!=='service-stop'&&result.fence?.purpose!=='service-stop')throw new QuiescenceError('Command is not a service stop receipt',{executed:false});return result;}
  private async admitBound(input:{commandId:string;purpose:QuiescencePurpose;retryRefused?:boolean;serviceIdentity?:ServiceIdentity}) {
   token(input.commandId,'command identity');if(input.retryRefused!==undefined&&typeof input.retryRefused!=='boolean')throw Error('retryRefused must be an explicit boolean');if(!['distribution-update','recovery','service-stop'].includes(input.purpose))throw Error('Unknown quiescence purpose');
@@ -280,6 +316,39 @@ export class QuiescenceGate {
    throw new QuiescenceError(completed?'Admission abort retry differs from its retained proof':'Admission abort remains unknown; intake stays closed',{fenceId:fence.fenceId,outcome:'unknown'});
   } finally {this.changing=false;}
  }
+ /** Trusted provisioning reconciliation only; caller evidence cannot authenticate a startup. */
+ async releaseServiceStart(input:ServiceStartReleaseRequest):Promise<ServiceStartReleaseResult>{
+  token(input.fenceId,'fence identity');token(input.commandId,'initial start identity');
+  if(Object.keys(input).some(key=>!['fenceId','commandId','evidence'].includes(key))||Buffer.byteLength(canonical(input.evidence??null))>32768)throw new QuiescenceError('Invalid initial start reconciliation arguments',{executed:false});
+  if(this.changing||this.pending.size||this.maintenance||this.serviceDrain||this.calls||this.continuations)throw new QuiescenceError('Initial start settlement is still running',{executed:false});
+  const current=this.fence(),row=this.db.prepare('SELECT * FROM host_service_releases WHERE fence_id=?').get(input.fenceId);
+  const completed=row?.state==='released'&&row.command_id===input.commandId;
+  const fence:QuiescenceFence|undefined=current?.fenceId===input.fenceId&&current.commandId===input.commandId?current:completed?JSON.parse(String(row!.fence)):undefined;
+  const configured=this.config?.serviceLifecycle,initial=configured?.initialStart;
+  if(!fence||fence.purpose!=='initial-start'||!fence.serviceIdentity||!initial||!configured?.verifyInitialStart||initial.commandId!==fence.commandId||!sameIdentity(initial.identity,fence.serviceIdentity)||!sameIdentity(configured.identity,fence.serviceIdentity))throw new QuiescenceError('Exact retained initial generation and verifier required',{executed:false});
+  const requestSignature=digest(input);if(row&&row.request_signature!==requestSignature)throw new QuiescenceError('Initial start release identity has different arguments',{executed:false});
+  this.changing=true;
+  try{
+   const proof=await this.deadline(configured.verifyInitialStart({...structuredClone(fence),evidence:input.evidence}));
+   const expected=identity(fence.serviceIdentity);
+   const exactIdentity=(value:ServiceIdentity)=>value&&Object.keys(value).sort().join(',')==='dataScope,installationId,instanceId,ownerId,releaseDigest'&&sameIdentity(value,expected);
+   if(!proof||proof.kind!=='service-initial-start'||proof.verified!==true||Object.keys(proof).sort().join(',')!=='claimReceiptId,commandId,dataScope,expected,fenceId,instanceId,kind,observed,readyReceiptId,receiptId,target,verified'||proof.fenceId!==fence.fenceId||proof.commandId!==fence.commandId||proof.instanceId!==expected.instanceId||proof.dataScope!==expected.dataScope||!exactIdentity(proof.expected)||!exactIdentity(proof.observed))throw Error('Initial proof does not bind the exact original generation');
+   for(const key of ['claimReceiptId','readyReceiptId','receiptId'] as const)token(proof[key],key);
+   if(!proof.target||Object.keys(proof.target).sort().join(',')!=='digest,id,revision,version'||proof.target.digest!==expected.releaseDigest)throw Error('Initial proof lacks the authenticated full release target');
+   for(const key of ['id','version','revision','digest'] as const)token(proof.target[key],'initial target '+key);
+   if(Buffer.byteLength(canonical(proof))>32768)throw Error('Initial start proof exceeds32KiB');
+   const proofSignature=digest(proof);if(row&&row.proof_signature!==proofSignature)throw Error('Initial start proof differs from retained proof');
+   if(completed)return JSON.parse(String(row!.result));
+   const result:ServiceStartReleaseResult={released:true,intakeClosed:false,purpose:'initial-start',fenceId:fence.fenceId,commandId:fence.commandId,expected,observed:identity(proof.observed),receiptId:proof.receiptId};
+   // No owner acquisition, respawn or claim occurs here. Reuse the existing release authority.
+   this.db.exec('BEGIN IMMEDIATE');try{
+    if(!row)this.db.prepare('INSERT INTO host_service_releases VALUES(?,?,?,?,?,?,?,?)').run(fence.fenceId,fence.commandId,requestSignature,proofSignature,JSON.stringify(fence),JSON.stringify(proof),'released',JSON.stringify(result));
+    else this.db.prepare("UPDATE host_service_releases SET state='released',result=? WHERE fence_id=?").run(JSON.stringify(result),fence.fenceId);
+    this.result(fence.commandId,result);this.db.prepare('DELETE FROM host_quiescence_fence WHERE id=1').run();this.db.exec('COMMIT');
+   }catch(error){this.db.exec('ROLLBACK');throw error;}
+   this.maybeIdle();return result;
+  }catch(error){if(!completed)this.unknown(fence,error instanceof Error?error.message:String(error));throw new QuiescenceError(completed?'Initial start retry differs from retained proof':'Initial start remains unknown; intake stays closed',{executed:false,fenceId:fence.fenceId});}finally{this.changing=false;}
+ }
  /** Service release uses a distinct authenticated authority; a generic ready receipt cannot open it. */
  async releaseServiceStop(input:ServiceStopReleaseRequest):Promise<ServiceStopReceipt>{
   token(input.fenceId,'fence identity');token(input.commandId,'service stop identity');
@@ -346,7 +415,7 @@ export class QuiescenceGate {
   if(this.changing||this.pending.size||this.maintenance)throw new QuiescenceError('Quiescence transition or maintenance effect is still running',{executed:false});
   const fence=this.fence();if(!fence||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId)throw new QuiescenceError('Exact current quiescence fence required',{executed:false});
   if(this.abortAttempt(input.commandId))throw new QuiescenceError('Original admission abort requires its distinct settlement proof',{executed:false});
-  if(fence.purpose==='service-stop')throw new QuiescenceError('Service stop requires its service-specific release proof',{executed:false});
+  if(['service-stop','initial-start'].includes(fence.purpose))throw new QuiescenceError('Service lifecycle requires its service-specific release proof',{executed:false});
   if(input.outcome==='unknown')return this.unknown(fence,'supervisor-outcome-unknown');
   if(!['ready','unchanged'].includes(input.outcome)||!this.config)throw new QuiescenceError('Authenticated supervisor reconciliation is required',{executed:false});
   if(Buffer.byteLength(JSON.stringify(input.evidence??null))>32768)throw new QuiescenceError('Reconciliation evidence exceeds32KiB',{executed:false});

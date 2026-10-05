@@ -7,7 +7,7 @@ import type {ConversationPresentationConfig,PresentationActor,PresentationPrepar
 import {ManagedFilesJournal,type ManagedFilesProtection,type ManagedFilesApply,type ManagedFilesActor} from './managed-files.js';
 import {ManagedAllocations,managedHash,type ManagedSessionCreate,type ManagedLocation} from './managed.js';
 import {Retention,type RetentionProtection,type RetentionPreviewRequest,type RetentionApplyRequest} from './retention.js';
-import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest,type AdmissionAbortRequest} from './quiescence.js';
+import {QuiescenceGate,type QuiescenceConfig,type QuiescencePurpose,type QuiescenceOutcome,type ServiceStopRequest,type ServiceStopReleaseRequest,type ServiceStartReleaseRequest,type AdmissionAbortRequest} from './quiescence.js';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -2512,11 +2512,12 @@ export class AmplifierHost {
       if(this.store.db.prepare("SELECT 1 FROM queue_intents WHERE chat=? AND status='pending' UNION ALL SELECT 1 FROM steering_intents WHERE chat=? AND status IN ('pending','dispatching','unknown') LIMIT 1").get(chat,chat)||this.relocationFence(session)||this.transferFence(session)||this.retentionChanging.has(session)||this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(session,session))throw new RpcFault(-32011,'Retained work or ownership transition protects conversation presentation',{executed:false});
     }
   }
-  admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'retention-hide'>;retryRefused?:boolean}) {return this.intake.admit(input);}
+  admitQuiescence(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'initial-start'|'retention-hide'>;retryRefused?:boolean}) {return this.intake.admit(input);}
   admitServiceStop(input:ServiceStopRequest) {return this.intake.admitServiceStop(input);}
   closeServiceIntake(input:ServiceStopRequest) {return this.intake.closeServiceIntake(input);}
   serviceStopReceipt(commandId:string) {return this.intake.serviceStopReceipt(commandId);}
   inspectServiceLifecycle() {return this.intake.inspectServiceLifecycle();}
+  releaseServiceStart(input:ServiceStartReleaseRequest) {return this.intake.releaseServiceStart(input);}
   releaseServiceStop(input:ServiceStopReleaseRequest) {return this.intake.releaseServiceStop(input);}
   inspectQuiescence() {return this.intake.inspect();}
   quiescenceReceipt(commandId:string) {return this.intake.receipt(commandId);}
