@@ -107,7 +107,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -224,6 +224,11 @@ export class AmplifierHost {
     });
     this.retireTimer=setInterval(()=>void this.retireIdle(),10000);this.retireTimer.unref();
     this.store.db.exec("UPDATE terminals SET payload=json_set(payload,'$.lifecycle.status','exited'),lifecycle='exited' WHERE lifecycle='running'");
+    // Publish the lifetime reset so replay reconnects also discard old mounted evidence.
+    for(const row of this.store.db.prepare(`SELECT uri FROM sessions WHERE json_type(state,'$._meta."amplifier.dev/host".activeSteering') IS NOT NULL`).all()){
+      const record=this.getRecord(String(row.uri))!,metadata=record.state._meta!,host=metadata['amplifier.dev/host'] as Json;
+      if(JSON.stringify(host.activeSteering)!==JSON.stringify({version:1,supported:false}))this.emit(record.uri,{type:'session/metaChanged',_meta:{...metadata,'amplifier.dev/host':{...host,activeSteering:{version:1,supported:false}}}} as StateAction);
+    }
     // End interrupted projections without replaying the accepted command or past tool work.
     for(const row of this.store.db.prepare("SELECT uri FROM sessions WHERE json_extract(chat,'$.activeTurn') IS NOT NULL").all()) {
       const record=this.getRecord(row.uri as string)!;
@@ -232,7 +237,7 @@ export class AmplifierHost {
     for(const row of this.store.db.prepare("SELECT chat,id FROM queue_intents WHERE projected=0").all()){this.emit(String(row.chat),{type:'chat/pendingMessageRemoved',kind:'queued',id:String(row.id)} as PendingQueueAction);this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(row.id);}
     for(const row of this.store.db.prepare("SELECT DISTINCT chat FROM queue_intents WHERE status='pending'").all())this.holdQueue(String(row.chat),'host-restarted');
     for(const row of this.store.db.prepare("SELECT chat,id FROM steering_intents WHERE projected=0").all()){this.emit(String(row.chat),{type:'chat/pendingMessageRemoved',kind:'steering',id:String(row.id)} as PendingQueueAction);this.store.db.prepare('UPDATE steering_intents SET projected=1 WHERE id=?').run(row.id);}
-    for(const row of this.store.db.prepare("SELECT chat,id,message FROM steering_intents WHERE status='pending'").all())this.emit(String(row.chat),{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...JSON.parse(String(row.message)),_meta:{'amplifier.dev/steering':{held:true,reason:'host-restarted'}}}} as PendingQueueAction);
+    for(const row of this.store.db.prepare("SELECT chat,id,message FROM steering_intents WHERE status='pending'").all()){const message=JSON.parse(String(row.message));this.emit(String(row.chat),{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{...message._meta?.['amplifier.dev/steering'],held:true,reason:'host-restarted'}}}} as PendingQueueAction);}
   }
   async listen():Promise<this> {
     this.roots=await Promise.all(this.config.allowedWorkspaceRoots.map(root=>realpath(root)));
@@ -294,7 +299,7 @@ export class AmplifierHost {
     peer.socket.send(JSON.stringify(message));
   }
   private notify(method:string,params:Json,channel=ROOT) {const session=params.session??params.summary?.resource;if(channel===ROOT&&['root/sessionAdded','root/sessionSummaryChanged'].includes(method)&&typeof session==='string'&&this.presentation?.hidden(session))return;for(const peer of this.peers)if(peer.subscriptions.has(channel))this.send(peer,{jsonrpc:'2.0',method,params});}
-  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{libraryQuery:!!this.library,receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
+  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId'},defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{libraryQuery:!!this.library,receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
   private terminalList(){return this.store.db.prepare("SELECT uri,payload FROM terminals WHERE lifecycle='running' ORDER BY modified DESC LIMIT 128").all().map(row=>{const state=JSON.parse(row.payload as string);return {resource:row.uri,title:state.title,claim:state.claim,lifecycle:state.lifecycle};});}
   private terminalState(uri:string):TerminalState|undefined {const row=this.store.db.prepare('SELECT payload FROM terminals WHERE uri=?').get(uri);return row?JSON.parse(row.payload as string):undefined;}
   private terminalEvent(session:string,event:Parameters<NonNullable<AgentHandlers['terminal']>>[0]) {
@@ -742,7 +747,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId'},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
@@ -1908,6 +1913,13 @@ export class AmplifierHost {
     }
     const native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
     if(native?.activeSteering?.version!==1||native.activeSteering.mode!=='request_boundary')throw new RpcFault(-32601,'Agent does not advertise generation-anchored request-boundary steering');
+    if(action.message?._meta&&Object.hasOwn(action.message._meta,'amplifier.dev/steering')){
+      const binding=action.message._meta['amplifier.dev/steering'] as Json;
+      if(!binding||typeof binding!=='object'||Array.isArray(binding)||typeof binding.activeTurnId!=='string'||!binding.activeTurnId||binding.activeTurnId.length>128)throw new RpcFault(-32602,'Bound steering requires a bounded captured activeTurnId',{executed:false});
+      // The selected-session mutex covers comparison, replacement and admission.
+      const current=this.getRecord(record.uri)!,active=this.active.get(record.uri);
+      if(!active?.busy||active.cancel||active.turnId!==binding.activeTurnId||current.chat.activeTurn?.id!==binding.activeTurnId)throw new RpcFault(-32011,'The captured active turn changed; no steering input was admitted',{executed:false});
+    }
     if(!action.message||typeof action.message.text!=='string'||!action.message.text.trim()||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.attachments?.length||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering supports bounded user text; multimodal or per-message configuration is not negotiated');
     if(supportsPublicOriginal(mountedPublicOriginal(native?.publicMessagePreservation,this.active.get(record.uri)?.publicOriginalMount),'steer.submit'))capturePublicMessage(action.message,action.id);
     const payload=JSON.stringify(action.message);if(Buffer.byteLength(payload)>65536)throw new RpcFault(-32000,'Steering message exceeds byte bound');
@@ -1918,7 +1930,7 @@ export class AmplifierHost {
     this.store.transaction(()=>{
       this.store.db.prepare("UPDATE steering_intents SET status='removed',message=NULL WHERE chat=? AND status='pending' AND id!=?").run(chat,action.id);
       this.store.db.prepare("INSERT INTO steering_intents(id,chat,message,origin,status,held,active_turn_id) VALUES(?,?,?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET message=excluded.message,origin=excluded.origin,held=excluded.held,active_turn_id=excluded.active_turn_id").run(action.id,chat,payload,JSON.stringify(origin),held?1:0,activeTurnId);
-      this.emit(chat,{...action,message:{...action.message,_meta:{...action.message._meta,'amplifier.dev/steering':{held,...(held?{reason:'prior-execution-unknown'}:{})}}}},origin.clientSeq>=0?origin:undefined);
+      this.emit(chat,{...action,message:{...action.message,_meta:{...action.message._meta,'amplifier.dev/steering':{...(action.message._meta?.['amplifier.dev/steering'] as Json),held,...(held?{reason:'prior-execution-unknown'}:{})}}}},origin.clientSeq>=0?origin:undefined);
     });
     this.consumeSteering(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
   }
@@ -1944,11 +1956,24 @@ export class AmplifierHost {
     }).catch(error=>this.settleSteering(session,id,'unknown',(error as Error).message)).finally(()=>{clearTimeout(acceptanceTimer);active.steeringRuns?.delete(pending);});
     active.steeringRuns??=new Set();active.steeringRuns.add(pending);
   }
+  private publishSteeringSupport(session:string,active:Active) {
+    const record=this.getRecord(session);if(!record)return;
+    const mount=active.steeringMount,capability=mount?.capability;
+    const matches=!!active.busy&&!!active.turnId&&!!active.generationId&&mount?.activeTurnId===active.turnId&&mount?.generationId===active.generationId;
+    const supported=matches&&capability?.version===1&&capability.mode==='request_boundary'&&capability.supported!==false;
+    const report={version:1,supported,...(active.busy&&active.turnId?{activeTurnId:active.turnId}:{}),...(matches?{generationId:mount!.generationId}:{}),...(supported?{mode:capability!.mode,...(typeof capability!.cancellable==='boolean'?{cancellable:capability!.cancellable}:{})}:{})};
+    const metadata=record.state._meta??{},host=metadata['amplifier.dev/host'] as Json|undefined;
+    if(JSON.stringify(host?.activeSteering)===JSON.stringify(report))return;
+    this.emit(session,{type:'session/metaChanged',_meta:{...metadata,'amplifier.dev/host':{...host,activeSteering:report}}} as StateAction);
+  }
   private steeringEvent(session:string,active:Active,event:Json) {
-    if(event.type==='generation.started'&&active.busy&&event.activeInputId===active.turnId&&typeof event.generation_id==='string'&&event.generation_id.length<=128){
+    if(event.type==='generation.started'&&active.busy&&event.activeInputId===active.turnId&&typeof event.generation_id==='string'&&event.generation_id.length>0&&event.generation_id.length<=128){
       active.generationId=event.generation_id;
+      active.steeringMount={activeTurnId:active.turnId!,generationId:event.generation_id,capability:event.activeSteering};
+      this.publishSteeringSupport(session,active);
       void this.withLock(session,async()=>this.consumeSteering(session)).catch(()=>{});return;
     }
+    if(event.type==='runtime.closed'||['generation.finished','generation.failed','generation.detached'].includes(event.type)&&event.generation_id===active.generationId){active.steeringMount=undefined;active.generationId=undefined;this.publishSteeringSupport(session,active);}
     if(!['steering.applied','steering.held','steering.unknown'].includes(event.type)||typeof event.input_id!=='string')return;
     const row=this.store.db.prepare('SELECT * FROM steering_intents WHERE id=? AND chat=?').get(event.input_id,chatURI(session));
     if(!row||row.active_turn_id!==event.activeInputId||row.generation_id!==event.target_generation_id)return;
@@ -2106,7 +2131,7 @@ export class AmplifierHost {
     const historyPrefix=special?.operation==='history.revise'?await this.nativeHistory(record,50,undefined,{beforeTurnId:special.args.targetMessageId,expectedRevision:special.args.expectedHistoryRevision}):undefined;
     this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(special.args));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
-    this.touchAgent(active);active.busy=true;active.generationId=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();
+    this.touchAgent(active);active.busy=true;active.generationId=undefined;active.steeringMount=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();this.publishSteeringSupport(record.uri,active);
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
     active.historyRevision=historyPrefix?{args:special!.args,prefix:historyPrefix,confirmed:false}:undefined;
     if(special?.operation==='history.revise')active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};
@@ -2397,10 +2422,10 @@ export class AmplifierHost {
         if(!drain||this.closing)this.settleSteering(uri,id,'unknown','Turn interrupted without confirmed steering disposition');
         else{const timer=setTimeout(()=>this.settleSteering(uri,id,'unknown','Native steering disposition deadline expired'),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));timer.unref();this.steeringTimers.set(id,timer);}
       }
-      for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
+      for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{...message._meta?.['amplifier.dev/steering'],held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
       if(active.historyRevision){const receipt=this.store.receipt(turnId)!;this.store.db.prepare('UPDATE history_edits SET status=? WHERE operation_id=?').run(receipt.status,active.historyRevision.args.operationId);}
       active.historyRevision=undefined;active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;
-      for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;
+      for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.steeringMount=undefined;this.publishSteeringSupport(uri,active);
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
       let updatesJoined=true;
@@ -2528,7 +2553,7 @@ export class AmplifierHost {
     this.settledCallbacks.add(pending);
   }
   private notifyAgentStopped(session:string,active:Active,reason:AgentStopped['reason'],details:{exitCode?:number;signal?:string}={}) {
-    if(active.stopNotified)return;active.stopNotified=true;
+    if(active.stopNotified)return;active.stopNotified=true;active.steeringMount=undefined;active.generationId=undefined;this.publishSteeringSupport(session,active);
     for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND status='dispatching'").all(chatURI(session)))this.settleSteering(session,String(row.id),'unknown','Native runtime stopped without confirmed steering disposition');
     if(!this.config.agentStopped)return;
     const event=Object.freeze({session,nativeSessionId:active.agent.nativeId,engineId:active.agent.engine.id,workingDirectory:active.agent.cwd,reason,...details});
