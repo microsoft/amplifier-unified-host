@@ -675,10 +675,12 @@ test('cold receipt and steering archives stay out of current admission scans',as
 
 test('late held steering may settle after the parent prompt response without a false unknown',async()=>{
  const f=await setup();try{
+  const release=join(f.dir,'release-late-steering');(f.config.engines[0]!.env as Record<string,string>).FIXTURE_AFTER_TURN_RELEASE=release;
   const client=await f.connect(),{session}=await f.create(client),commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'slow',clientId:'owner'});
   await f.host.updatePendingQueue(session,{type:'chat/pendingMessageSet',kind:'steering',id:'late-held',message:{text:'after-turn steering',origin:{kind:'user'}}} as any,{clientId:'owner'});
   assert.equal((await f.host.waitForTurn(session,commandId)).completed,true);assert.equal(f.host.store.receipt('late-held')?.status,'dispatching');
   await assert.rejects(f.host.submitTurn(session,{commandId:randomUUID(),text:'too soon',clientId:'owner'}),/steering disposition is pending/);
+  await writeFile(release,'release');
   await waitFor(()=>f.host.store.receipt('late-held')?.status==='failed');assert.equal(f.host.diagnostics().steeringDispositionPending,0);
   const next=randomUUID();await f.host.submitTurn(session,{commandId:next,text:'confirmed new work',clientId:'owner'});assert.equal((await f.host.waitForTurn(session,next)).completed,true);
  }finally{await f.cleanup();}

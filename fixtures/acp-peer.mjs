@@ -211,7 +211,12 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       if(text==='many')for(let i=0;i<100;i++)update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'x'}});
       else update(p.sessionId,{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Echo: '+text}});
       reply(id,{...(text==='mapping'?{usage:{totalTokens:31,inputTokens:20,outputTokens:11,cachedReadTokens:4,cachedWriteTokens:2,thoughtTokens:3}}:{}),...(scheduled?{accepted:true,inputId:p.args.inputId}:{}),stopReason:turn.cancelled?'cancelled':'end_turn'});
-      if(turn.afterTurn)setTimeout(()=>send(turn.afterTurn),100);
+      if(turn.afterTurn){
+        // An explicit test release makes the pending-disposition assertion
+        // independent of scheduler load. Other fixture uses retain their delay.
+        if(process.env.FIXTURE_AFTER_TURN_RELEASE)void (async()=>{while(!existsSync(process.env.FIXTURE_AFTER_TURN_RELEASE))await new Promise(resolve=>setTimeout(resolve,5));send(turn.afterTurn);})();
+        else setTimeout(()=>send(turn.afterTurn),100);
+      }
     })();
   } else if(message.method==='session/cancel'){if(active)active.cancelled=true;}
   else if(message.id!==undefined)send({id:message.id,error:{code:-32601,message:'Unsupported'}});
