@@ -487,6 +487,25 @@ test('Recall inventories stay cold and pages retain exact messages, scoped curso
  }finally{if(reader)await reader.close();await f.cleanup();}
 });
 
+test('retained historical source lookup stays passive, bounded and separate from human admission',async()=>{
+ const f=await setup();let reader:any;try{
+  const dir=await realpath(f.dir),history=join(dir,'retained.json'),timestamp=new Date().toISOString();
+  const groups=Array.from({length:51},(_,i)=>({id:'old-'+i,state:'complete',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:'historical '+i},_meta:{'amplifier.dev/history':{messageId:'old-'+i,nativeInput:{version:1,kind:'user',id:'old-'+i},createdAt:timestamp}}}]}));
+  await writeFile(history,JSON.stringify(groups));
+  const record={uri:'ahp-session:/retained',engineId:'fixture',nativeSessionId:'native-retained',workingDirectory:dir,title:'Retained',kind:'root',workspaceAvailability:'present',createdAt:timestamp,modifiedAt:timestamp};
+  reader=await createHost({...f.config,stateDirectory:join(dir,'retained-state'),engines:f.config.engines.map((e:any)=>({...e,env:{...e.env,FIXTURE_HISTORY:history}})),catalog:{get:async(id:string)=>id===record.uri?record:undefined,upsert:async()=>{},list:async()=>({items:[record]})}});
+  const row=await reader.readHistoricalMessage(record.uri,'old-50');
+  assert.equal(row.text,'historical 50');assert.equal(row.role,'user');assert.equal(row._meta['amplifier.dev/history'].authorization,'unverified-native-history');
+  assert.deepEqual(row.provenance,{source:'host-projection',complete:true});assert.equal(row._meta['amplifier.dev/history'].nativeInput.id,'old-50');
+  await assert.rejects(reader.readUserMessage(record.uri,'old-50'),(e:any)=>e.reason==='not-indexed');
+  await assert.rejects(reader.readHistoricalMessage(record.uri,'old-0'),(e:any)=>e.data.reason==='outside-window');
+  await assert.rejects(reader.readHistoricalMessage(record.uri,'absent'),(e:any)=>e.data.reason==='outside-window');
+  await writeFile(history,JSON.stringify([{...groups[50],updates:[{...groups[50]!.updates[0],content:{type:'text',text:'x'.repeat(65536)}}]}]));
+  await assert.rejects(reader.readHistoricalMessage(record.uri,'old-50'),/complete-source byte bound/);
+  assert.equal(reader.diagnostics().activeAgents,0);await assert.rejects(readFile(f.log,'utf8'));
+ }finally{if(reader)await reader.close();await f.cleanup();}
+});
+
 test('question answers use settled common admission, preserve provenance and refuse busy or uncertain replay',async()=>{
  const f=await setup();try{
   const client=await f.connect(),{session}=await f.create(client),question={commandId:randomUUID(),text:'Use the blue option',questionId:'q-1',questionRevision:4,answerProvenance:{actor:'user',sourceMessageId:'answer-1',revision:7}};

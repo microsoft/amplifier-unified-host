@@ -2556,6 +2556,18 @@ export class AmplifierHost {
     const outcome=turnOutcome(turn?.responseParts??[],current.status==='completed');
     return {generation_id:commandId,status:current.status,completed:current.status==='completed',...outcome,detail:current.detail,...(current.retryEligibility?{executed:false,retryEligibility:current.retryEligibility,observationAdmission:current.observationAdmission}:{}),workContinues:['admitted','dispatching'].includes(current.status)};
   }
+  /** Bounded passive original read. This projection never supplies input admission. */
+  async readHistoricalMessage(session:string,messageId:string):Promise<Json> {
+    if(typeof messageId!=='string'||!messageId||messageId.length>512)throw new RpcFault(-32602,'An exact historical message identity is required');
+    const record=await this.record(session),page=await this.nativeHistory(record,50);
+    const matches=page.turns.filter(turn=>turn.id===messageId);
+    if(matches.length!==1)throw new RpcFault(-32008,'Historical message is outside the complete selected window',{available:false,reason:matches.length?'ambiguous-identity':'outside-window',window:50});
+    const turn=matches[0]!,message=turn.message,history=message._meta?.['amplifier.dev/history'] as Json|undefined;
+    if(Buffer.byteLength(JSON.stringify(message))>65536)throw new RpcFault(-32000,'Historical message exceeds the complete-source byte bound');
+    return structuredClone({...message,id:messageId,role:message.origin?.kind==='user'?'user':'assistant',createdAt:history?.createdAt??turn.startedAt,
+      inputOrigin:history?.inputOrigin??'unknown',questionId:history?.questionId,scheduledRunId:history?.scheduledRunId,
+      sourceRevision:page.revision,provenance:{source:'host-projection',complete:true}});
+  }
   /** Exact host-indexed input, never a recent-window search or eager native transcript read. */
   async readUserMessage(session:string,messageId:string,options:{maxBytes?:number}={}):Promise<Json> {
     if(typeof messageId!=='string'||!messageId||messageId.length>512)throw new RpcFault(-32602,'A bounded exact message identity is required');
