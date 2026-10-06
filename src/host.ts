@@ -1,3 +1,4 @@
+import {missingHistoryWorkspace} from './history-workspace.js';
 import {turnOutcome} from './turn-outcome.js';
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
 import {PUBLIC_MESSAGE_META,publicMessage,capturePublicMessage,supportsPublicOriginal,mountedPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
@@ -29,6 +30,7 @@ export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:stri
 export interface CatalogFamilyDiscovery {version:1;scope:'selected-native-project-namespaces';phase:'complete'|'refused';issues:string[];maxEntries:number;metadataByteLimit:number;metadataFileLimit:number;indexRevision:string;verificationToken:string;inventoryHash:string;entriesExamined:number;metadataReads:number;metadataBytesAdmitted:number;namespaces:string[];completedAt:string;externalWriterCoverage:false;transcriptBodiesRead:false;nativeOwnershipVerified:false;}
 export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};familyDiscovery?:CatalogFamilyDiscovery;}
 export interface Catalog {
+  libraryCapabilities?():Promise<Json>;
   supportsLibraryQuery?:()=>Promise<boolean>;
   libraryQuery?:(params:LibraryRead)=>Promise<{version:1;items:CatalogRecord[];nextCursor?:string;observationFreshness?:unknown;[key:string]:unknown}>;
   list(params:{connectionId:string;limit:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;allowedWorkspaceRoots?:string[];allowedManagedRoots?:string[];includeArchive?:boolean;archive?:'active'|'all'|'archived'}):Promise<{items:CatalogRecord[];nextCursor?:string;freshness?:unknown}>;
@@ -332,7 +334,13 @@ export class AmplifierHost {
   private insideManaged(path:string){if(!this.managed)return false;const r=relative(this.managed.root,path);return !r||r!=='..'&&!r.startsWith('../')&&!isAbsolute(r);}
   private async selectedWorkspace(record:SessionRecord,execution=false):Promise<string>{
     const location=record.state._meta?.['amplifier.dev/location'] as ManagedLocation|undefined;
-    if(!location)return this.workspace(pathToFileURL(execution?(record.executionDirectory??record.workingDirectory):record.workingDirectory).href);
+    if(!location){
+      if(execution)return this.workspace(pathToFileURL(record.executionDirectory??record.workingDirectory).href);
+      const missing=await missingHistoryWorkspace(record.workingDirectory,this.roots,this.managed?.root);
+      const native=record.state._meta?.['amplifier.dev/native'] as Json|undefined;
+      if((native?.workspaceAvailable===false)!==missing)this.emit(record.uri,{type:'session/metaChanged',_meta:{...record.state._meta,'amplifier.dev/native':{...native,workspaceAvailable:!missing,historyReadOnly:missing}}} as StateAction);
+      return record.workingDirectory;
+    }
     const receipt=this.managed?.bySession(record.uri);
     if(!receipt||receipt.state!=='completed'||managedHash(location)!==managedHash(this.managed!.location(receipt))||record.nativeSessionId!==location.allocationId||record.engineId!==receipt.request.provider)throw new RpcFault(-32009,'Managed session has no confirmed local allocation authority');
     const disposed=this.managedFiles.fence(record.uri);
@@ -398,13 +406,13 @@ export class AmplifierHost {
     const discovered=await this.exactCatalogRecord(session);
     if(!discovered)throw new RpcFault(-32008,'Unknown resource');
     if(discovered.location?.kind==='managed')throw new RpcFault(-32009,'Managed session must be restored from its local allocation receipt before activation');
-    await this.workspace(pathToFileURL(discovered.workingDirectory).href);
+    const missing=await missingHistoryWorkspace(discovered.workingDirectory,this.roots,this.managed?.root);
     // Metadata discovery never starts an agent. Native histories are read by the catalog/resource owner.
     const timestamp=discovered.modifiedAt;
     const summary=this.catalogSummary(discovered);
     const chat:ChatState={resource:chatURI(session),title:summary.title,status:summary.status,modifiedAt:timestamp,turns:[],_meta:{'amplifier.dev/history':{source:'native',available:false,reason:'Native history projection has not been imported'}}};
     record={uri:session,engineId:discovered.engineId,nativeSessionId:discovered.nativeSessionId,workingDirectory:discovered.workingDirectory,summary,
-      state:{provider:summary.provider,title:summary.title,status:summary.status,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:{'amplifier.dev/native':{availability:discovered.availability??'available'},...(discovered.nativeDeleted?{'amplifier.dev/lifecycle':{version:1,deleted:true,source:'native-catalog'}}:{})}},chat};
+      state:{provider:summary.provider,title:summary.title,status:summary.status,lifecycle:SessionLifecycle.Ready,activeClients:[],chats:[this.chatSummary(chat)],defaultChat:chat.resource,workingDirectories:summary.workingDirectories,_meta:{'amplifier.dev/native':{availability:discovered.availability??'available',workspaceAvailable:!missing,historyReadOnly:missing},...(discovered.nativeDeleted?{'amplifier.dev/lifecycle':{version:1,deleted:true,source:'native-catalog'}}:{})}},chat};
     if(this.presentation&&discovered.nativeSessionId)this.presentation.retainMapping(discovered as unknown as Json);this.store.save(record);if(discovered.nativeDeleted){this.store.db.prepare('INSERT OR REPLACE INTO session_visibility VALUES(?,1,?)').run(record.uri,'catalog-native-deleted');this.store.db.prepare('UPDATE sessions SET hidden=1 WHERE uri=?').run(record.uri);}this.emit(ROOT,{type:'root/activeSessionsChanged',activeSessions:this.store.count} as StateAction);return record;
   }
   private getRecord(uri:string):SessionRecord|undefined {return this.hotRecords.get(uri.startsWith('ahp-chat:/')?'ahp-session:/'+uri.slice('ahp-chat:/'.length):uri)??this.store.get(uri);}
@@ -464,7 +472,9 @@ export class AmplifierHost {
     try{
       const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
       if(capability?.version!==1||capability.paging!=='complete-turns'||capability.passive!==true||capability.passiveInspect!==true)throw new RpcFault(-32601,'Agent does not advertise revision-checked passive history');
-      return await agent.client.extMethod(operation==='inspect'?'_amplifier/history/inspect':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,...params});
+      const missing=(record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true;
+      if(missing&&capability.missingWorkspaceRead?.version!==1)throw new RpcFault(-32601,'Agent does not advertise read-only missing-workspace history');
+      return await agent.client.extMethod(operation==='inspect'?'_amplifier/history/inspect':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,...params,...(missing?{readOnlyMissingWorkspace:true}:{})});
     }finally{this.passiveReads--;await agent.retire();}
   }
   /** Metadata-only indexed inventory. Unselected catalog history is intentionally outside this coverage. */
@@ -562,7 +572,9 @@ export class AmplifierHost {
     try{
       const init=await agent.initialize(),capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.publicMessagePreservation;
       if(capability?.version!==1||capability.publicRows!==true||locator&&capability.exactRowRead!==true)throw new RpcFault(-32601,'Native public row reading is not qualified');
-      const result:Json=await agent.client.extMethod('_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,includePublicRows:true,...input});
+      const missing=(record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true;
+      if(missing&&(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history?.missingWorkspaceRead?.version!==1)throw new RpcFault(-32601,'Agent does not advertise read-only missing-workspace history');
+      const result:Json=await agent.client.extMethod('_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,includePublicRows:true,...input,...(missing?{readOnlyMissingWorkspace:true}:{})});
       if(typeof result.revision!=='string'||!Array.isArray(result.diagnostics)||input.expectedRevision!==undefined&&result.revision!==input.expectedRevision)throw new RpcFault(-32013,'Native public row revision changed');
       const rows=this.publicRows(record,result);
       if(result.nextCursor!==undefined&&result.nextCursor!==null&&(typeof result.nextCursor!=='string'||!result.nextCursor||result.nextCursor===input.cursor))throw new RpcFault(-32013,'Native public row cursor did not advance');
@@ -657,11 +669,13 @@ export class AmplifierHost {
       const init=await agent.initialize();
       const capability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
       if(capability?.version!==1||capability?.paging!=='complete-turns'||capability?.passive!==true)throw new RpcFault(-32601,'Agent does not advertise a passive native history reader');
+      const missing=(record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true;
+      if(missing&&(before||capability.missingWorkspaceRead?.version!==1))throw new RpcFault(-32601,'Agent does not advertise this read-only missing-workspace history operation');
       let next=cursor,revision='',diagnostics:unknown[]=[],turns:Turn[]=[],editContext:Json|undefined;
       do {
         const publicCapability=(init.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.publicMessagePreservation;
         const includePublicRows=!before&&publicCapability?.version===1&&publicCapability.publicRows===true;
-        const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(includePublicRows?{includePublicRows:true}:{}),...(before??{}),...(next?{cursor:next}:{})}) as Json;
+        const result=await agent.client.extMethod(before?'_amplifier/history/before':'_amplifier/history',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,limit:Math.min(limit===undefined?200:limit-turns.length,200),...(includePublicRows?{includePublicRows:true}:{}),...(missing?{readOnlyMissingWorkspace:true}:{}),...(before??{}),...(next?{cursor:next}:{})}) as Json;
         if(!Array.isArray(result.turnGroups)||typeof result.revision!=='string')throw new Error('Malformed native history page');
         if(result.selection?.version===1&&typeof result.selection.bundle==='string'&&result.selection.bundle.length<=4096&&typeof result.selection.bundleLabel==='string'&&result.selection.bundleLabel.length<=200){
           const fresh=this.getRecord(record.uri);
@@ -1316,13 +1330,14 @@ export class AmplifierHost {
   }
   private guardSessionLifecycle(session:string) {
     this.guardTransfer(session);
+    if((this.getRecord(session)?.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true)throw new RpcFault(-32011,'The original workspace is missing. This conversation is read-only; no work was started.',{executed:false,reason:'workspace-missing'});
     if(this.managedFiles.fence(session))throw new RpcFault(-32011,'Managed files disposal is fenced; inspect its receipt or create an independent recovery copy');
     const allocation=this.managed?.bySession(session);if(allocation&&allocation.state!=='completed')throw new RpcFault(-32011,'Managed creation is unresolved; inspect its original receipt without replay');
     if(this.store.db.prepare("SELECT 1 FROM import_adoptions WHERE session=? AND status<>'completed' LIMIT 1").get(session))throw new RpcFault(-32011,'Imported session registration is unresolved; inspect its exact receipt');
     if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE (session=? OR target=?) AND status IN ('dispatching','unknown') LIMIT 1").get(session,session))throw new RpcFault(-32011,'Session lifecycle outcome is unresolved; inspect the original receipt without replay');
     if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(session))throw new RpcFault(-32008,'Session was removed from discovery; restore it before execution');
   }
-  private passiveProcessDirectory(record:SessionRecord){return this.managedFiles.fence(record.uri)?this.defaultWorkingDirectory:record.workingDirectory;}
+  private passiveProcessDirectory(record:SessionRecord){return this.managedFiles.fence(record.uri)||(record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true?this.defaultWorkingDirectory:record.workingDirectory;}
   private async lifecycleAgent<T>(record:SessionRecord,work:(agent:AcpProcess)=>Promise<T>):Promise<T> {
     if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
     const engine=this.config.engines.find(engine=>engine.id===record.engineId);if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native lifecycle identity is unavailable');
@@ -1335,7 +1350,12 @@ export class AmplifierHost {
   }
   /** Native storage owner inspection; no transcript body or prepared runtime. */
   async inspectSessionHistory(session:string):Promise<Json> {
-    const record=await this.record(session),result:Json=await this.lifecycleAgent(record,async agent=>{const inspected=await this.nativeLifecycle(agent,record,'inspect');return {...inspected,lifecycleCapabilities:(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle};});
+    const record=await this.record(session);
+    if((record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true){
+      const inspected=await this.passiveRecall(record,'inspect');
+      return {session:record.uri,sessionId:record.nativeSessionId,historyRevision:inspected.revision,diagnostics:inspected.diagnostics,metadata:{},location:{historyCwd:record.workingDirectory,executionAvailable:false},readOnly:true,lifecycleCapabilities:{version:1,passive:true,missingWorkspaceRead:true}};
+    }
+    const result:Json=await this.lifecycleAgent(record,async agent=>{const inspected=await this.nativeLifecycle(agent,record,'inspect');return {...inspected,lifecycleCapabilities:(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle};});
     if(result.sessionId!==record.nativeSessionId||typeof result.historyRevision!=='string'||result.historyRevision.length>512||result.location?.historyCwd!==record.workingDirectory)throw new RpcFault(-32000,'Native lifecycle inspection returned a different identity');
     return {session:record.uri,...result,lifecycleFence:this.store.db.prepare("SELECT command_id,operation,status FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown') LIMIT 1").get(record.uri)};
   }

@@ -2,7 +2,7 @@ import {createHash} from 'node:crypto';
 import {SessionStatus} from '@microsoft/agent-host-protocol';
 import type {Catalog,CatalogRecord} from './host.js';
 export interface HostObservation {version:1;source:string;incarnation:string;revision:number;observedAt:string;effect:'unknown'|'error'|'settled'|'unverified';unknownChecked:true;}
-export interface LibraryQuery {connectionId:string;allowedWorkspaceRoots:string[];limit?:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;archive?:'active'|'all'|'archived';sort?:'activity'|'created'|'name';activity?:'all'|'working'|'attention';location?:'all'|'managed';allowedManagedRoots?:string[];}
+export interface LibraryQuery {connectionId:string;allowedWorkspaceRoots:string[];limit?:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;archive?:'active'|'all'|'archived';sort?:'activity'|'created'|'name';activity?:'all'|'working'|'attention';location?:'all'|'managed'|'missing';allowedManagedRoots?:string[];}
 export interface LiveFact {uri:string;runtime:'working'|'input-needed'|'idle'|'unknown';effect:HostObservation['effect'];modifiedAt:number;}
 export interface LibraryRead extends LibraryQuery {liveFacts:{source:string;incarnation:string;items:LiveFact[]};observationFreshness:{phase:'complete'|'reconciling'|'degraded';issues:string[]};}
 export interface LibraryHooks {

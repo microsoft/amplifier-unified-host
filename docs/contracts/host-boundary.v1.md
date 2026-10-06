@@ -331,3 +331,14 @@ at composition before an engine naming capability is advertised.
 [Focused causal checks](../../test/session-title-metadata.test.ts) use owned
 metadata fixtures and an independent ACP notification peer; source/package
 acceptance remains separate from Native, bridge and browser/account acceptance.
+
+### Missing ordinary workspace history
+
+A missing folder inside the launcher's canonical workspace grants may remain a
+read scope. Host advertises `amplifier.dev/native.workspaceAvailable: false` and
+`historyReadOnly: true`, negotiates Native's exact-metadata passive reader, and
+uses its configured existing default directory only to launch that reader.
+It never substitutes that directory for execution or rewrites the native cwd.
+Native still proves the original identity and metadata. Mutation/lifecycle
+admission is refused; restoring the original folder clears this temporary state.
+Managed allocation recovery continues to use its separate receipt contract.

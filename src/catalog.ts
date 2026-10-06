@@ -40,6 +40,7 @@ export class StdioCatalog implements Catalog {
     if(Buffer.byteLength(frame)>1024*1024)return Promise.reject(new Error('Catalog request exceeded 1 MiB'));
     return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('Catalog response timed out'));},10000);timer.unref();this.pending.set(id,{resolve,reject,timer});this.process.stdin.write(frame,error=>{if(error){clearTimeout(timer);this.pending.delete(id);reject(error);}});});
   }
+  libraryCapabilities(){return this.request('libraryCapabilities',{});}
   async supportsLibraryQuery(){try{return (await this.request('libraryCapabilities',{})).version===1;}catch(error){if((error as any).code===-32601)return false;throw error;}}
   libraryQuery(params:import('./library-index.js').LibraryRead){return this.request('libraryQuery',{...params});}
   list(params:Parameters<Catalog['list']>[0]) {return this.request('list',params);}
