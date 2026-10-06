@@ -45,3 +45,37 @@ test('inactive sessions and oversized requests do not start work or create a rev
   await f.start();await assert.rejects(f.host.confirmCapability(f.session,{operation:'fixture.publish',title:'Too large',args:{body:'x'.repeat(70000)}}),/review limit/);assert.equal(f.review(),undefined);assert.equal(f.effects,0);
  }finally{await f.close();}
 });
+
+test('active input proof binds the actual root and refuses historical, queued and held inputs',async()=>{
+ const f=await fixture();try{
+  const actor=()=> 'agent:'+f.host.store.get(f.session)!.nativeSessionId;
+  await assert.rejects(f.host.readActiveUserMessage(f.session,f.turnId,actor()),/current authenticated/);
+  await f.start();const original=await f.host.readActiveUserMessage(f.session,f.turnId,actor());
+  assert.equal(original.text,'approval');assert.equal(original.provenance.source,'host-admission');
+  assert.equal(original.delivery.activeTurnId,f.turnId);assert.ok(original.delivery.generationId);assert.match(original.delivery.sourceDigest,/^[a-f0-9]{64}$/);
+  await assert.rejects(f.host.readActiveUserMessage(f.session,f.turnId,'agent:child'),/current authenticated/);
+  await assert.rejects(f.host.readActiveUserMessage(f.session,'previous-turn',actor()),/current authenticated/);
+  f.a.dispatch(f.chat,{type:'chat/pendingMessageSet',kind:'queued',id:'queued-proof',message:{text:'next',origin:{kind:'user'}}});
+  f.a.dispatch(f.chat,{type:'chat/pendingMessageSet',kind:'steering',id:'held-proof',message:{text:'held steering',origin:{kind:'user'}}});
+  await wait(()=>f.host.store.db.prepare("SELECT 1 FROM steering_intents WHERE id='held-proof' AND status='held'").get());
+  await assert.rejects(f.host.readActiveUserMessage(f.session,'queued-proof',actor()),/current authenticated/);
+  await assert.rejects(f.host.readActiveUserMessage(f.session,'held-proof',actor()),/current authenticated/);
+  f.a.dispatch(f.chat,{type:'chat/pendingMessageSet',kind:'steering',id:'applied-proof',message:{text:'current correction',origin:{kind:'user'}}});
+  await wait(()=>f.host.store.db.prepare("SELECT 1 FROM steering_intents WHERE id='applied-proof' AND status='applied'").get());
+  const correction=await f.host.readActiveUserMessage(f.session,'applied-proof',actor());assert.equal(correction.text,'current correction');assert.equal(correction.delivery.generationId,original.delivery.generationId);
+  f.a.dispatch(f.chat,{type:'chat/pendingMessageRemoved',id:'queued-proof',kind:'queued'});
+  f.a.dispatch(f.chat,{type:'chat/turnCancelled',turnId:f.turnId});
+  await wait(()=>!f.host.store.get(f.session)?.chat.activeTurn);
+  await assert.rejects(f.host.readActiveUserMessage(f.session,'applied-proof',actor()),/current authenticated/);
+ }finally{await f.close();}
+});
+
+test('active input proof rechecks generation after an asynchronous input lookup',async()=>{
+ const f=await fixture();try{
+  await f.start();const read=f.host.readUserMessage.bind(f.host);let unblock!:()=>void,entered!:()=>void;
+  const gate=new Promise<void>(r=>unblock=r),reading=new Promise<void>(r=>entered=r);
+  f.host.readUserMessage=async(...args)=>{const message=await read(...args);entered();await gate;return message;};
+  const result=f.host.readActiveUserMessage(f.session,f.turnId,'agent:'+f.host.store.get(f.session)!.nativeSessionId);const refused=assert.rejects(result,/current authenticated/);
+  await reading;f.a.dispatch(f.chat,{type:'chat/turnCancelled',turnId:f.turnId});await wait(()=>!f.host.store.get(f.session)?.chat.activeTurn);unblock();await refused;
+ }finally{await f.close();}
+});

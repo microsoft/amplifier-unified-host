@@ -2497,7 +2497,23 @@ export class AmplifierHost {
     const receipt=this.store.receipt(messageId),admission=receipt?.channel===record.chat.resource?receipt:undefined;
     const questionId=input?.questionId??history?.questionId??scheduled?.questionId??raw.questionId,scheduledRunId=scheduled?.scheduledRunId??input?.scheduledRunId??raw.scheduledRunId,voiceId=history?.callId??input?.voiceId??raw.voiceId,voiceItemId=history?.itemId??input?.voiceItemId??raw.voiceItemId;
     const inputOrigin=scheduled||scheduledRunId?'scheduled':questionId?'question':history?.via==='call'?'voice':input?.inputOrigin??history?.inputOrigin??raw.inputOrigin??(admission?'user':'unknown');
-    return structuredClone({...message,id:messageId,role:'user',createdAt,inputOrigin,...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(voiceId?{voiceId}:{}),...(voiceItemId?{voiceItemId}:{}),provenance:{source:admission?'host-admission':'host-projection',complete:true,...(admission?{admission:{clientId:admission.clientId,status:admission.status,createdAt:admission.createdAt}}:{})}});
+    const sourceDigest=createHash('sha256').update(JSON.stringify([messageId,message,createdAt,inputOrigin])).digest('hex');
+    return structuredClone({...message,id:messageId,role:'user',createdAt,inputOrigin,sourceDigest,...(questionId?{questionId}:{}),...(scheduledRunId?{scheduledRunId}:{}),...(voiceId?{voiceId}:{}),...(voiceItemId?{voiceItemId}:{}),provenance:{source:admission?'host-admission':'host-projection',complete:true,...(admission?{admission:{clientId:admission.clientId,status:admission.status,createdAt:admission.createdAt}}:{})}});
+  }
+  /** Exact input delivered to this live root. Role and prose alone are not delivery proof.
+   * Trusted owners still decide which input origins can authorize their own actions. */
+  async readActiveUserMessage(session:string,messageId:string,actorId:string):Promise<Json> {
+    const record=await this.record(session),active=this.active.get(record.uri);
+    const refuse=():never=>{throw new RpcFault(-32011,'The exact input is not delivered to the current authenticated root generation',{executed:false});};
+    if(!active?.busy||!active.turnId||!active.generationId||active.cancel||this.closing||!record.nativeSessionId||active.agent.nativeId!==record.nativeSessionId||actorId!=='agent:'+record.nativeSessionId)refuse();
+    const turnId=active!.turnId!,generationId=active!.generationId!,nativeSessionId=record.nativeSessionId!;
+    const delivered=()=>messageId===turnId||!!this.store.db.prepare("SELECT 1 FROM steering_intents WHERE chat=? AND id=? AND status='applied' AND active_turn_id=? AND generation_id=?").get(record.chat.resource,messageId,turnId,generationId);
+    if(!delivered())refuse();
+    const message=await this.readUserMessage(record.uri,messageId);
+    if(this.active.get(record.uri)!==active||!active!.busy||active!.cancel||active!.turnId!==turnId||active!.generationId!==generationId||active!.agent.nativeId!==nativeSessionId||this.closing||!delivered()||message.provenance?.source!=='host-admission')refuse();
+    return {...message,delivery:{sessionId:record.uri,nativeSessionId,activeTurnId:turnId,generationId,
+      interruptionRevision:this.store.revisions(record.uri).interruptionRevision,
+      sourceDigest:message.sourceDigest}};
   }
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
@@ -3038,7 +3054,7 @@ export class AmplifierHost {
   /** Trusted composition only. Uses the ordinary AHP confirmation surface and
    * binds one reviewed effect to the currently executing originating turn. */
   async confirmCapability(session:string,input:{operation:string;title:string;args:Json}) {
-    const refuse=(message:string):never=>{throw new RpcFault(-32009,message,{executed:false,reason:'capability-approval-refused'});};
+    const refuse=(message:string,decision?:'deny'):never=>{throw new RpcFault(-32009,message,{executed:false,reason:'capability-approval-refused',...(decision?{decision}:{})});};
     if(typeof session!=='string'||!session.startsWith('ahp-session:/'))refuse('An originating conversation is required for approval');
     await this.record(session);
     if(!input||typeof input.operation!=='string'||!input.operation||input.operation.length>120||typeof input.title!=='string'||!input.title||input.title.length>200||!input.args||typeof input.args!=='object'||Array.isArray(input.args))refuse('A bounded capability review is required');
@@ -3052,7 +3068,7 @@ export class AmplifierHost {
     const approved=decision.outcome.outcome==='selected'&&decision.outcome.optionId==='approve'&&this.active.get(session)===active&&active!.busy&&active!.turnId===turnId&&!active!.cancel&&!this.closing;
     // Approval is a completed review, not evidence that the remote effect ran.
     if(this.active.get(session)===active&&active!.turnId===turnId&&active!.busy)this.emit(chatURI(session),{type:'chat/toolCallComplete',turnId,toolCallId:id,result:{success:approved,pastTenseMessage:approved?'Approved the proposed action':'Action was not approved'}} as StateAction);
-    if(!approved)refuse('The proposed action was not approved. No effect was authorized');
+    if(!approved)refuse('The proposed action was not approved. No effect was authorized',decision.outcome.outcome==='selected'&&decision.outcome.optionId==='deny'?'deny':undefined);
     return {approved:true,permissionId:id,turnId};
   }
   /** Shared admission path for authenticated clients and trusted native-host callbacks. */
