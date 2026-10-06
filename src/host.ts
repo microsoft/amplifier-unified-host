@@ -3004,6 +3004,26 @@ export class AmplifierHost {
   }
   /** Advertised tools only: no client drafts, DOM, editing buffers or rendered state. */
   async listClientTools(session:string) {const record=await this.record(session);return structuredClone(record.state.activeClients);}
+  /** Trusted composition only. Uses the ordinary AHP confirmation surface and
+   * binds one reviewed effect to the currently executing originating turn. */
+  async confirmCapability(session:string,input:{operation:string;title:string;args:Json}) {
+    const refuse=(message:string):never=>{throw new RpcFault(-32009,message,{executed:false,reason:'capability-approval-refused'});};
+    if(typeof session!=='string'||!session.startsWith('ahp-session:/'))refuse('An originating conversation is required for approval');
+    await this.record(session);
+    if(!input||typeof input.operation!=='string'||!input.operation||input.operation.length>120||typeof input.title!=='string'||!input.title||input.title.length>200||!input.args||typeof input.args!=='object'||Array.isArray(input.args))refuse('A bounded capability review is required');
+    const review=structuredClone({operation:input.operation,args:input.args});
+    if(Buffer.byteLength(JSON.stringify(review))>65536)refuse('The proposed effect exceeds the conversation review limit');
+    const active=this.active.get(session),turnId=active?.turnId;
+    if(!active?.busy||!turnId||active.cancel||this.closing)refuse('An active originating conversation is required for publication approval');
+    if(active!.permissions.size>=8)refuse('Resolve the pending conversation decisions before requesting another approval');
+    const id='capability-approval:'+randomUUID();
+    const decision=await this.permission(session,{sessionId:active!.agent.nativeId!,toolCall:{toolCallId:id,title:input.title,kind:'other',rawInput:review},options:[{optionId:'approve',name:'Approve once',kind:'allow_once'},{optionId:'deny',name:'Deny once',kind:'reject_once'}]});
+    const approved=decision.outcome.outcome==='selected'&&decision.outcome.optionId==='approve'&&this.active.get(session)===active&&active!.busy&&active!.turnId===turnId&&!active!.cancel&&!this.closing;
+    // Approval is a completed review, not evidence that the remote effect ran.
+    if(this.active.get(session)===active&&active!.turnId===turnId&&active!.busy)this.emit(chatURI(session),{type:'chat/toolCallComplete',turnId,toolCallId:id,result:{success:approved,pastTenseMessage:approved?'Approved the proposed action':'Action was not approved'}} as StateAction);
+    if(!approved)refuse('The proposed action was not approved. No effect was authorized');
+    return {approved:true,permissionId:id,turnId};
+  }
   /** Shared admission path for authenticated clients and trusted native-host callbacks. */
   async invokeCapability(request:Json,actor:{actorId:string;clientId?:string;origin?:'agent'|'ui';session?:string}) {
     const provider=this.config.capabilities;
@@ -3020,7 +3040,7 @@ export class AmplifierHost {
     this.store.transaction(()=>this.store.admission(request.channel,request,request.commandId,actor.actorId,this.store.extensionSequence(actor.actorId)));
     this.store.finish(request.commandId,'dispatching');
     try {const result=await provider.action(request,{actorId:actor.actorId,clientId:actor.clientId??'',origin:actor.origin??'ui',session});this.store.finish(request.commandId,result.accepted?'completed':'failed');for(const topic of result.invalidate??[])this.invalidateCapability(topic,request.channel===ROOT?'host':request.channel);for(const update of result.updates??[])this.invalidateCapability(update.topic,update.scope);return result;}
-    catch(error){this.store.finish(request.commandId,'unknown',(error as Error).message);throw error;}
+    catch(error){this.store.finish(request.commandId,error instanceof RpcFault&&(error.data as Json)?.reason==='capability-approval-refused'?'failed':'unknown',(error as Error).message);throw error;}
     };
     return access?this.intake.inspectOnly(execute):actor.origin==='agent'&&actor.session&&this.scopedNativeContinuation(actor.session)?this.intake.continuation(execute):this.intake.run(execute);
   }

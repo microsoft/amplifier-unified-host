@@ -58,6 +58,17 @@ actor fields. A UI actor cannot set it. `args.sessionId` is an owner-validated
 selector, never proof that the caller owns that session. Owners enforce own-session
 restrictions against authenticated context even when the action's topic is global.
 
+Trusted composition can call `confirmCapability(session, {operation,title,args})`
+to review a bounded proposed effect through the existing AHP tool confirmation
+surface. The originating session must already have an active turn. The review
+authorizes exactly that in-flight call, never a future turn, retained blanket
+grant, caller-supplied approval, or remote-effect outcome. Rejection, cancellation
+and turn completion refuse without effect authority. The method is not a wire
+RPC or an agent-advertised action. Capability owners still own validation,
+publication, durable receipts and reconciliation. Source qualification:
+`test/capability-approval.test.ts` uses two official clients and an independent
+ACP peer; this does not certify external publication or browser presentation.
+
 New capability v1 command IDs follow the registry's 1–256-character bound, with
 no truncation. Existing longer durable IDs remain passively inspectable through
 `x-commandReceipt`; reading their receipts does not admit or replay the effect.
