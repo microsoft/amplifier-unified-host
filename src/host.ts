@@ -2559,7 +2559,29 @@ export class AmplifierHost {
   /** Bounded passive original read. This projection never supplies input admission. */
   async readHistoricalMessage(session:string,messageId:string):Promise<Json> {
     if(typeof messageId!=='string'||!messageId||messageId.length>512)throw new RpcFault(-32602,'An exact historical message identity is required');
-    const record=await this.record(session),page=await this.nativeHistory(record,50);
+    const record=await this.record(session),engine=this.config.engines.find(engine=>engine.id===record.engineId);
+    if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Native historical source identity is unavailable');
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive historical source read capacity reached');
+    this.passiveReads++;
+    const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive historical source inspection cannot perform effects');}});
+    try{
+      const initialized=await agent.initialize(),capability=(initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
+      if(capability?.version===1&&capability.passive===true&&capability.exactMessageRead?.version===1){
+        const missing=(record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true;
+        if(missing&&capability.missingWorkspaceRead?.version!==1)throw new RpcFault(-32601,'Missing-workspace history inspection is unavailable');
+        const scope={sessionId:record.nativeSessionId,cwd:record.workingDirectory,...(missing?{readOnlyMissingWorkspace:true}:{})};
+        const inspected=await agent.client.extMethod('_amplifier/history/inspect',scope) as Json;
+        if(inspected.available!==true||typeof inspected.revision!=='string'||!inspected.revision||inspected.revision.length>512)throw new RpcFault(-32008,'Historical source inspection is unavailable');
+        const result=await agent.client.extMethod('_amplifier/history/message',{...scope,messageId,expectedRevision:inspected.revision}) as Json,message=result.message;
+        if(result.revision!==inspected.revision||result.selection!=='exact-message'||result.complete!==true||result.execution!==false||!message||message.id!==messageId||message.role!=='user'||typeof message.text!=='string'||Buffer.byteLength(JSON.stringify(result))>65536)throw new RpcFault(-32000,'Invalid or incomplete historical source');
+        const history:Json={...this.nativeMessageHistory(record,message._meta?.['amplifier.dev/history']),authorization:'unverified-native-history'};
+        return structuredClone({id:messageId,role:'user',text:message.text,_meta:{'amplifier.dev/history':history},createdAt:history.createdAt,
+          inputOrigin:history.inputOrigin??'unknown',questionId:history.questionId,scheduledRunId:history.scheduledRunId,
+          sourceRevision:result.revision,provenance:{source:'host-projection',complete:true}});
+      }
+    }finally{this.passiveReads--;await agent.retire();}
+    // Older negotiated readers retain their explicitly bounded compatibility path.
+    const page=await this.nativeHistory(record,50);
     const matches=page.turns.filter(turn=>turn.id===messageId);
     if(matches.length!==1)throw new RpcFault(-32008,'Historical message is outside the complete selected window',{available:false,reason:matches.length?'ambiguous-identity':'outside-window',window:50});
     const turn=matches[0]!,message=turn.message,history=message._meta?.['amplifier.dev/history'] as Json|undefined;
