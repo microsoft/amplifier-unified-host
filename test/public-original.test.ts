@@ -204,3 +204,25 @@ for(const originals of [false,true])test(`historical steering stays chronologica
     const repeated=await (f.host as any).nativeHistory(f.host.store.get(f.session),50);assert.equal(repeated.turns[0].responseParts.filter((p:any)=>p.kind==='systemNotification').length,1);
   }finally{await f.close();}
 });
+
+test('passive peer notification remains an attributed inline input in history and selected context',async()=>{
+  const f=await fixture();try{
+    const native=f.host.store.get(f.session)!.nativeSessionId!,turnId=randomUUID(),peerId='peer:'+randomUUID();
+    const envelope={version:1,requestId:peerId,mode:'notify',senderSessionId:'ahp-session:/source',recipientSessionId:f.session};
+    const at='2026-10-06T20:00:00Z';
+    const history=(id:string,position:number,extra:any={})=>({messageId:id,rowLocator:{sessionId:native,messageId:id,position,historyEpoch:null},...extra});
+    const chunk=(role:string,id:string,text:string,position:number,extra:any={})=>({sessionUpdate:role+'_message_chunk',content:{type:'text',text},_meta:{'amplifier.dev/history':history(id,position,extra)}});
+    const updates=[chunk('user','human', 'Original human request',0,{inputOrigin:'user',nativeInput:{id:turnId,version:1,kind:'user'}}),chunk('agent','before','Before the notice',10),chunk('user','notice','Peer update',20,{inputOrigin:'peer',recordedOnly:true,peerEnvelope:envelope,createdAt:at,nativeInput:{id:peerId,version:1,kind:'user'}}),chunk('agent','after','After the notice',30)];
+    await writeFile(f.data,JSON.stringify({[native]:{revision:'peer-inline',rows:[],turnGroups:[{id:turnId,state:'complete',updates}]}}));
+    const page=await (f.host as any).nativeHistory(f.host.store.get(f.session),10),turn=page.turns[0];
+    assert.equal(page.turns.length,1);assert.equal(turn.id,turnId);assert.equal(turn.message._meta['amplifier.dev/history'].recordedOnly,undefined);
+    assert.deepEqual(turn.responseParts.map((part:any)=>part.kind),['markdown','systemNotification','markdown']);
+    const notice=turn.responseParts[1]._meta['amplifier.dev/history'];assert.equal(notice.message.origin.kind,'agent');assert.equal(notice.message.text,'Peer update');assert.deepEqual(notice.peerEnvelope,envelope);
+    await f.host.invalidateNativeHistory(f.session);
+    const context=await f.host.readSessionContext(f.session,10);
+    assert.deepEqual(context.messages.map((row:any)=>row.text),['Original human request','Before the notice','Peer update','After the notice']);
+    assert.deepEqual(context.messages.map((row:any)=>row.role),['user','assistant','user','assistant']);
+    assert.equal(context.messages[2].inputOrigin,'peer');assert.deepEqual(context.messages[2].peerEnvelope,envelope);assert.equal(context.messages[2].createdAt,at);assert.equal(context.messages[2].id,peerId);
+    assert.equal(f.host.store.turns(f.session.replace('ahp-session:','ahp-chat:')).turns.length,0);await assert.rejects(readFile(f.log));
+  }finally{await f.close();}
+});

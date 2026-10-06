@@ -22,7 +22,7 @@ import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, Session
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { Store, type SessionRecord } from './store.js';
 import { AcpProcess, type EngineConfig, type AgentHandlers } from './acp.js';
-import { mergeHistoryTurns, turnIdentityHash } from './history.js';
+import { mergeHistoryTurns, retainPassiveInputs, turnIdentityHash } from './history.js';
 import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
@@ -635,7 +635,7 @@ export class AmplifierHost {
   }
   private async nativeHistoryMessage(record:SessionRecord,group:Json,updates:Json[],publicRows:PersistedPublicRow[]):Promise<Message> {
     const inputs=updates.map(update=>update.content);
-    const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
+    const recorded=(updates.length?updates:group.recordedOnly?group.updates:[]).map((update:Json)=>update._meta?.['amplifier.dev/history']).find((value:Json)=>value?.recordedOnly);
     const inputHistory=updates.find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
     const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length||inputHistory?.inputOrigin==='peer'?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
     const attachments:any[]=[];
@@ -707,7 +707,8 @@ export class AmplifierHost {
               const row=rowAt.get(index);if(!row||row===initial)continue;
               const steering=await this.nativeHistoryMessage(record,group,row,publicRows);
               active.textPart=undefined;active.reasoningPart=undefined;
-              state=chatReducer(state,{type:'chat/responsePart',turnId:group.id,part:{kind:'systemNotification',content:`${(steering._meta?.['amplifier.dev/history'] as Json)?.inputOrigin==='steering'?'Steering':'User'} input: ${steering.text}`,_meta:{'amplifier.dev/history':{...(steering._meta?.['amplifier.dev/history'] as Json),message:steering}}}} as any);
+              const origin=(steering._meta?.['amplifier.dev/history'] as Json)?.inputOrigin;
+              state=chatReducer(state,{type:'chat/responsePart',turnId:group.id,part:{kind:'systemNotification',content:`${origin==='steering'?'Steering':origin==='peer'?'Peer':'User'} input: ${steering.text}`,_meta:{'amplifier.dev/history':{...(steering._meta?.['amplifier.dev/history'] as Json),message:steering}}}} as any);
               continue;
             }
             await this.update(record.uri,{sessionId:record.nativeSessionId,update} as SessionNotification,{active,emit:action=>{state=chatReducer(state,action as any);}});
@@ -1423,7 +1424,7 @@ export class AmplifierHost {
               const liveSteering=live.responseParts.map(part=>steeringId(part as Json)).filter(Boolean);
               if(JSON.stringify(liveSteering)===JSON.stringify([...savedSteering.keys()])){
                 let textIndex=0;retainedObservations=true;
-                responseParts=live.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN').map(part=>part.kind==='markdown'?{...part,_meta:{...(part as Json)._meta,...(savedText[textIndex++] as Json)._meta}}:savedSteering.get(steeringId(part as Json))??part);
+                responseParts=retainPassiveInputs(responseParts,live.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN').map(part=>part.kind==='markdown'?{...part,_meta:{...(part as Json)._meta,...(savedText[textIndex++] as Json)._meta}}:savedSteering.get(steeringId(part as Json))??part),normalizeTool);
               }
             }
           }
@@ -2558,8 +2559,20 @@ export class AmplifierHost {
         const correction=JSON.parse(String(steering.message)),admitted=this.store.receipt(String(steering.id));
         messages.push({id:String(steering.id),role:'user',text:correction.text.slice(0,5000),truncated:correction.text.length>5000,createdAt:admitted?.createdAt,inputOrigin:'user',activeTurnId:turn.id,delivery:'steering'});
       }
-      const text=turn.responseParts.filter((part:any)=>part.kind==='markdown').map((part:any)=>part.content??'').join('\n');
-      if(text&&!voiceDelivery)messages.push({id:turn.id+':response',role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance});
+      // Keep canonical inline inputs in their original position. Flattening all
+      // response text loses the author and moves notifications across answers.
+      let responseIndex=0;
+      for(const part of turn.responseParts as Json[]){
+        const partHistory=part._meta?.['amplifier.dev/history'],inline=partHistory?.message;
+        if(part.kind==='systemNotification'&&inline&&typeof inline.text==='string'&&partHistory?.messageId){
+          if(partHistory.voiceDelivery&&partHistory.voiceDelivery.source!=='chat')continue;
+          const id=partHistory.nativeInput?.id??partHistory.messageId;
+          if(!messages.some(row=>row.id===id))messages.push({id,role:inline.origin?.kind==='systemNotification'?'system':'user',text:inline.text.slice(0,5000),truncated:inline.text.length>5000,createdAt:partHistory.createdAt??turn.startedAt,inputOrigin:partHistory.inputOrigin??'unknown',authorization:partHistory.authorization??'unverified-native-history',activeTurnId:turn.id,...(partHistory.inputOrigin==='steering'?{delivery:'steering'}:{}),...(partHistory.inputOrigin==='peer'?{peerEnvelope:partHistory.peerEnvelope}:{}),...(partHistory.recordedOnly?{recordedOnly:true}:{})});
+        }else if(part.kind==='markdown'&&part.content&&!voiceDelivery){
+          const text=String(part.content),id=responseIndex++?`${turn.id}:response:${partHistory?.messageId??responseIndex}`:turn.id+':response';
+          messages.push({id,role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance,createdAt:partHistory?.createdAt??provenance.createdAt});
+        }
+      }
     }
     const state=await this.inspectSession(session);
     const selections=Object.entries(record.state.config?.values??{}).filter(([key])=>['model','provider','reasoning_effort','reasoning','thinking','bundle','mode'].includes(key)).map(([id,value])=>({id,value:String(value).slice(0,300)}));
