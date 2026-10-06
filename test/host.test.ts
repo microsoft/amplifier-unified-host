@@ -12,7 +12,7 @@ import { chatReducer,type ChatState,type StateAction } from '@microsoft/agent-ho
 import { createHost,MessageUnavailableError } from '../src/host.js';
 
 async function setup(options:any={}) {
-  const dir=await mkdtemp(join(tmpdir(),'ahp-host-'));const log=join(dir,'prompts.jsonl');
+  const dir=await realpath(await mkdtemp(join(tmpdir(),'ahp-host-')));const log=join(dir,'prompts.jsonl');
   const config={stateDirectory:join(dir,'state'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('./agent.mjs',import.meta.url))],env:{FIXTURE_LOG:log}}],...options};
   const host=await createHost(config);const clients:AhpClient[]=[];
   async function connect(id=randomUUID()) {const transport=await WebSocketTransport.connect(host.url);const client=new AhpClient(transport);client.connect();await client.initialize({clientId:id,protocolVersions:['0.9.0'],initialSubscriptions:['ahp-root://']});clients.push(client);return client;}

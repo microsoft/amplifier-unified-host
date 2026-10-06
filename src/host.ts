@@ -1405,21 +1405,32 @@ export class AmplifierHost {
           let responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
           const hasRecords=live.responseParts.some(part=>(part as Json)._meta?.['amplifier.dev/modelCall']);
           const responseText=(parts:typeof responseParts)=>parts.filter(part=>part.kind==='markdown').map(part=>typeof (part as any).content==='string'?(part as any).content:(part as any).content?.value??'').join('');
-          const toolIds=(parts:typeof responseParts)=>JSON.stringify(parts.filter(part=>part.kind==='toolCall').map(part=>(part as any).toolCall.toolCallId));
+          const toolIds=(parts:typeof responseParts)=>parts.filter(part=>part.kind==='toolCall').map(part=>String((part as any).toolCall.toolCallId));
+          const savedTools=toolIds(responseParts),savedToolSet=new Set(savedTools);
+          const normalizeTool=(id:string)=>record.nativeSessionId&&id.startsWith(record.nativeSessionId+':')?id.slice(record.nativeSessionId.length+1):id;
+          // Native live updates namespace root tool IDs and also observe child
+          // tools absent from the root transcript. Match the complete ordered
+          // root subsequence, preserving all observed diagnostics around it.
+          const observedTools=toolIds(live.responseParts).map(normalizeTool).filter(id=>savedToolSet.has(id));
+          let retainedObservations=false;
           // A canonical reread has no provider timing records. Retain the
           // observed ordering only when its answer and tool identities agree.
-          if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&toolIds(live.responseParts)===toolIds(responseParts)){
+          if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&JSON.stringify(observedTools)===JSON.stringify(savedTools)){
             const savedText=responseParts.filter(part=>part.kind==='markdown'),liveText=live.responseParts.filter(part=>part.kind==='markdown');
             if(savedText.length===liveText.length&&savedText.every((part,index)=>responseText([part])===responseText([liveText[index]]))){
               const savedSteering=new Map(responseParts.filter(part=>(part as Json)._meta?.['amplifier.dev/history']?.inputOrigin==='steering').map(part=>[(part as Json)._meta['amplifier.dev/history'].nativeInput.id,part]));
               const steeringId=(part:Json)=>part._meta?.['amplifier.dev/steering']?.inputId??(part._meta?.['amplifier.dev/history']?.inputOrigin==='steering'?part._meta['amplifier.dev/history'].nativeInput?.id:undefined);
               const liveSteering=live.responseParts.map(part=>steeringId(part as Json)).filter(Boolean);
               if(JSON.stringify(liveSteering)===JSON.stringify([...savedSteering.keys()])){
-                let textIndex=0;
+                let textIndex=0;retainedObservations=true;
                 responseParts=live.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN').map(part=>part.kind==='markdown'?{...part,_meta:{...(part as Json)._meta,...(savedText[textIndex++] as Json)._meta}}:savedSteering.get(steeringId(part as Json))??part);
               }
             }
           }
+
+          // A differing canonical boundary cannot justify erasing recordings.
+          // Retain this observed turn until the two histories can be reconciled.
+          if(hasRecords&&!retainedObservations){retainedTurns++;continue;}
 
           const boundary=canonical.message._meta?.['amplifier.dev/history'] as Json|undefined;
           const {messageReference:_oldReference,replyTo:_oldQuote,...liveBoundary}=(live.message._meta?.['amplifier.dev/history'] as Json)??{};
