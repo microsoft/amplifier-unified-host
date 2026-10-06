@@ -1,8 +1,10 @@
 import {missingHistoryWorkspace} from './history-workspace.js';
+import {validatePeerSteering,type PeerSteeringInput} from './peer-steering.js';
 import {turnOutcome} from './turn-outcome.js';
 import {LibraryIndex,type LibraryQuery,type LibraryRead,type HostObservation,type LiveFact} from './library-index.js';
 import {PUBLIC_MESSAGE_META,publicMessage,capturePublicMessage,supportsPublicOriginal,mountedPublicOriginal,nativeLocator,persistedPublicRow,cardOccurrence,sameLocator,sameCard,samePublicMessage,qualifiedAccessUri,resourcesBodyUri,type PublicMessageV1,type PersistedPublicRow,type NativeLocator,type PublicCard,type PublicOriginalResources,type RetainOriginalAttachmentV2,type VerifiedOriginalAttachmentV2} from './public-original.js';
 import {AsyncLocalStorage} from 'node:async_hooks';
+import {isDeepStrictEqual} from 'node:util';
 import {SESSION_METADATA_KEY,type SessionTitleSnapshot,type SessionTitleCommitContext,type SessionTitleCommitResult} from './session-metadata.js';
 import {nativeFailedInput} from './input-outcome.js';
 import {ConversationPresentation,type PresentationMetadata} from './presentation.js';
@@ -1385,15 +1387,21 @@ export class AmplifierHost {
           for(const part of canonical.responseParts){
             if(part.kind!=='systemNotification')continue;
             const history=part._meta?.['amplifier.dev/history'] as Json|undefined,input=history?.nativeInput,message=history?.message,locator=history?.rowLocator;
-            if(history?.inputOrigin!=='steering'||history.activeInputId!==canonical.id||input?.version!==1||input.kind!=='steer'||typeof input.id!=='string'||!input.id||input.id.length>128||/[\x00-\x1f\x7f]/.test(input.id)||typeof history.messageId!=='string'||!history.messageId||message?.origin?.kind!=='user'||typeof message.text!=='string')continue;
+            const peer=history?.inputOrigin==='peer';
+            if(!['steering','peer'].includes(history?.inputOrigin)||history?.activeInputId!==canonical.id||input?.version!==1||input.kind!=='steer'||typeof input.id!=='string'||!input.id||input.id.length>128||/[\x00-\x1f\x7f]/.test(input.id)||typeof history.messageId!=='string'||!history.messageId||message?.origin?.kind!==(peer?'agent':'user')||typeof message.text!=='string')continue;
             if(locator&&(locator.sessionId!==record.nativeSessionId||locator.messageId!==history.messageId))continue;
-            if(canonicalInputs.has(input.id)&&JSON.stringify(canonicalInputs.get(input.id))!==JSON.stringify({message,replyTo:history.replyTo}))conflictingInputs.add(input.id);
-            canonicalInputs.set(input.id,{message,replyTo:history.replyTo});
+            const saved={message,replyTo:history.replyTo,inputOrigin:history.inputOrigin,peerEnvelope:history.peerEnvelope};
+            if(canonicalInputs.has(input.id)&&JSON.stringify(canonicalInputs.get(input.id))!==JSON.stringify(saved))conflictingInputs.add(input.id);
+            canonicalInputs.set(input.id,saved);
           }
           let missing=0;
           for(const input of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status IN ('dispatching','applied','held','unknown')").iterate(record.chat.resource,canonical.id)){
             const saved=canonicalInputs.get(String(input.id)),original=JSON.parse(String(input.message)),reply=this.messageReply(original);
             let matched=!!saved&&!conflictingInputs.has(String(input.id))&&saved.message.text===original.text;
+            if(matched){
+              const peer=original._meta?.['amplifier.dev/input']?.inputOrigin==='peer';
+              matched=saved!.message.origin?.kind===original.origin?.kind&&(peer?saved!.inputOrigin==='peer'&&isDeepStrictEqual(saved!.peerEnvelope,original._meta['amplifier.dev/input'].peerEnvelope):saved!.inputOrigin==='steering');
+            }
             if(matched&&(original.attachments?.length||saved!.message.attachments?.length)){
               const expected=capturePublicMessage(original,String(input.id)),actual=capturePublicMessage({...saved!.message,attachments:saved!.message.attachments?.map((item:Json)=>{const { _meta,...card}=item;return card;})} as Message,String(input.id));
               matched=!!expected&&!!actual&&samePublicMessage(expected,actual);
@@ -1422,8 +1430,8 @@ export class AmplifierHost {
           if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&JSON.stringify(observedTools)===JSON.stringify(savedTools)){
             const savedText=responseParts.filter(part=>part.kind==='markdown'),liveText=live.responseParts.filter(part=>part.kind==='markdown');
             if(savedText.length===liveText.length&&savedText.every((part,index)=>responseText([part])===responseText([liveText[index]]))){
-              const savedSteering=new Map(responseParts.filter(part=>(part as Json)._meta?.['amplifier.dev/history']?.inputOrigin==='steering').map(part=>[(part as Json)._meta['amplifier.dev/history'].nativeInput.id,part]));
-              const steeringId=(part:Json)=>part._meta?.['amplifier.dev/steering']?.inputId??(part._meta?.['amplifier.dev/history']?.inputOrigin==='steering'?part._meta['amplifier.dev/history'].nativeInput?.id:undefined);
+              const savedSteering=new Map(responseParts.filter(part=>(part as Json)._meta?.['amplifier.dev/history']?.nativeInput?.kind==='steer').map(part=>[(part as Json)._meta['amplifier.dev/history'].nativeInput.id,part]));
+              const steeringId=(part:Json)=>part._meta?.['amplifier.dev/steering']?.inputId??(part._meta?.['amplifier.dev/history']?.nativeInput?.kind==='steer'?part._meta['amplifier.dev/history'].nativeInput?.id:undefined);
               const liveSteering=live.responseParts.map(part=>steeringId(part as Json)).filter(Boolean);
               if(JSON.stringify(liveSteering)===JSON.stringify([...savedSteering.keys()])){
                 let textIndex=0;retainedObservations=true;
@@ -2484,6 +2492,58 @@ export class AmplifierHost {
       });
     });
   }
+  /** A saved peer correction for exactly one mounted generation; never queues a new turn. */
+  async submitPeerSteering(session:string,input:PeerSteeringInput) {
+    return this.intake.run(async()=>{
+      validatePeerSteering(input);
+      const selected=await this.record(session);
+      return this.withLock(selected.uri,async()=>{
+        const record=await this.record(selected.uri),active=this.active.get(record.uri);
+        this.guardTransfer(record.uri);
+        if(this.relocationFence(record.uri)||!active||active.agent.closed||!active.agent.nativeId)throw new RpcFault(-32011,'No available mounted peer recipient',{executed:false});
+        this.guardRetirement(active);
+        const state=await this.inspectSession(record.uri),mount=active.steeringMount;
+        if(!active.busy||active.cancel||active.finishing||active.stopNotified||active.turnId!==input.activeTurnId||record.chat.activeTurn?.id!==input.activeTurnId
+          ||active.generationId!==input.targetGenerationId||mount?.generationId!==input.targetGenerationId||mount?.activeTurnId!==input.activeTurnId
+          ||mount.capability?.version!==1||mount.capability.mode!=='request_boundary'||mount.capability.supported===false
+          ||state.executionRevision!==input.expectedExecutionRevision||state.interruptionRevision!==input.expectedInterruptionRevision
+          ||state.configurationHash!==input.expectedConfigurationHash||state.nativeSessionId!==input.expectedNativeSessionId||state.nativeLocationRevision!==input.expectedNativeLocationRevision
+          ||this.store.unknown(record.chat.resource))throw new RpcFault(-32011,'The exact peer steering generation or recipient state changed',{executed:false});
+        if(this.store.receipt(input.commandId)||this.store.db.prepare('SELECT 1 FROM steering_intents WHERE id=? UNION ALL SELECT 1 FROM queue_intents WHERE id=?').get(input.commandId,input.commandId))throw new RpcFault(-32011,'Peer steering already reserved; inspect its receipt without replay');
+        if(Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE chat=? AND status='dispatching'").get(record.chat.resource)!.n)>=16)throw new RpcFault(-32000,'Peer steering capacity reached',{executed:false});
+        const message={text:input.text,origin:{kind:'agent'},_meta:{'amplifier.dev/input':{inputOrigin:'peer',peerEnvelope:input.peerEnvelope},'amplifier.dev/peerSteering':{grantId:input.grantId,executionRevision:input.expectedExecutionRevision}}};
+        const submitted={type:'chat/responsePart',turnId:input.activeTurnId,part:{kind:'systemNotification',content:'Peer input: '+input.text,_meta:{'amplifier.dev/history':{inputOrigin:'peer',authorization:'agent-origin',message:{id:input.commandId,...message}},'amplifier.dev/steering':{inputId:input.commandId,activeTurnId:input.activeTurnId}}}} as StateAction;
+        const projectionBytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(submitted));
+        if(projectionBytes>(this.config.maxActiveProjectionBytes??8*1024*1024))throw new RpcFault(-32000,'Active peer view exceeds its byte budget',{executed:false});
+        const publication:{commit?:()=>void}={};
+        this.store.transaction(()=>{
+          this.store.admission(record.chat.resource,{kind:'peer-steering',id:input.commandId,message,activeInputId:input.activeTurnId,generationId:input.targetGenerationId},input.commandId,'host:peer',this.store.extensionSequence('host:peer'));
+          this.store.db.prepare("INSERT INTO steering_intents(id,chat,message,origin,status,held,active_turn_id,generation_id,projected) VALUES(?,?,?,?,'dispatching',0,?,?,1)").run(input.commandId,record.chat.resource,JSON.stringify(message),JSON.stringify({clientId:'host:peer',clientSeq:-1}),input.activeTurnId,input.targetGenerationId);
+          this.store.finish(input.commandId,'dispatching');this.emit(record.chat.resource,submitted,undefined,undefined,publication);
+        });
+        active.projectionBytes=projectionBytes;publication.commit!();
+        let timer:ReturnType<typeof setTimeout>|undefined;
+        try{
+          const pending=this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'peer.steer',args:{inputId:input.commandId,grantId:input.grantId,taskId:input.taskId,taskRevision:input.taskRevision,targetGenerationId:input.targetGenerationId}}));
+          const result=await Promise.race([pending,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(Error('Peer steering admission outcome unknown')),bounded(this.config.steeringOutcomeTimeoutMs,10000,60000));timer.unref();})]);
+          if(result.accepted===false&&result.executed===false){this.settleSteering(record.uri,input.commandId,'held',String(result.reason??'Peer steering refused'));return result;}
+          if(result.accepted!==true||result.inputId!==input.commandId||result.activeInputId!==input.activeTurnId||result.generationId!==input.targetGenerationId||!['queued','applied','held','unknown'].includes(String(result.disposition)))throw Error('Invalid peer steering disposition');
+          if(result.disposition!=='queued')this.settleSteering(record.uri,input.commandId,result.disposition as 'applied'|'held'|'unknown',String(result.reason??result.disposition));
+          return {...result,completed:false};
+        }catch(error){this.settleSteering(record.uri,input.commandId,'unknown',(error as Error).message);throw error;}
+        finally{clearTimeout(timer);}
+      });
+    });
+  }
+  /** Passive exact admission proof, available only during the original active generation. */
+  async inspectPeerSteering(session:string,inputId:string) {
+    const record=await this.record(session),active=this.active.get(record.uri);
+    const row=this.store.db.prepare("SELECT * FROM steering_intents WHERE chat=? AND id=?").get(record.chat.resource,inputId);
+    if(!row)return {admitted:false};
+    const admitted=row.status==='dispatching'&&!!active?.busy&&!active.cancel&&!active.finishing&&!active.stopNotified&&active.generationId===row.generation_id&&active.turnId===row.active_turn_id;
+    const message=JSON.parse(String(row.message)),proof=message._meta?.['amplifier.dev/peerSteering'];
+    return proof?{admitted,disposition:row.status,inputId,grantId:proof.grantId,executionRevision:proof.executionRevision,activeTurnId:row.active_turn_id,targetGenerationId:row.generation_id}:{admitted:false};
+  }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
   async waitForTurn(session:string,commandId:string,timeoutMs=600000) {
     const record=await this.record(session),receipt=this.store.receipt(commandId);
@@ -2560,7 +2620,11 @@ export class AmplifierHost {
       if(turn.message.text&&(!voiceDelivery||voiceDelivery.source==='chat'))messages.push({id:turn.id,role:turn.message.origin?.kind==='agent'?'assistant':turn.message.origin?.kind==='systemNotification'?'system':'user',text:turn.message.text.slice(0,5000),truncated:turn.message.text.length>5000,...provenance});
       for(const steering of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='applied' ORDER BY rowid DESC LIMIT ?").all(record.chat.resource,turn.id,limit).reverse()){
         const correction=JSON.parse(String(steering.message)),admitted=this.store.receipt(String(steering.id));
-        messages.push({id:String(steering.id),role:'user',text:correction.text.slice(0,5000),truncated:correction.text.length>5000,createdAt:admitted?.createdAt,inputOrigin:'user',activeTurnId:turn.id,delivery:'steering'});
+        // Persisted inline corrections already have their exact position. The
+        // admission journal supplies only corrections not yet projected there.
+        if(turn.responseParts.some(part=>{const h=(part as Json)._meta?.['amplifier.dev/history'];return h?.messageId&&h?.message&&h?.nativeInput?.id===steering.id;}))continue;
+        const origin=correction._meta?.['amplifier.dev/input'];
+        messages.push({id:String(steering.id),role:correction.origin?.kind==='agent'?'assistant':'user',text:correction.text.slice(0,5000),truncated:correction.text.length>5000,createdAt:admitted?.createdAt,inputOrigin:origin?.inputOrigin??'user',...(origin?.inputOrigin==='peer'?{peerEnvelope:origin.peerEnvelope,authorization:'agent-origin'}:{}),activeTurnId:turn.id,delivery:'steering'});
       }
       // Keep canonical inline inputs in their original position. Flattening all
       // response text loses the author and moves notifications across answers.
@@ -2570,7 +2634,7 @@ export class AmplifierHost {
         if(part.kind==='systemNotification'&&inline&&typeof inline.text==='string'&&partHistory?.messageId){
           if(partHistory.voiceDelivery&&partHistory.voiceDelivery.source!=='chat')continue;
           const id=partHistory.nativeInput?.id??partHistory.messageId;
-          if(!messages.some(row=>row.id===id))messages.push({id,role:inline.origin?.kind==='systemNotification'?'system':'user',text:inline.text.slice(0,5000),truncated:inline.text.length>5000,createdAt:partHistory.createdAt??turn.startedAt,inputOrigin:partHistory.inputOrigin??'unknown',authorization:partHistory.authorization??'unverified-native-history',activeTurnId:turn.id,...(partHistory.inputOrigin==='steering'?{delivery:'steering'}:{}),...(partHistory.inputOrigin==='peer'?{peerEnvelope:partHistory.peerEnvelope}:{}),...(partHistory.recordedOnly?{recordedOnly:true}:{})});
+          if(!messages.some(row=>row.id===id))messages.push({id,role:inline.origin?.kind==='systemNotification'?'system':inline.origin?.kind==='agent'?'assistant':'user',text:inline.text.slice(0,5000),truncated:inline.text.length>5000,createdAt:partHistory.createdAt??turn.startedAt,inputOrigin:partHistory.inputOrigin??'unknown',authorization:partHistory.authorization??'unverified-native-history',activeTurnId:turn.id,...(partHistory.nativeInput?.kind==='steer'?{delivery:'steering'}:{}),...(partHistory.inputOrigin==='peer'?{peerEnvelope:partHistory.peerEnvelope}:{}),...(partHistory.recordedOnly?{recordedOnly:true}:{})});
         }else if(part.kind==='markdown'&&part.content&&!voiceDelivery){
           const text=String(part.content),id=responseIndex++?`${turn.id}:response:${partHistory?.messageId??responseIndex}`:turn.id+':response';
           messages.push({id,role:'assistant',text:text.slice(0,5000),truncated:text.length>5000,...provenance,createdAt:partHistory?.createdAt??provenance.createdAt});
@@ -2978,7 +3042,7 @@ export class AmplifierHost {
     const active=this.active.get(record.uri),admission=active?.busy&&active.turnId?this.store.receipt(active.turnId):undefined;
     const peerAdmission=admission?.status==='dispatching'&&active?.peerAdmission&&!active.cancel&&!active.finishing&&!active.stopNotified?{...active.peerAdmission,status:admission.status}:undefined;
     const observationAdmission=admission?.status==='dispatching'&&active?.observationAdmission?{...active.observationAdmission,status:admission.status}:undefined;
-    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,location:record.state._meta?.['amplifier.dev/location'],activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,peerAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,location:record.state._meta?.['amplifier.dev/location'],activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,peerAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',activeSteering:active?.busy&&!active.cancel&&!active.finishing?(record.state._meta?.['amplifier.dev/host'] as Json)?.activeSteering:{supported:false},...revisions,configurationHash};
   }
   /** Hold the selected session mapping through bounded trusted I/O. No filesystem snapshot is implied. */
   async withSessionWorkspace<T>(session:string,expected:SessionWorkspaceExpectation,capture:(workspace:Readonly<SessionWorkspace>)=>Promise<T>):Promise<T> {
