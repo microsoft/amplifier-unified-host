@@ -88,7 +88,10 @@ export function capturePublicMessage(message:Message,inputId:string):PublicMessa
   if(message.origin?.kind!=='user')return;
   const blocks:(PublicText|PublicCard)[]=[{type:'text',text:message.text}];
   for(const attachment of message.attachments??[]){
-    if(attachment.type!=='resource'||Object.keys(attachment).some(key=>!['type','label','uri','contentType'].includes(key))||!resourcesBodyUri(attachment.uri)||!token(attachment.label,255)||!attachment.contentType||!/^[-\w.+]+\/[-\w.+]+$/.test(attachment.contentType))return;
+    // AHP metadata is transport/presentation context, not another content
+    // variant or authority for a public original. Preserve the literal card;
+    // byte counts, hashes and access are resolved from its Resources owner.
+    if(attachment.type!=='resource'||Object.keys(attachment).some(key=>!['type','label','uri','contentType','_meta'].includes(key))||attachment._meta!==undefined&&!object(attachment._meta)||!resourcesBodyUri(attachment.uri)||!token(attachment.label,255)||!attachment.contentType||!/^[-\w.+]+\/[-\w.+]+$/.test(attachment.contentType))return;
     blocks.push({type:'attachment',reference:{owner:'resources',id:attachment.uri},name:attachment.label,mimeType:attachment.contentType});
   }
   return publicMessage({version:1,inputId,capture:'host-standard',blocks});

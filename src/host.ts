@@ -2065,7 +2065,10 @@ export class AmplifierHost {
     if(!action.message||typeof action.message.text!=='string'||(!action.message.text.trim()&&!action.message.attachments?.length)||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering requires bounded user input without per-message configuration');
     const rich=!!action.message.attachments?.length||!!this.messageReply(action.message);
     if(rich&&!this.richSteeringSupported(record))throw new RpcFault(-32601,'This active runtime does not advertise attachment and quoted steering',{executed:false});
-    if(supportsPublicOriginal(mountedPublicOriginal(native?.publicMessagePreservation,this.active.get(record.uri)?.publicOriginalMount),'steer.submit'))capturePublicMessage(action.message,action.id);
+    if(supportsPublicOriginal(mountedPublicOriginal(native?.publicMessagePreservation,this.active.get(record.uri)?.publicOriginalMount),'steer.submit')){
+      const original=capturePublicMessage(action.message,action.id);
+      if(rich&&!original)throw new RpcFault(-32602,'Steering original content cannot be preserved',{executed:false});
+    }
     const payload=JSON.stringify(action.message);if(Buffer.byteLength(payload)>65536)throw new RpcFault(-32000,'Steering message exceeds byte bound');
     if(prior&&prior.status!=='pending'||this.store.receipt(action.id)||this.store.db.prepare('SELECT 1 FROM queue_intents WHERE id=?').get(action.id))throw new RpcFault(-32011,'Steering identity already consumed or removed; inspect its receipt without replay');
     const capacity=this.store.db.prepare("SELECT count(*) n,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM steering_intents WHERE status IN ('pending','dispatching') AND id!=?").get(action.id)!;

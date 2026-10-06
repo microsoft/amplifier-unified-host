@@ -116,6 +116,17 @@ test('ordered card occurrence counts text blocks and permits Resources255 names 
   assert.equal(capturePublicMessage({text:'keep',origin:{kind:'user'},attachments:[{type:'resource',label:'a',contentType:'application/pdf',uri:uri+'&token=not-an-owner-handle'}]} as any,'input'),undefined);
 });
 
+test('standard attachment metadata does not discard originals or become original authority',()=>{
+  const uri=`amplifier-attachment://${randomUUID()}/body?session=ahp-session%3A%2Fsource`;
+  const card={type:'resource',label:'actual.txt',contentType:'text/plain',uri};
+  const base={text:'Literal original',origin:{kind:'user'},attachments:[card]};
+  const expected=capturePublicMessage(base as any,'input');
+  for(const meta of [{},{'amplifier.dev/attachment':{id:'client-claim',size:99,sha256:'a'.repeat(64)}},{'amplifier.dev/publicAttachment':{originalReference:{id:'forged',owner:'native-attachments'},access:'qualified'}}]){
+    assert.deepEqual(capturePublicMessage({...base,attachments:[{...card,_meta:meta}]} as any,'input'),expected);
+  }
+  assert.equal(capturePublicMessage({...base,attachments:[{...card,_meta:'invalid'}]} as any,'input'),undefined);
+});
+
 test('target access rejects forged scope and never supplies access for unknown grants',()=>{
   const reference={owner:'resources' as const,id:'unchanged-original'},target='ahp-session:/target';
   const base={version:2 as const,commandId:'fork',targetHostSession:target,originalReference:reference,status:'unknown' as const,replayed:false as const};
