@@ -300,7 +300,7 @@ export class AmplifierHost {
     peer.socket.send(JSON.stringify(message));
   }
   private notify(method:string,params:Json,channel=ROOT) {const session=params.session??params.summary?.resource;if(channel===ROOT&&['root/sessionAdded','root/sessionSummaryChanged'].includes(method)&&typeof session==='string'&&this.presentation?.hidden(session))return;for(const peer of this.peers)if(peer.subscriptions.has(channel))this.send(peer,{jsonrpc:'2.0',method,params});}
-  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId'},defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{libraryQuery:!!this.library,receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
+  private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{libraryQuery:!!this.library,receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
   private terminalList(){return this.store.db.prepare("SELECT uri,payload FROM terminals WHERE lifecycle='running' ORDER BY modified DESC LIMIT 128").all().map(row=>{const state=JSON.parse(row.payload as string);return {resource:row.uri,title:state.title,claim:state.claim,lifecycle:state.lifecycle};});}
   private terminalState(uri:string):TerminalState|undefined {const row=this.store.db.prepare('SELECT payload FROM terminals WHERE uri=?').get(uri);return row?JSON.parse(row.payload as string):undefined;}
   private terminalEvent(session:string,event:Parameters<NonNullable<AgentHandlers['terminal']>>[0]) {
@@ -777,7 +777,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId'},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
@@ -1357,17 +1357,26 @@ export class AmplifierHost {
           const row=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,canonical.id);
           if(!row||this.store.receipt(canonical.id)?.status!=='completed')continue;
           const live=JSON.parse(String(row.payload)) as Turn;
-          const canonicalInputs=new Map<string,string>(),conflictingInputs=new Set<string>();
+          const canonicalInputs=new Map<string,Json>(),conflictingInputs=new Set<string>();
           for(const part of canonical.responseParts){
             if(part.kind!=='systemNotification')continue;
             const history=part._meta?.['amplifier.dev/history'] as Json|undefined,input=history?.nativeInput,message=history?.message,locator=history?.rowLocator;
             if(history?.inputOrigin!=='steering'||history.activeInputId!==canonical.id||input?.version!==1||input.kind!=='steer'||typeof input.id!=='string'||!input.id||input.id.length>128||/[\x00-\x1f\x7f]/.test(input.id)||typeof history.messageId!=='string'||!history.messageId||message?.origin?.kind!=='user'||typeof message.text!=='string')continue;
             if(locator&&(locator.sessionId!==record.nativeSessionId||locator.messageId!==history.messageId))continue;
-            if(canonicalInputs.has(input.id)&&canonicalInputs.get(input.id)!==message.text)conflictingInputs.add(input.id);
-            canonicalInputs.set(input.id,message.text);
+            if(canonicalInputs.has(input.id)&&JSON.stringify(canonicalInputs.get(input.id))!==JSON.stringify({message,replyTo:history.replyTo}))conflictingInputs.add(input.id);
+            canonicalInputs.set(input.id,{message,replyTo:history.replyTo});
           }
           let missing=0;
-          for(const input of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status IN ('dispatching','applied','held','unknown')").iterate(record.chat.resource,canonical.id))if(conflictingInputs.has(String(input.id))||canonicalInputs.get(String(input.id))!==JSON.parse(String(input.message)).text)missing++;
+          for(const input of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status IN ('dispatching','applied','held','unknown')").iterate(record.chat.resource,canonical.id)){
+            const saved=canonicalInputs.get(String(input.id)),original=JSON.parse(String(input.message)),reply=this.messageReply(original);
+            let matched=!!saved&&!conflictingInputs.has(String(input.id))&&saved.message.text===original.text;
+            if(matched&&(original.attachments?.length||saved!.message.attachments?.length)){
+              const expected=capturePublicMessage(original,String(input.id)),actual=capturePublicMessage({...saved!.message,attachments:saved!.message.attachments?.map((item:Json)=>{const { _meta,...card}=item;return card;})} as Message,String(input.id));
+              matched=!!expected&&!!actual&&samePublicMessage(expected,actual);
+            }
+            if(matched&&reply)matched=!!saved!.replyTo&&['messageId','historyEpoch','sourceDigest'].every(key=>saved!.replyTo[key]===reply[key])&&saved!.replyTo.sessionId===record.nativeSessionId;
+            if(!matched)missing++;
+          }
           // A bounded page's absence is not cancellation. Keep this whole live
           // response rather than dropping originals or guessing fragment order.
           if(missing){retainedTurns++;unresolvedSteeringInputs+=missing;continue;}
@@ -2053,7 +2062,9 @@ export class AmplifierHost {
       const current=this.getRecord(record.uri)!,active=this.active.get(record.uri);
       if(!active?.busy||active.cancel||active.turnId!==binding.activeTurnId||current.chat.activeTurn?.id!==binding.activeTurnId)throw new RpcFault(-32011,'The captured active turn changed; no steering input was admitted',{executed:false});
     }
-    if(!action.message||typeof action.message.text!=='string'||!action.message.text.trim()||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.attachments?.length||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering supports bounded user text; multimodal or per-message configuration is not negotiated');
+    if(!action.message||typeof action.message.text!=='string'||(!action.message.text.trim()&&!action.message.attachments?.length)||action.message.text.length>16000||action.message.origin?.kind!=='user'||action.message.model||action.message.agent)throw new RpcFault(-32602,'Steering requires bounded user input without per-message configuration');
+    const rich=!!action.message.attachments?.length||!!this.messageReply(action.message);
+    if(rich&&!this.richSteeringSupported(record))throw new RpcFault(-32601,'This active runtime does not advertise attachment and quoted steering',{executed:false});
     if(supportsPublicOriginal(mountedPublicOriginal(native?.publicMessagePreservation,this.active.get(record.uri)?.publicOriginalMount),'steer.submit'))capturePublicMessage(action.message,action.id);
     const payload=JSON.stringify(action.message);if(Buffer.byteLength(payload)>65536)throw new RpcFault(-32000,'Steering message exceeds byte bound');
     if(prior&&prior.status!=='pending'||this.store.receipt(action.id)||this.store.db.prepare('SELECT 1 FROM queue_intents WHERE id=?').get(action.id))throw new RpcFault(-32011,'Steering identity already consumed or removed; inspect its receipt without replay');
@@ -2065,10 +2076,15 @@ export class AmplifierHost {
       this.store.db.prepare("INSERT INTO steering_intents(id,chat,message,origin,status,held,active_turn_id) VALUES(?,?,?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET message=excluded.message,origin=excluded.origin,held=excluded.held,active_turn_id=excluded.active_turn_id").run(action.id,chat,payload,JSON.stringify(origin),held?1:0,activeTurnId);
       this.emit(chat,{...action,message:{...action.message,_meta:{...action.message._meta,'amplifier.dev/steering':{...(action.message._meta?.['amplifier.dev/steering'] as Json),held,...(held?{reason:'prior-execution-unknown'}:{})}}}},origin.clientSeq>=0?origin:undefined);
     });
-    this.consumeSteering(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
+    await this.consumeSteering(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
+  }
+  private richSteeringSupported(record:SessionRecord) {
+    const active=this.active.get(record.uri),native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
+    const supports=(value:Json|undefined)=>value?.version===1&&value.attachments===true&&value.quotedReplies===true;
+    return !!active?.busy&&active.steeringMount?.generationId===active.generationId&&active.steeringMount?.activeTurnId===active.turnId&&supports(active.steeringMount?.capability?.content)&&supports(native?.activeSteering?.content)&&supportsPublicOriginal(mountedPublicOriginal(native?.publicMessagePreservation,active.publicOriginalMount),'steer.submit',true);
   }
   /** Only the immutable current generation may consume an intent. No new prompt collector. */
-  private consumeSteering(session:string) {
+  private async consumeSteering(session:string) {
     const record=this.getRecord(session)!,active=this.active.get(session);
     if(this.closing||!active?.busy||!active.generationId||active.cancel||!record.chat.activeTurn||active.turnId!==record.chat.activeTurn.id||this.store.unknown(record.chat.resource))return;
     const capability=(active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.activeSteering;
@@ -2076,9 +2092,20 @@ export class AmplifierHost {
     const row=this.store.db.prepare("SELECT * FROM steering_intents WHERE chat=? AND status='pending' AND held=0 LIMIT 1").get(record.chat.resource);if(!row||row.active_turn_id&&row.active_turn_id!==active.turnId)return;
     if((active.steeringRuns?.size??0)>=16||Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='dispatching'").get(record.chat.resource,active.turnId)!.n)>=50)return;
     const id=String(row.id),message=JSON.parse(String(row.message)),origin=JSON.parse(String(row.origin)),activeInputId=active.turnId!,generationId=active.generationId;
+    const reply=this.messageReply(message),rich=!!message.attachments?.length||!!reply;
+    let blocks:ContentBlock[]|undefined;
+    if(rich){
+      if(!this.richSteeringSupported(record))return;
+      if(reply&&(active.agent.engine.messagePrincipal===undefined||!record.nativeSessionId))throw new RpcFault(-32601,'Quoted steering requires native message authority',{executed:false});
+      blocks=await this.prompt(message,record,true,true);this.checkContentCapabilities(active,blocks);
+      // Attachment resolution may yield while the original generation ends.
+      // Its captured input remains pending; it must never steer a later turn.
+      if(this.active.get(session)!==active||!active.busy||active.cancel||active.generationId!==generationId||active.turnId!==activeInputId||this.getRecord(session)?.chat.activeTurn?.id!==activeInputId)return;
+    }
     const original=this.captureOriginal(active,message,id,'steer.submit');
-    const params=this.inputWireParams({sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,text:message.text,...(message._meta?.['amplifier.dev/input']?.voiceDelivery?{voiceDelivery:message._meta['amplifier.dev/input'].voiceDelivery}:{})},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})});
-    const submitted={type:'chat/responsePart',turnId:activeInputId,part:{kind:'systemNotification',content:'Steering submitted: '+message.text,_meta:{'amplifier.dev/steering':{inputId:id,activeTurnId:activeInputId,...(message._meta?.['amplifier.dev/input']?.voiceDelivery?{voiceDelivery:message._meta['amplifier.dev/input'].voiceDelivery}:{})}}}} as StateAction;
+    if(rich&&!original)throw new RpcFault(-32602,'Steering original content cannot be preserved',{executed:false});
+    const params=this.inputWireParams({sessionId:active.agent.nativeId!,operation:'steer.submit',args:{inputId:id,activeInputId,...(blocks?{prompt:blocks,...(reply?{reply:{...reply,sessionId:record.nativeSessionId}}:{})}:{text:message.text}),...(message._meta?.['amplifier.dev/input']?.voiceDelivery?{voiceDelivery:message._meta['amplifier.dev/input'].voiceDelivery}:{})},...(original?{_meta:{[PUBLIC_MESSAGE_META]:original}}:{})});
+    const submitted={type:'chat/responsePart',turnId:activeInputId,part:{kind:'systemNotification',content:'Steering submitted: '+message.text,_meta:{'amplifier.dev/steering':{inputId:id,activeTurnId:activeInputId,...(rich?{message:structuredClone(message)}:{}),...(message._meta?.['amplifier.dev/input']?.voiceDelivery?{voiceDelivery:message._meta['amplifier.dev/input'].voiceDelivery}:{})}}}} as StateAction;
     const projectionBytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(submitted));
     if(projectionBytes>(this.config.maxActiveProjectionBytes??8*1024*1024))throw new RpcFault(-32000,'Active steering view exceeds its byte budget; original pending input is retained',{executed:false});
     const publication:{commit?:()=>void}={};
@@ -2101,7 +2128,7 @@ export class AmplifierHost {
     const mount=active.steeringMount,capability=mount?.capability;
     const matches=!!active.busy&&!!active.turnId&&!!active.generationId&&mount?.activeTurnId===active.turnId&&mount?.generationId===active.generationId;
     const supported=matches&&capability?.version===1&&capability.mode==='request_boundary'&&capability.supported!==false;
-    const report={version:1,supported,...(active.busy&&active.turnId?{activeTurnId:active.turnId}:{}),...(matches?{generationId:mount!.generationId}:{}),...(supported?{mode:capability!.mode,...(typeof capability!.cancellable==='boolean'?{cancellable:capability!.cancellable}:{})}:{})};
+    const report={version:1,supported,...(active.busy&&active.turnId?{activeTurnId:active.turnId}:{}),...(matches?{generationId:mount!.generationId}:{}),...(supported?{mode:capability!.mode,...(this.richSteeringSupported(record)?{content:{version:1,attachments:true,quotedReplies:true}}:{}),...(typeof capability!.cancellable==='boolean'?{cancellable:capability!.cancellable}:{})}:{})};
     const metadata=record.state._meta??{},host=metadata['amplifier.dev/host'] as Json|undefined;
     if(JSON.stringify(host?.activeSteering)===JSON.stringify(report))return;
     this.emit(session,{type:'session/metaChanged',_meta:{...metadata,'amplifier.dev/host':{...host,activeSteering:report}}} as StateAction);

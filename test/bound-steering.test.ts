@@ -10,15 +10,19 @@ import {createHost} from '../src/host.js';
 const capability={version:1,mode:'request_boundary',cancellable:false};
 const wait=async(check:()=>boolean)=>{for(let n=0;n<200;n++){if(check())return;await new Promise(r=>setTimeout(r,5));}assert.fail('fixture condition did not arrive');};
 const message=(id:string,turnId:unknown)=>({type:'chat/pendingMessageSet',kind:'steering',id,message:{text:'Bound correction',origin:{kind:'user'},_meta:{sibling:{keep:true},'amplifier.dev/steering':{activeTurnId:turnId,note:'retain'}}}} as any);
-async function fixture(report:unknown,wrongTurn=false){
+const content={version:1,attachments:true,quotedReplies:true};
+const richMessage=(id:string,turnId:string)=>{const action=message(id,turnId);action.message.attachments=[{type:'resource',label:'note.txt',contentType:'text/plain',uri:'amplifier-attachment://12345678-1234-1234-1234-123456789abc/body?session=ahp-session%3A%2Fbound'}];return action;};
+async function fixture(report:unknown,wrongTurn=false,options:any={}){
  const dir=await mkdtemp(join(tmpdir(),'bound-steering-')),peer=join(dir,'peer.mjs'),log=join(dir,'native.log');
  let source=await readFile(new URL('../fixtures/acp-peer.mjs',import.meta.url),'utf8');
  source=source.replace('let permissionId=1000;', 'let permissionId=1000;let releaseTurn;');
  source=source.replace("else if(message.method==='_amplifier/native'&&p.operation==='fixture.worker.idle')", "else if(message.method==='_amplifier/native'&&p.operation==='fixture.release-turn'){releaseTurn?.();releaseTurn=undefined;reply(message.id,{});}\n  else if(message.method==='_amplifier/native'&&p.operation==='fixture.report'){send({method:'_amplifier/event',params:{sessionId:p.sessionId,event:p.args}});reply(message.id,{});}\n  else if(message.method==='_amplifier/native'&&p.operation==='fixture.worker.idle')");
  source=source.replace('const turn=active;', "const turn=active;if(text==='fixture-held')await new Promise(resolve=>releaseTurn=resolve);");
  source=source.replace('activeInputId:active.inputId}}};', "activeInputId:"+(wrongTurn?"'wrong-input'":"active.inputId")+(report===undefined?'':',activeSteering:'+JSON.stringify(report))+'}}};');
+ if(options.content)source=source.replace("activeSteering:{version:1,mode:'request_boundary',cancellable:false}","activeSteering:"+JSON.stringify({...capability,content:options.content}));
  await writeFile(peer,source);
- const host=await createHost({stateDirectory:join(dir,'host'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',command:process.execPath,args:[peer],env:{FIXTURE_LOG:log}}]});
+ const preservation={version:1,routes:['prompt','steer.submit'],variants:['text','resources'],publicRows:true,exactRowRead:true};
+ const host=await createHost({stateDirectory:join(dir,'host'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',command:process.execPath,args:[peer],env:{FIXTURE_LOG:log,...(options.preservation?{FIXTURE_PUBLIC_ORIGINAL:JSON.stringify(preservation)}:{})}}],...options.config});
  const client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();const init=await client.initialize({clientId:'owner',protocolVersions:['0.9.0']});
  const session='ahp-session:/bound',chat='ahp-chat:/bound';await client.request('createSession',{channel:session,provider:'fixture',workingDirectories:[pathToFileURL(dir).href]});
  let closed=false;
@@ -29,7 +33,7 @@ async function fixture(report:unknown,wrongTurn=false){
 
 test('optional binding rejects captured A after B begins, without replacing retained standard input',async()=>{
  const f=await fixture(capability);try{
-  assert.deepEqual((f.init as any)._meta['amplifier.dev/host'].boundSteering,{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId'});
+  assert.deepEqual((f.init as any)._meta['amplifier.dev/host'].boundSteering,{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1});
   await f.start('A');await wait(()=>f.mount()?.supported===true);const captured=message('captured-A','A');
   await f.finish('A');assert.equal(f.mount().supported,false);
   await f.host.updatePendingQueue(f.session,{type:'chat/pendingMessageSet',kind:'steering',id:'standard-future',message:{text:'Future correction',origin:{kind:'user'}}} as any,{clientId:'owner'});
@@ -102,4 +106,36 @@ test('stale opt-in cannot replace a pending standard message at admission',async
   await assert.rejects(f.host.updatePendingQueue(f.session,captured,{clientId:'owner'}),/captured active turn changed/);
   assert.equal(JSON.stringify(f.host.store.db.prepare("SELECT * FROM steering_intents WHERE id='keep-standard'").get()),prior);
  }finally{await f.close();}
+});
+
+for(const [name,options,report] of [
+ ['handshake',{preservation:true},{...capability,content}],
+ ['mount',{content,preservation:true},capability],
+ ['original preservation',{content},{...capability,content}],
+] as const)test(`rich steering refuses missing ${name} support before persistence`,async()=>{
+ const f=await fixture(report,false,options);try{
+  await f.start('A');await wait(()=>f.mount()?.supported===true);
+  await assert.rejects(f.host.updatePendingQueue(f.session,richMessage('rich','A'),{clientId:'owner'}),/does not advertise attachment and quoted steering/);
+  assert.equal(f.host.store.receipt('rich'),undefined);
+  assert.equal(f.host.store.db.prepare("SELECT id FROM steering_intents WHERE id='rich'").get(),undefined);
+  await assert.rejects(readFile(f.log+'.steering'));
+ }finally{await f.close();}
+});
+
+test('generation ending during attachment resolution preserves the correction without admission or retargeting',async()=>{
+ let entered=false,release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
+ const f=await fixture({...capability,content},false,{content,preservation:true,config:{resolvePromptAttachment:async()=>{entered=true;await held;return [{type:'text',text:'resolved file'}];}}});
+ try{
+  await f.start('A');await wait(()=>f.mount()?.content?.version===1);
+  const original=richMessage('delayed','A'),submission=f.host.updatePendingQueue(f.session,original,{clientId:'owner'});
+  await wait(()=>entered);const generation=f.mount().generationId;
+  // Deliver the native lifecycle notification while resource resolution is waiting.
+  (f.host as any).active.get(f.session).agent.client.extMethod('_amplifier/native',{sessionId:(f.host as any).active.get(f.session).agent.nativeId,operation:'fixture.report',args:{type:'generation.finished',generation_id:generation}});
+  await wait(()=>f.mount()?.supported===false);release();assert.equal((await submission).pending,true);
+  assert.equal(f.host.store.receipt('delayed'),undefined);await assert.rejects(readFile(f.log+'.steering'));
+  await f.finish('A');await f.start('B');await wait(()=>f.mount()?.supported===true);
+  const retained=f.host.store.db.prepare("SELECT message,active_turn_id,held FROM steering_intents WHERE id='delayed'").get()!;
+  assert.deepEqual(JSON.parse(String(retained.message)),original.message);assert.equal(retained.active_turn_id,'A');assert.equal(retained.held,1);await assert.rejects(readFile(f.log+'.steering'));
+  await f.finish('B');
+ }finally{release();await f.close();}
 });
