@@ -1,3 +1,4 @@
+import {peerTerminal} from './peer-results.js';
 import {missingHistoryWorkspace} from './history-workspace.js';
 import {validatePeerSteering,type PeerSteeringInput} from './peer-steering.js';
 import {turnOutcome} from './turn-outcome.js';
@@ -68,7 +69,7 @@ export interface BeginTransfer extends TransferCommand {destination:string;expec
 /** AHP identity/source originate in the authenticated signed portability envelope. */
 export interface AdoptTransfer extends TransferCommand {session:string;engineId:string;nativeSessionId:string;historyHome:string;executionDirectory:string;source:string;destination:string;releaseHash:string;title?:string;}
 export type PendingQueueAction=Extract<StateAction,{type:'chat/pendingMessageSet'|'chat/pendingMessageRemoved'|'chat/queuedMessagesReordered'}>;
-export interface TurnSettled {session:string;commandId:string;status:'completed'|'cancelled'|'failed'|'unknown';inputOrigin:string;}
+export interface TurnSettled {session:string;commandId:string;status:'completed'|'cancelled'|'failed'|'unknown';inputOrigin:string;peerTerminals?:Json[];}
 export interface AgentStopped {session:string;nativeSessionId?:string;engineId:string;workingDirectory:string;reason:'runtime-closed'|'process-closed'|'idle-retired'|'host-shutdown'|'relocated'|'relocation-unknown'|'startup-failed'|'session-lifecycle'|'quiesced';exitCode?:number;signal?:string;}
 export interface HostConfig {
   stateDirectory:string; engines:EngineConfig[]; allowedWorkspaceRoots:string[];
@@ -112,7 +113,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise'|'peer.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string;nativeSessionId?:string;nativeLocationRevision?:number};}
-interface Active {steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {peerTerminals?:Json[];steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -2180,6 +2181,11 @@ export class AmplifierHost {
     this.emit(session,{type:'session/metaChanged',_meta:{...metadata,'amplifier.dev/host':{...host,activeSteering:report}}} as StateAction);
   }
   private steeringEvent(session:string,active:Active,event:Json) {
+    const proof=peerTerminal(event,active.agent.nativeId!,active.generationId,(active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.peerTurns?.results);
+    if(proof&&active.busy&&!active.cancel&&(active.peerTerminals?.length??0)<200){
+      const ids=proof.inputIds.filter((id:string)=>id===active.turnId||this.store.db.prepare("SELECT 1 FROM steering_intents WHERE chat=? AND id=? AND status='applied' AND active_turn_id=? AND generation_id=?").get(chatURI(session),id,active.turnId!,proof.generationId));
+      if(ids.length)(active.peerTerminals??=[]).push({...proof,inputIds:ids});
+    }
     if(event.type==='generation.started'&&active.busy&&event.activeInputId===active.turnId&&typeof event.generation_id==='string'&&event.generation_id.length>0&&event.generation_id.length<=128){
       active.generationId=event.generation_id;
       active.steeringMount={activeTurnId:active.turnId!,generationId:event.generation_id,capability:event.activeSteering};
@@ -2544,6 +2550,18 @@ export class AmplifierHost {
     const message=JSON.parse(String(row.message)),proof=message._meta?.['amplifier.dev/peerSteering'];
     return proof?{admitted,disposition:row.status,inputId,grantId:proof.grantId,executionRevision:proof.executionRevision,activeTurnId:row.active_turn_id,targetGenerationId:row.generation_id}:{admitted:false};
   }
+  /** Peer input proof is separate from human-message authority. No passive read mounts a worker. */
+  async readActivePeerInput(session:string,inputId:string,actorId:string):Promise<Json> {
+    const record=await this.record(session),active=this.active.get(record.uri);
+    const refuse=():never=>{throw new RpcFault(-32011,'The exact peer input is not delivered to this authenticated root generation',{executed:false});};
+    const capability=(active?.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.peerTurns?.results;
+    if(!active?.busy||active.cancel||active.finishing||this.closing||!active.generationId||!active.turnId||actorId!=='agent:'+record.nativeSessionId||active.agent.nativeId!==record.nativeSessionId||capability?.version!==1||capability.checkpointed!==true)refuse();
+    const steering=this.store.db.prepare("SELECT message FROM steering_intents WHERE chat=? AND id=? AND status='applied' AND active_turn_id=? AND generation_id=?").get(record.chat.resource,inputId,active!.turnId!,active!.generationId!);
+    const message=inputId===active!.turnId?(active!.pendingTurn?.action.message??record.chat.activeTurn?.message):steering?JSON.parse(String(steering.message)):undefined;
+    const provenance=message?._meta?.['amplifier.dev/input'] as Json|undefined;
+    if(provenance?.inputOrigin!=='peer'||!provenance.peerEnvelope||this.store.receipt(inputId)?.channel!==record.chat.resource)refuse();
+    return structuredClone({sessionId:record.uri,nativeSessionId:record.nativeSessionId,inputId,activeTurnId:active!.turnId,generationId:active!.generationId,grantId:provenance!.peerEnvelope.grantId,interruptionRevision:this.store.revisions(record.uri).interruptionRevision});
+  }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
   async waitForTurn(session:string,commandId:string,timeoutMs=600000) {
     const record=await this.record(session),receipt=this.store.receipt(commandId);
@@ -2765,7 +2783,7 @@ export class AmplifierHost {
     const pending=active.pendingTurn;active.pendingTurn=undefined;this.emit(chatURI(uri),pending.action,pending.origin);
   }
   private async run(uri:string,active:Active,params:Json,special?:SettledInput) {
-    const channel=chatURI(uri),turnId=active.turnId!;let drain=false;
+    const channel=chatURI(uri),turnId=active.turnId!;let drain=false;active.peerTerminals=[];
     const message=(active.pendingTurn?.action.message??this.getRecord(uri)!.chat.activeTurn!.message),meta=message._meta as Json|undefined;
     const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':special?.operation==='history.revise'?'history-edit':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
@@ -2812,6 +2830,7 @@ export class AmplifierHost {
       active.historyRevision=undefined;active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;active.peerAdmission=undefined;
       for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.steeringMount=undefined;this.publishSteeringSupport(uri,active);
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
+      if(this.store.receipt(turnId)?.status==='completed'&&!active.cancel&&active.peerTerminals?.length)this.store.annotateReceipt(turnId,{peerTerminals:active.peerTerminals});
       this.notifyTurnSettled(uri,turnId,inputOrigin);
       let updatesJoined=true;
       try{
@@ -2932,7 +2951,7 @@ export class AmplifierHost {
     const status=this.store.receipt(commandId)?.status;
     if(!status||!['completed','cancelled','failed','unknown'].includes(status))return;
     if(this.settledCallbacks.size>=64){this.settledCallbackDropped++;return;}
-    const event=Object.freeze({session,commandId,status:status as TurnSettled['status'],inputOrigin});
+    const event=Object.freeze({session,commandId,status:status as TurnSettled['status'],inputOrigin,...(status==='completed'&&this.store.receipt(commandId)?.peerTerminals?{peerTerminals:structuredClone(this.store.receipt(commandId)!.peerTerminals)}:{})});
     // A barrier only: never invoke a capability owner while holding admission's mutex.
     const pending=this.withLock(session,async()=>{}).then(()=>this.config.turnSettled!(event)).catch(()=>{this.settledCallbackFailures++;}).finally(()=>{this.settledCallbacks.delete(pending);this.intake.workChanged();});
     this.settledCallbacks.add(pending);

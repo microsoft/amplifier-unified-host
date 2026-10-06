@@ -12,6 +12,7 @@ export interface SessionRecord {
   summary: SessionSummary; state: SessionState; chat: ChatState;
 }
 export interface Receipt {
+  peerTerminals?:Record<string,any>[];
   commandId: string; channel: string; clientId: string; clientSeq: number;
   status: 'admitted' | 'dispatching' | 'completed' | 'failed' | 'cancelled' | 'unknown';
   fingerprint: string; createdAt: string; updatedAt: string; detail?: string;requestSignature?:string;retryEligibility?:'waiting_worker';observationAdmission?:Record<string,unknown>;nativeInputOutcome?:NativeFailedInput;
@@ -206,7 +207,7 @@ export class Store {
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,status,detail,updatedAt:new Date().toISOString()}),commandId);
     if(receipt.status!==status){if(this.transactionOpen){if(this.receiptChanges.size<128)this.receiptChanges.add(receipt.channel);else this.receiptChanges.add('*capacity');}else this.notifyReceipt(receipt.channel);}
   }
-  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'|'nativeInputOutcome'>) {
+  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'|'nativeInputOutcome'|'peerTerminals'>) {
     const receipt=this.receipt(commandId);if(!receipt)throw new Error('Unknown command identity');
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,...values}),commandId);
   }
