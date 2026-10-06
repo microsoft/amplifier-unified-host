@@ -934,3 +934,21 @@ test('older catalog without reconcileFamily retains fresh indexed proof only',as
   const client=await f.connect(),root=await f.create(client);stale=true;await assert.rejects(f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'}),/coverage/);stale=false;assert.equal((await f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'})).workReplayed,false);
  }finally{await f.cleanup();}
 });
+
+
+test('guarded peer inputs use exact recipient revisions and cannot become human authority',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),before=await f.host.inspectSession(session),commandId=randomUUID();
+  const input={commandId,grantId:'human-scope',text:'Saved peer request',peerEnvelope:{requestId:commandId,grantId:'human-scope',mode:'queue',senderSessionId:'source',recipientSessionId:session},taskId:null,taskRevision:null,expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash,expectedNativeSessionId:before.nativeSessionId!,expectedNativeLocationRevision:before.nativeLocationRevision};
+  await assert.rejects(f.host.submitPeer(session,{...input,expectedNativeSessionId:'moved'}),/identity or location changed/);
+  assert.equal((await f.host.submitPeer(session,input)).accepted,true);assert.equal((await f.host.waitForTurn(session,commandId)).status,'completed');
+  const wire=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(wire.operation,'peer.submit');assert.equal(wire.args.inputId,commandId);assert.equal(wire.args.text,undefined);assert.equal(wire.args.peerEnvelope,undefined);
+  const context=await f.host.readSessionContext(session,2);assert.equal(context.messages[0].inputOrigin,'peer');await assert.rejects(f.host.readUserMessage(session,commandId),(e:any)=>e.reason==='not-user');
+  await assert.rejects(f.host.submitPeer(session,input),/already admitted/);
+  await assert.rejects(f.host.nativeControl(session,'peer.submit',{}),/submitPeer admission/);await assert.rejects(f.host.nativeControl(session,'peer.steer',{}),/submitPeerSteering admission/);
+  const current=await f.host.inspectSession(session);assert.equal(current.peerAdmission,undefined);
+  const refused=randomUUID();await f.host.submitPeer(session,{...input,commandId:refused,peerEnvelope:{...input.peerEnvelope,requestId:refused},taskRevision:99,expectedExecutionRevision:current.executionRevision});
+  assert.equal((await f.host.waitForTurn(session,refused)).status,'failed');assert.equal(f.host.store.turns(session.replace('ahp-session:','ahp-chat:')).turns.length,1);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});

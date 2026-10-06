@@ -109,8 +109,8 @@ export interface HostConfig {
   nativeEvent?:(context:{session:string;nativeSessionId:string;workingDirectory:string},params:Json)=>Promise<void>;
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
-interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string};}
-interface Active {steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise'|'peer.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string;nativeSessionId?:string;nativeLocationRevision?:number};}
+interface Active {steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -637,7 +637,7 @@ export class AmplifierHost {
     const inputs=updates.map(update=>update.content);
     const recorded=(group.updates as Json[]).map(update=>update._meta?.['amplifier.dev/history']).find(value=>value?.recordedOnly);
     const inputHistory=updates.find(update=>update.sessionUpdate==='user_message_chunk')?._meta?.['amplifier.dev/history'];
-    const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
+    const message:Message={text:inputs.filter(content=>content.type==='text').map(content=>content.text).join(''),origin:{kind:recorded&&!inputs.length||inputHistory?.inputOrigin==='peer'?'agent' as any:'user' as any},_meta:{'amplifier.dev/history':{...inputHistory,inputOrigin:inputHistory?.inputOrigin??'unknown',authorization:'unverified-native-history',outcome:group.recordedOnly?'recorded':group.state??'unknown',...(recorded?{via:recorded.via,callId:recorded.callId,itemId:recorded.itemId,recordedOnly:true}: {})}}};
     const attachments:any[]=[];
     for(const content of inputs){
       if(content.type==='image'||content.type==='audio')attachments.push({type:'embeddedResource',label:content.type,contentType:content.mimeType,data:content.data});
@@ -2336,9 +2336,10 @@ export class AmplifierHost {
       if(special||active.agent.engine.messagePrincipal===undefined||native?.version!==1||capability?.version!==1||capability.quoteMeta!=='amplifier.dev/messageReply'||!record.nativeSessionId||active.agent.nativeId!==record.nativeSessionId)throw new RpcFault(-32601,'Configured engine does not support quoted message inputs',{executed:false,replayed:false});
     }
     if(special){
-      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':special.operation==='question.submit'?'questionTurns':special.operation==='history.revise'?'historyEdits':'observationTurns'];
+      const native=active.agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.[special.operation==='schedule.submit'?'scheduledTurns':special.operation==='question.submit'?'questionTurns':special.operation==='history.revise'?'historyEdits':special.operation==='peer.submit'?'peerTurns':'observationTurns'];
       if(capability?.version!==1||capability.completion!=='settled')throw new Error(`Agent does not advertise settled ${special.operation}`);
-      if(special.expected){const current=await this.inspectSession(record.uri);if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
+      if(special.operation==='peer.submit'&&(capability.guarded!==true||!capability.modes?.includes('queue')))throw new Error('Agent does not advertise guarded peer input');
+      if(special.expected){const current=await this.inspectSession(record.uri);if(special.operation==='peer.submit'&&(current.nativeSessionId!==special.expected.nativeSessionId||current.nativeLocationRevision!==special.expected.nativeLocationRevision))throw new Error('Peer recipient identity or location changed');if(current.interruptionRevision!==special.expected.interruptionRevision||current.executionRevision!==special.expected.executionRevision||current.configurationHash!==special.expected.configurationHash)throw new Error('Scheduled admission revisions changed');}
     }
     const historyArgs=special?.operation==='history.revise'?special.args:undefined;
     if(historyPrefix?.editContext&&special)special={...special,args:{...special.args,prompt:blocks}};
@@ -2348,7 +2349,8 @@ export class AmplifierHost {
     this.touchAgent(active);active.busy=true;active.generationId=undefined;active.steeringMount=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();this.publishSteeringSupport(record.uri,active);
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
     active.historyRevision=historyPrefix?{args:historyArgs!,prefix:historyPrefix,confirmed:false}:undefined;
-    if(special?.operation==='history.revise')active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};
+    if(special?.operation==='peer.submit'){active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};active.peerAdmission={inputId:action.turnId,grantId:special.args.grantId,taskId:special.args.taskId,taskRevision:special.args.taskRevision,...special.expected,admittedExecutionRevision:this.store.revisions(record.uri).executionRevision};}
+    else if(special?.operation==='history.revise')active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};
     else if(special?.operation==='observation.submit'){active.pendingTurn={action,origin:origin.clientSeq>=0?origin:undefined};active.observationAdmission={inputId:action.turnId,watchId:special.args.watchId,taskId:special.args.taskId,taskRevision:special.args.taskRevision,outcomeDigest:createHash('sha256').update(JSON.stringify(special.args.outcome)).digest('hex'),expectedExecutionRevision:special.expected!.executionRevision,expectedInterruptionRevision:special.expected!.interruptionRevision,expectedConfigurationHash:special.expected!.configurationHash,admittedExecutionRevision:this.store.revisions(record.uri).executionRevision};this.store.annotateReceipt(action.turnId,{observationAdmission:active.observationAdmission});}else this.emit(channel,action,origin.clientSeq>=0?origin:undefined);if(action.queuedMessageId)this.store.db.prepare('UPDATE queue_intents SET projected=1 WHERE id=?').run(action.queuedMessageId);this.store.finish(action.turnId,'dispatching');active.run=this.run(record.uri,active,params,special);
       });
   }
@@ -2465,6 +2467,18 @@ export class AmplifierHost {
       }catch(error){const current=this.store.receipt(input.commandId);if(current&&current.retryEligibility!=='waiting_worker')throw new RpcFault(-32011,(error as Error).message,{receipt:input.commandId,outcome:'unknown',executed:true});return {accepted:false,executed:false,reason:(error as Error).message,...(current?.retryEligibility?{receipt:current}: {})};}
     });
       });
+  }
+  /** A capability owner's saved peer request; native authority rechecks at intake. */
+  async submitPeer(session:string,input:{commandId:string;grantId:string;text:string;peerEnvelope:Json;taskId:string|null;taskRevision:number|null;expectedExecutionRevision:number;expectedInterruptionRevision:number;expectedConfigurationHash:string;expectedNativeSessionId:string;expectedNativeLocationRevision:number}) {
+    return this.intake.run(async()=>{
+      if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.grantId!=='string'||!input.grantId||input.grantId.length>200||typeof input.text!=='string'||!input.text.trim()||Buffer.byteLength(input.text)>32000||!input.peerEnvelope||input.peerEnvelope.requestId!==input.commandId||input.peerEnvelope.grantId!==input.grantId||input.peerEnvelope.mode!=='queue'||Buffer.byteLength(JSON.stringify(input.peerEnvelope))>12000||typeof input.expectedNativeSessionId!=='string'||!input.expectedNativeSessionId||![input.expectedExecutionRevision,input.expectedInterruptionRevision,input.expectedNativeLocationRevision].every(n=>Number.isSafeInteger(n)&&n>=0)||typeof input.expectedConfigurationHash!=='string')throw new RpcFault(-32602,'Bounded saved peer input and exact recipient revisions required');
+      const record=await this.record(session);
+      return this.withLock(record.uri,async()=>{
+        if(this.store.receipt(input.commandId))throw new RpcFault(-32011,'Peer input already admitted; inspect its receipt without replay');
+        await this.admitTurn(record,record.chat.resource,{type:'chat/turnStarted',turnId:input.commandId,startedAt:now(),message:{text:input.text,origin:{kind:'agent'},_meta:{'amplifier.dev/input':{inputOrigin:'peer',peerEnvelope:input.peerEnvelope}}}} as any,{clientId:'host:peer',clientSeq:this.store.extensionSequence('host:peer')},{operation:'peer.submit',args:{grantId:input.grantId,taskId:input.taskId,taskRevision:input.taskRevision},expected:{executionRevision:input.expectedExecutionRevision,interruptionRevision:input.expectedInterruptionRevision,configurationHash:input.expectedConfigurationHash,nativeSessionId:input.expectedNativeSessionId,nativeLocationRevision:input.expectedNativeLocationRevision}},true);
+        return {accepted:true,completed:false,inputId:input.commandId,receipt:this.store.receipt(input.commandId)};
+      });
+    });
   }
   /** Wait for an already admitted turn. Timeout leaves execution running and never resubmits. */
   async waitForTurn(session:string,commandId:string,timeoutMs=600000) {
@@ -2645,7 +2659,7 @@ export class AmplifierHost {
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
         await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
-        if(['observation.submit','history.revise'].includes(special.operation)&&!active.pendingTurn)throw new Error('Native refused observation after execution evidence');
+        if(['observation.submit','history.revise','peer.submit'].includes(special.operation)&&!active.pendingTurn)throw new Error('Native refused observation after execution evidence');
         if(special.operation==='observation.submit'&&response.executed===false&&response.reason==='waiting_worker')this.store.annotateReceipt(turnId,{retryEligibility:'waiting_worker'});
         if(!active.pendingTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'INPUT_REJECTED',message:String(response.reason??'Native input rejected before execution')}}} as StateAction);return;
       }
@@ -2681,7 +2695,7 @@ export class AmplifierHost {
       }
       for(const row of this.store.db.prepare("SELECT id,message FROM steering_intents WHERE chat=? AND active_turn_id=? AND status='pending'").all(channel,turnId)){this.store.db.prepare('UPDATE steering_intents SET held=1,reason=? WHERE id=?').run('target-turn-ended',row.id);const message=JSON.parse(String(row.message));this.emit(channel,{type:'chat/pendingMessageSet',kind:'steering',id:String(row.id),message:{...message,_meta:{...message._meta,'amplifier.dev/steering':{...message._meta?.['amplifier.dev/steering'],held:true,reason:'target-turn-ended'}}}} as PendingQueueAction);}
       if(active.historyRevision){const receipt=this.store.receipt(turnId)!;this.store.db.prepare('UPDATE history_edits SET status=? WHERE operation_id=?').run(receipt.status,active.historyRevision.args.operationId);}
-      active.historyRevision=undefined;active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;
+      active.historyRevision=undefined;active.generationId=undefined;active.pendingTurn=undefined;active.observationAdmission=undefined;active.peerAdmission=undefined;
       for(const pending of active.permissions.values())pending.resolve({outcome:{outcome:'cancelled'}});active.permissions.clear();active.busy=false;active.steeringMount=undefined;this.publishSteeringSupport(uri,active);
       if(drain&&!this.closing)void this.withLock(uri,()=>this.drainQueue(uri)).catch(()=>{});else this.holdQueue(channel,this.closing?'host-shutdown':'turn-not-naturally-completed');
       this.notifyTurnSettled(uri,turnId,inputOrigin);
@@ -2946,8 +2960,9 @@ export class AmplifierHost {
     const engine=this.config.engines.find(e=>e.id===record.engineId);
     const configurationHash=createHash('sha256').update(JSON.stringify({engine,values:record.state.config?.values,revision:revisions.configurationRevision})).digest('hex');
     const active=this.active.get(record.uri),admission=active?.busy&&active.turnId?this.store.receipt(active.turnId):undefined;
+    const peerAdmission=admission?.status==='dispatching'&&active?.peerAdmission&&!active.cancel&&!active.finishing&&!active.stopNotified?{...active.peerAdmission,status:admission.status}:undefined;
     const observationAdmission=admission?.status==='dispatching'&&active?.observationAdmission?{...active.observationAdmission,status:admission.status}:undefined;
-    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,location:record.state._meta?.['amplifier.dev/location'],activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
+    return {session:record.uri,uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,historyHome:record.workingDirectory,executionDirectory:record.executionDirectory??record.workingDirectory,nativeLocationRevision:record.nativeLocationRevision??0,relocationFence:this.relocationFence(record.uri),transferFence:this.transferFence(record.uri),title:record.summary.title,location:record.state._meta?.['amplifier.dev/location'],activeTurnId:admission?active!.turnId:record.chat.activeTurn?.id,observationAdmission,peerAdmission,status:active?.busy||record.chat.activeTurn?'working':'idle',...revisions,configurationHash};
   }
   /** Hold the selected session mapping through bounded trusted I/O. No filesystem snapshot is implied. */
   async withSessionWorkspace<T>(session:string,expected:SessionWorkspaceExpectation,capture:(workspace:Readonly<SessionWorkspace>)=>Promise<T>):Promise<T> {
@@ -3125,7 +3140,7 @@ export class AmplifierHost {
     if(this.relocationFence(session))throw new RpcFault(-32011,'Session relocation is fenced; no runtime control was dispatched');
     if(operation==='history.edit')throw new RpcFault(-32601,'Canonical history editing requires an admitted lifecycle; generic dispatch is unavailable');
     if(operation==='session.relocate')throw new RpcFault(-32602,'Relocation requires relocateSession admission');
-    const admissionMethod:Record<string,string>={'steer':'updatePendingQueue','steer.submit':'updatePendingQueue','schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation','history.revise':'reviseHistory'};
+    const admissionMethod:Record<string,string>={'steer':'updatePendingQueue','steer.submit':'updatePendingQueue','schedule.submit':'submitScheduled','question.submit':'submitQuestionAnswer','observation.submit':'submitObservation','history.revise':'reviseHistory','peer.submit':'submitPeer','peer.steer':'submitPeerSteering'};
     if(admissionMethod[operation])throw new RpcFault(-32602,`Execution requires ${admissionMethod[operation]} admission`);
     const execute=async()=>{
       this.guardTransfer(session);
