@@ -41,6 +41,29 @@ Their approved direction is separate from the implementation evidence below.
 | **HB8** — WS1; CB3; MA7–11 | Hiding discovery, purging a retired copy and disposing managed files are distinct reviewed authorities. Preserve canonical history unless separately authorized. | Age or an arbitrary cwd implies ownership; incomplete family/reference coverage permits disposal. | [Retention](../../test/retention.integration.test.ts), [retired copies](../../test/retired-copy.integration.test.ts), [managed files](../../test/managed-files.integration.test.ts) |
 | **HB9** — CB1, CB4–6 | Develop with public fixture peers and owned state; record exact source, package, installed and runtime evidence independently. | A local green test is reported as vendor, browser, Linux process or deployed acceptance. | [Run/verification guide](../../README.md#verification-boundary), [family Q1–Q12 gates][gates] |
 
+## Native event admission and completion ordering
+
+The ACP transport is duplex. The SDK may resolve a response while an earlier
+notification is still traversing its asynchronous dispatch handlers. Before the
+Host settles a prompt or native input, it joins admission of every native event
+already received on that connection. The Host callback records generation
+identity and checkpoint evidence synchronously, before releasing that admission.
+Asynchronous catalog and capability listeners may finish separately; they must
+not prevent the transport from receiving replies to their own requests.
+
+Admission is bounded to 512 pending notifications and eight MiB. Missing,
+foreign-session, timed-out or closed admissions make the input outcome unknown;
+they never create proof, repeat the input, or qualify a staged peer result. A
+completed answer still needs the existing exact native checkpoint and generation
+match. Standard ACP agents without native events have no admission work.
+
+`test/terminal-burst.test.ts` uses an independent wire peer that sends its final
+message, native terminal proof and RPC response in one write. It covers repeated
+turns, cancellation, errors, foreign sessions and a slow optional listener.
+`test/native-event-intake.test.ts` covers missing admissions and capacity bounds.
+The installed SDK must preserve extension parameter identity through dispatch;
+an incompatible SDK change is rejected instead of silently losing evidence.
+
 ## Scope, actor and command authority
 
 A capability topic marked `scope:'host'` requires resource `scope=host` and action

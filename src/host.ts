@@ -2791,7 +2791,9 @@ export class AmplifierHost {
     const message=(active.pendingTurn?.action.message??this.getRecord(uri)!.chat.activeTurn!.message),meta=message._meta as Json|undefined;
     const inputOrigin=special?.operation==='schedule.submit'?'scheduled':special?.operation==='question.submit'?'question':special?.operation==='observation.submit'?'observation':special?.operation==='history.revise'?'history-edit':String(meta?.['amplifier.dev/input']?.inputOrigin??(message.origin?.kind==='user'?'user':'unknown'));
     try {
-      const response:Json=special?await active.agent.client.extMethod('_amplifier/native',params):await active.agent.client.prompt(params as any);
+      let response:Json;
+      try{response=special?await active.agent.client.extMethod('_amplifier/native',params):await active.agent.client.prompt(params as any);}
+      finally{await active.agent.drainNativeEventIntake();}
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
         await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
