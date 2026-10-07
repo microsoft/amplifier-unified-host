@@ -208,6 +208,16 @@ AHP actions. Tool update fields replace their prior values: `rawInput` objects
 are never concatenated into malformed JSON, and omitted completion fields retain
 previous tool content. A pending permission stays pending when input changes.
 
+Tool inputs and results larger than 4 KiB use standard AHP content references.
+Snapshots retain their outcome and position; `resourceRead` returns the exact
+saved body when requested. Result resources use
+`application/vnd.amplifier.tool-result+json` to preserve the whole public result
+envelope, including structured output and content blocks. Pending permission
+arguments remain inline so the complete reviewed input is immediately available.
+Content writes are atomic and reads verify the URI's SHA-256 digest. These are
+derived projections; native history stays authoritative. This bounds large tool
+bodies in snapshots, not native history indexing or the number of execution nodes.
+
 Idle `session_info_update` values are preserved, and title changes update the
 session/catalog. Opaque `available_commands_update` lists and context-window /
 cumulative-cost `usage_update` reports have full replacement semantics under

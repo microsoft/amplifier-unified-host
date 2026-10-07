@@ -1,4 +1,5 @@
 import {peerTerminal} from './peer-results.js';
+import {toolInputDetail,toolResultDetail} from './tool-details.js';
 import {missingHistoryWorkspace} from './history-workspace.js';
 import {validatePeerSteering,type PeerSteeringInput} from './peer-steering.js';
 import {turnOutcome} from './turn-outcome.js';
@@ -18,7 +19,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
-import { realpath, stat, readFile, writeFile, mkdir, readdir } from 'node:fs/promises';
+import { realpath, stat, readFile, writeFile, mkdir, readdir, rename } from 'node:fs/promises';
 import { isAbsolute, relative, join, dirname, basename, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, SessionStatus, MessageAttachmentKind, type ActionEnvelope, type StateAction, type ChatState, type SessionSummary, type Snapshot, type Message, type SessionState, type Turn, type TerminalState } from '@microsoft/agent-host-protocol';
@@ -894,7 +895,10 @@ export class AmplifierHost {
         const provider=this.resourceProvider(p.uri);if(provider?.read)return provider.read(p,{clientId:peer.clientId!});
         if(typeof p.uri==='string'&&p.uri.startsWith('file:')){const path=await this.resourcePath(p.uri),info=await stat(path);if(info.size>16*1024*1024)throw new RpcFault(-32000,'Resource exceeds read budget');const body=await readFile(path);return {data:body.toString(p.encoding==='utf-8'?'utf8':'base64'),encoding:p.encoding==='utf-8'?'utf-8':'base64'};}
         if(typeof p.uri!=='string'||!/^ahp-content:\/[a-f0-9]{64}$/.test(p.uri))throw new RpcFault(-32009,'Only host-issued content resources are readable');
-        const key=p.uri.slice('ahp-content:/'.length),body=await readFile(join(this.config.stateDirectory,'content',key));
+        const key=p.uri.slice('ahp-content:/'.length),path=join(this.config.stateDirectory,'content',key);
+        if((await stat(path)).size>16*1024*1024)throw new RpcFault(-32000,'Content exceeds read budget');
+        const body=await readFile(path);
+        if(createHash('sha256').update(body).digest('hex')!==key)throw new RpcFault(-32000,'Saved content integrity check failed');
         const metadata=JSON.parse(await readFile(join(this.config.stateDirectory,'content',key+'.json'),'utf8'));
         return {data:body.toString(p.encoding==='utf-8'?'utf8':'base64'),encoding:p.encoding==='utf-8'?'utf-8':'base64',contentType:metadata.contentType};
       }
@@ -2866,7 +2870,12 @@ export class AmplifierHost {
   private async content(block:any):Promise<Json> {
     const body=block.data?Buffer.from(block.data,'base64'):Buffer.from(JSON.stringify(block));
     const key=createHash('sha256').update(body).digest('hex'),directory=join(this.config.stateDirectory,'content');await mkdir(directory,{recursive:true,mode:0o700});
-    await writeFile(join(directory,key),body,{mode:0o600});await writeFile(join(directory,key+'.json'),JSON.stringify({contentType:block.mimeType??'application/json'}),{mode:0o600});
+    // Publish complete immutable bytes before referring to them in a snapshot.
+    // Parallel refreshes may write the same digest; readers must never see a
+    // truncation caused by reopening an already published file for writing.
+    const temporary=join(directory,`${key}.${randomUUID()}.tmp`);
+    await writeFile(temporary,body,{mode:0o600});await rename(temporary,join(directory,key));
+    await writeFile(temporary+'.json',JSON.stringify({contentType:block.mimeType??'application/json'}),{mode:0o600});await rename(temporary+'.json',join(directory,key+'.json'));
     return {kind:'contentRef',uri:`ahp-content:/${key}`,contentType:block.mimeType??'application/json'};
   }
   private async toolContent(content:any[]):Promise<any[]> {
@@ -2922,14 +2931,16 @@ export class AmplifierHost {
       active.textPart=undefined;const id=update.toolCallId;active.toolStates??=new Map();
       const previous=active.toolStates.get(id)??{},current={...previous,...Object.fromEntries(Object.entries(update).filter(([key,value])=>value!==undefined&&(value!==null||key==='rawInput'||key==='rawOutput')))};
       active.toolStates.set(id,current);
-      const metadata={'amplifier.dev/acp':{kind:current.kind,locations:current.locations,title:current.title,rawInput:current.rawInput}};
+      // A pending decision must keep the complete reviewed input visible,
+      // including replacement arguments received while the prompt is open.
+      const raw=active.permissions.has(id)?(current.rawInput===undefined?undefined:JSON.stringify(current.rawInput)):await toolInputDetail(current.rawInput,block=>this.content(block));
+      const metadata={'amplifier.dev/acp':{kind:current.kind,locations:current.locations,title:current.title,...(typeof raw==='string'?{rawInput:current.rawInput}:{})}};
       if(!active.tools.has(id)){active.tools.add(id);emit({type:'chat/toolCallStart',turnId,toolCallId:id,toolName:current.name??current.kind??'tool',displayName:current.title??'Tool',_meta:metadata} as StateAction);}
-      const raw=current.rawInput===undefined?undefined:JSON.stringify(current.rawInput);
       // ACP rawInput is a replacement object, never an appendable JSON fragment.
       if(['in_progress','completed','failed'].includes(current.status)||active.permissions.has(id))emit({type:'chat/toolCallReady',turnId,toolCallId:id,invocationMessage:current.title??'Running tool',toolInput:raw,...(active.permissions.has(id)?{}:{confirmed:'not-needed'}),_meta:metadata} as StateAction);
       else emit({type:'chat/toolCallDelta',turnId,toolCallId:id,_meta:metadata} as StateAction);
-      if(update.status==='completed'||update.status==='failed')emit({type:'chat/toolCallComplete',turnId,toolCallId:id,result:{success:update.status==='completed',pastTenseMessage:current.title??'Tool finished',content:await this.toolContent(current.content??[]),structuredContent:current.rawOutput===undefined?undefined:{output:current.rawOutput}}} as StateAction);
-      else if(update.content!==undefined)emit({type:'chat/toolCallContentChanged',turnId,toolCallId:id,content:await this.toolContent(current.content??[])} as StateAction);
+      if(update.status==='completed'||update.status==='failed')emit({type:'chat/toolCallComplete',turnId,toolCallId:id,result:await toolResultDetail({success:update.status==='completed',pastTenseMessage:current.title??'Tool finished',content:await this.toolContent(current.content??[]),structuredContent:current.rawOutput===undefined?undefined:{output:current.rawOutput}},block=>this.content(block))} as StateAction);
+      else if(update.content!==undefined)emit({type:'chat/toolCallContentChanged',turnId,toolCallId:id,content:(await toolResultDetail({content:await this.toolContent(current.content??[])},block=>this.content(block))).content} as StateAction);
     } else if(update.sessionUpdate==='plan') {
       emit({type:'chat/responsePart',turnId,part:{kind:'systemNotification',content:update.entries.map((e:any)=>`${e.status}: ${e.content}`).join('\n')}} as StateAction);
     }
