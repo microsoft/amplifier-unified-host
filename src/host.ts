@@ -252,7 +252,7 @@ export class AmplifierHost {
       page:after=>this.store.db.prepare('SELECT uri FROM sessions WHERE uri>? ORDER BY uri LIMIT 100').all(after).map(row=>String(row.uri)),
       record:uri=>this.libraryMetadata(uri),unknown:uri=>this.libraryUnknown(uri),live:()=>this.libraryLiveFacts(),
       changed:()=>this.invalidateCapability('workspaces','host'),
-    },await realpath(this.config.stateDirectory),this.store.incarnation);
+    },this.store.librarySource,this.store.incarnation);
     this.store.onReceiptChanged=this.library?channel=>{if(channel==='*capacity')this.library?.degraded();else if(channel.startsWith('ahp-chat:/')||channel.startsWith('ahp-session:/'))this.library?.point(channel.replace('ahp-chat:/','ahp-session:/'));}:undefined;
     await this.repairArchiveProjection();
     await this.presentation?.checkReady();

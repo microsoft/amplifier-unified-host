@@ -24,7 +24,7 @@ const refused={code:'HOST_AUTHORITATIVE_SCHEMA'};
 function damage(directory:string,sql:string){const db=new DatabaseSync(join(directory,'host.sqlite'));db.exec(sql);db.close();}
 function withoutWrites(directory:string,open:()=>unknown){const path=join(directory,'host.sqlite'),before=hash(path);assert.throws(open,refused);assert.equal(hash(path),before);}
 
-for(const table of ['receipts','lifecycle_commands','transfer_fences','queue_intents','turns'])test(`existing ${table} loss refuses before restart normalization`,()=>{
+for(const table of ['receipts','lifecycle_commands','transfer_fences','queue_intents','turns','library_identity'])test(`existing ${table} loss refuses before restart normalization`,()=>{
  const directory=fixture();try{const store=new Store(directory);admit(store);store.close();damage(directory,`DROP TABLE ${table}`);
   withoutWrites(directory,()=>new Store(directory));withoutWrites(directory,()=>new Store(directory));
   const db=new DatabaseSync(join(directory,'host.sqlite'),{readOnly:true});try{assert.equal(absent(db,table),true);if(table!=='receipts')assert.equal(JSON.parse(String(db.prepare('SELECT payload FROM receipts').get()!.payload)).status,'admitted');}finally{db.close();}
@@ -110,4 +110,16 @@ test('crash-left WAL evidence is unchanged when missing schema rejects startup',
   renameSync(path,path+'.retained');assert.throws(()=>new Store(directory),refused);assert.equal(existsSync(path),false);assert.equal(hash(path+'-wal'),before.wal);renameSync(path+'.retained',path);
   if(process.env.HOST_SCHEMA_WAL_EVIDENCE)writeFileSync(join(directory,'receipt.json'),JSON.stringify({case:'crash-left-wal-refused-before-writable-open',before,after:{main:hash(path),wal:hash(path+'-wal')},noRecreatedTable:true},null,2)+'\n');
  }finally{if(child?.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await once(child,'exit');}if(!process.env.HOST_SCHEMA_WAL_EVIDENCE)rmSync(directory,{recursive:true,force:true});}
+});
+
+
+test('pre-identity marked store migrates once and retains the original path identity',()=>{
+ const directory=fixture();try{let store=new Store(directory);const source=store.librarySource;admit(store);store.close();
+ damage(directory,'DROP TABLE library_identity; PRAGMA user_version=1095237889');
+ store=new Store(directory);assert.equal(store.librarySource,source);assert.equal(store.receipt('original-input')!.status,'unknown');store.close();
+ }finally{rmSync(directory,{recursive:true,force:true});}
+});
+for(const sql of ['DELETE FROM library_identity', "UPDATE library_identity SET source='invalid'"])test('lost or invalid persisted library identity refuses without reminting: '+sql,()=>{
+ const directory=fixture();try{const store=new Store(directory);admit(store);store.close();damage(directory,sql);withoutWrites(directory,()=>new Store(directory));}
+ finally{rmSync(directory,{recursive:true,force:true});}
 });

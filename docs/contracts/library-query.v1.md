@@ -26,7 +26,12 @@ Startup and explicit reconcileLibrary run a paged metadata-only pass:100 URI key
 then existing lightweight session metadata and indexed unresolved checks per row.
 It never runs per query. Observation-only writes cannot overwrite canonical titles,
 parent/child kinds, visibility, location, archive, or mappings. Source identities use
-the canonical Host state directory. Source/incarnation/revisions order observations;
+the canonical Host state directory on first admission, then persist in the Host
+database. A stopped full restore carries that identity to its new directory.
+The identity is never inferred from a Catalog row or a client-supplied value.
+An older backup captured before this migration must first be upgraded at its
+original location; restoring such a backup elsewhere is not qualified.
+Source/incarnation/revisions order observations;
 restart preserves retained unknown/error and invalidates prior live claims.
 
 Delivery failure is recorded in bounded in-memory freshness state; no failed user

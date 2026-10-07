@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm,realpath} from 'node:fs/promises';
+import {mkdtemp,rm,realpath,cp} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {LibraryIndex,type LibraryHooks} from '../src/library-index.js';
@@ -30,12 +30,15 @@ test('metadata read failure is degraded and an explicit successful pass repairs 
  assert.equal((await index.query({connectionId:'reader',allowedWorkspaceRoots:['/owned']})).observationFreshness!.phase,'degraded');
  broken=false;await index.reconcile();assert.equal((await index.query({connectionId:'reader',allowedWorkspaceRoots:['/owned']})).observationFreshness!.phase,'complete');await index.close();
 });
-test('Host library authority is intersected and cold unresolved receipts survive restart without agent starts',async()=>{
+test('Host library authority and cold unresolved receipts survive restore to a new directory without agent starts',async()=>{
  const dir=await realpath(await mkdtemp(join(tmpdir(),'host-library-'))),uri=make(1).uri,rows=new Map<string,CatalogRecord>();rows.set(uri,{...make(1),workingDirectory:dir});let captured:any;
- const catalog:Catalog={list:async()=>({items:[rows.get(uri)!]}),get:async u=>rows.get(u),upsert:async r=>{rows.set(r.uri,r);},libraryQuery:async p=>{captured=p;return {version:1,items:[rows.get(uri)!],observationFreshness:p.observationFreshness};}};
+ const catalog:Catalog={list:async()=>({items:[rows.get(uri)!]}),get:async u=>rows.get(u),upsert:async r=>{const prior=rows.get(r.uri)?.hostObservation;if(prior)assert.equal(r.hostObservation?.source,prior.source,'Restored Host must retain its source');rows.set(r.uri,r);},libraryQuery:async p=>{captured=p;return {version:1,items:[rows.get(uri)!],observationFreshness:p.observationFreshness};}};
  const config={stateDirectory:join(dir,'host'),allowedWorkspaceRoots:[dir],engines:[{id:'unused',command:'/must-never-start'}],catalog};let host=await createHost(config);
  try{await host.archiveSession(uri,true);const store=(host as any).store;store.admission('ahp-chat:/1',{},'retained-unknown','fixture',1);store.finish('retained-unknown','unknown');const before=JSON.stringify(store.receipt('retained-unknown'));await host.reconcileLibrary();await host.queryLibrary({connectionId:'reader',allowedWorkspaceRoots:['/'],activity:'attention'});assert.deepEqual(captured.allowedWorkspaceRoots,[dir]);assert.equal(rows.get(uri)!.hostObservation!.effect,'unknown');assert.equal(captured.liveFacts.items.length,0);assert.equal(host.diagnostics().activeAgents,0);await host.close();
- host=await createHost(config);await host.reconcileLibrary();assert.equal(JSON.stringify((host as any).store.receipt('retained-unknown')),before);assert.equal(rows.get(uri)!.hostObservation!.effect,'unknown');assert.equal(host.diagnostics().activeAgents,0);
+ const source=rows.get(uri)!.hostObservation!.source;
+ await cp(config.stateDirectory,join(dir,'restored-host'),{recursive:true});
+ host=await createHost({...config,stateDirectory:join(dir,'restored-host')});await host.reconcileLibrary();assert.equal(JSON.stringify((host as any).store.receipt('retained-unknown')),before);assert.equal(rows.get(uri)!.hostObservation!.effect,'unknown');assert.equal(rows.get(uri)!.hostObservation!.source,source);assert.equal(host.diagnostics().activeAgents,0);
+ assert.equal((await host.queryLibrary({connectionId:'restored-reader',allowedWorkspaceRoots:[dir]})).observationFreshness!.phase,'complete');
  const client=new AhpClient(await WebSocketTransport.connect(host.url));client.connect();try{await client.initialize({clientId:'plain',protocolVersions:['0.9.0']});const listed:any=await client.request('listSessions',{channel:'ahp-root://',limit:50});assert.equal(listed.items[0].resource,uri);assert.equal(listed.items[0].status&64,64);}finally{await client.shutdown();}
  }finally{await host.close();await rm(dir,{recursive:true,force:true});}
 });

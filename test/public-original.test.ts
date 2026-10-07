@@ -221,7 +221,9 @@ test('passive peer notification remains an attributed inline input in history an
     await f.host.invalidateNativeHistory(f.session);
     const context=await f.host.readSessionContext(f.session,10);
     assert.deepEqual(context.messages.map((row:any)=>row.text),['Original human request','Before the notice','Peer update','After the notice']);
-    assert.deepEqual(context.messages.map((row:any)=>row.role),['user','assistant','user','assistant']);
+    // Native stores this notification in an input row, but selected context
+    // retains its peer-agent author; it must not become a human instruction.
+    assert.deepEqual(context.messages.map((row:any)=>row.role),['user','assistant','assistant','assistant']);
     assert.equal(context.messages[2].inputOrigin,'peer');assert.deepEqual(context.messages[2].peerEnvelope,envelope);assert.equal(context.messages[2].createdAt,at);assert.equal(context.messages[2].id,peerId);
     assert.equal(f.host.store.turns(f.session.replace('ahp-session:','ahp-chat:')).turns.length,0);await assert.rejects(readFile(f.log));
   }finally{await f.close();}

@@ -1,4 +1,3 @@
-import {createHash} from 'node:crypto';
 import {SessionStatus} from '@microsoft/agent-host-protocol';
 import type {Catalog,CatalogRecord} from './host.js';
 export interface HostObservation {version:1;source:string;incarnation:string;revision:number;observedAt:string;effect:'unknown'|'error'|'settled'|'unverified';unknownChecked:true;}
@@ -12,12 +11,11 @@ export interface LibraryHooks {
 }
 /** Rebuildable observations using existing Catalog writes; no durable delivery queue. */
 export class LibraryIndex {
- readonly source:string;
  private revision=0;private failureRevision=0;private requests=new Set<Promise<unknown>>();private stopping=false;private pass?:Promise<void>;
  private jobs=new Set<Promise<void>>();private failures=new Set<string>();
  private writes=new Map<string,{latest:number;pending:number}>();
  private phase:'complete'|'reconciling'|'degraded'='reconciling';
- constructor(private catalog:Catalog,private hooks:LibraryHooks,stateDirectory:string,readonly incarnation:string){this.source=createHash('sha256').update(stateDirectory).digest('hex');}
+ constructor(private catalog:Catalog,private hooks:LibraryHooks,readonly source:string,readonly incarnation:string){}
  observation(record:CatalogRecord):HostObservation {
   const status=Number(record.status)||0;
   const effect=this.hooks.unknown(record.uri)?'unknown':status&SessionStatus.Error?'error':status&SessionStatus.InProgress?'unverified':'settled';

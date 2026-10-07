@@ -1,7 +1,7 @@
-import {initializeAuthority,preflightAuthorityFile} from './authoritative-schema.js';
+import {initializeAuthority,preflightAuthorityFile,AuthoritativeSchemaError} from './authoritative-schema.js';
 import type {NativeFailedInput} from './input-outcome.js';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync,realpathSync } from 'node:fs';
 import { OwnerLease } from './owner-lease.js';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -36,6 +36,13 @@ export class Store {
     const path=join(directory,'host.sqlite'),existingFile=preflightAuthorityFile(path,'store');
     this.db = opened = new DatabaseSync(path);
     initializeAuthority(this.db,'store',()=>{
+    // Established stores must retain their identity, even after a stopped copy
+    // moves directories. Only the recognized pre-identity schema can mint it.
+    const hadIdentity=!!this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='library_identity'").get();
+    this.db.exec('CREATE TABLE IF NOT EXISTS library_identity(id INTEGER PRIMARY KEY CHECK(id=1),source TEXT NOT NULL)');
+    if(!hadIdentity)this.db.prepare('INSERT INTO library_identity VALUES(1,?)').run(createHash('sha256').update(realpathSync(directory)).digest('hex'));
+    const identities=this.db.prepare('SELECT id,source FROM library_identity LIMIT 2').all();
+    if(identities.length!==1||identities[0].id!==1||typeof identities[0].source!=='string'||!/^[a-f0-9]{64}$/.test(identities[0].source))throw new AuthoritativeSchemaError('library identity missing or invalid');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES('seq',0);
@@ -113,6 +120,7 @@ export class Store {
     }catch(error){opened?.close();this.lease.close();throw error;}
   }
   get seq(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='seq'").get()!.value); }
+  get librarySource():string {return String(this.db.prepare('SELECT source FROM library_identity WHERE id=1').get()!.source);}
   get count(): number { return Number(this.db.prepare('SELECT count(*) AS n FROM sessions').get()!.n); }
   transaction<T>(work: () => T): T {
     if(this.transactionOpen)return work();
