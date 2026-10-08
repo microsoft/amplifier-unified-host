@@ -280,7 +280,8 @@ test('independent ACP metadata, legacy modes, usage and raw input replacements p
  const f=await setup();try{
   f.config.engines[0].env.FIXTURE_LEGACY='1';
   const client=await f.connect(),{session,chat}=await f.create(client);await client.subscribe(session);await client.subscribe(chat,{view:{turns:10}});
-  await waitFor(()=>f.host.store.get(session)?.state.title==='Idle peer title');
+  // Drain through the final ordered metadata update, not just the preceding title.
+  await waitFor(()=>f.host.store.get(session)?.state.title==='Idle peer title'&&f.host.store.get(session)?.state.config?.values?.mode==='fast');
   let state=f.host.store.get(session)!.state,meta=state._meta!['amplifier.dev/acp'] as any;
   assert.equal(meta.availableCommands[0].name,'inspect');assert.deepEqual(meta.usage.cost,{amount:0.12,currency:'USD'});assert.equal(meta.usage.used,123);assert.equal(meta.sessionInfo.updatedAt,'2026-10-02T00:00:00Z');assert.equal(state.config?.values?.mode,'fast');
   client.dispatch(session,{type:'session/configChanged',config:{mode:'safe'}});await waitFor(()=>f.host.store.get(session)?.state.config?.values?.mode==='safe');
@@ -818,7 +819,7 @@ test('mixed canonical voice and live receipts use one bounded shared window and 
     await a.unsubscribe(chat);await b.unsubscribe(chat);await waitFor(()=>!(f.host as any).hasSubscribers(chat));
     const reset=(await a.subscribe(chat,{view:{turns:2}})).result.snapshot!.state as ChatState;assert.equal(reset.turns.length,2);assert.ok(reset.turnsNextCursor);
     const context=await f.host.readSessionContext(session,3);assert.ok(context.messages.some(row=>row.text==='spoken between chats'));assert.ok(context.messages.findIndex(row=>row.text==='before voice')<context.messages.findIndex(row=>row.text==='spoken between chats'));
-    const full=(await a.subscribe(chat)).result.snapshot!.state as ChatState;assert.equal(full.turns.length,61);assert.equal(full.turnsNextCursor,undefined);
+    const full=(await a.subscribe(chat)).result.snapshot!.state as ChatState;assert.equal(full.turns.length,50);assert.ok(full.turnsNextCursor);
   }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
 });
 

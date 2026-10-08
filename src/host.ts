@@ -1,3 +1,4 @@
+import {UpdateIntake} from './update-intake.js';
 import {peerTerminal} from './peer-results.js';
 import {toolInputDetail,toolResultDetail} from './tool-details.js';
 import {missingHistoryWorkspace} from './history-workspace.js';
@@ -114,7 +115,7 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise'|'peer.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string;nativeSessionId?:string;nativeLocationRevision?:number};}
-interface Active {peerTerminals?:Json[];steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+interface Active {updateIntake?:UpdateIntake;peerTerminals?:Json[];steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -303,7 +304,14 @@ export class AmplifierHost {
     if(peer.socket.readyState!==WebSocket.OPEN)return;
     if(!peer.ready&&(message as Json).method){const bytes=Buffer.byteLength(JSON.stringify(message));if(peer.buffer.length>=512||peer.bufferBytes+bytes>8*1024*1024){peer.socket.close(1013,'Handshake event capacity exceeded');return;}peer.buffer.push(message as Json);peer.bufferBytes+=bytes;return;}
     if(peer.socket.bufferedAmount>(this.config.maxPeerBufferedBytes??4*1024*1024)){peer.socket.close(1013,'Slow consumer: reconnect for authoritative state');return;}
-    peer.socket.send(JSON.stringify(message));
+    const wire=JSON.stringify(message);
+    if(Buffer.byteLength(wire)>12*1024*1024){
+      const row=message as Json;
+      if(Object.hasOwn(row,'id'))peer.socket.send(JSON.stringify({jsonrpc:'2.0',id:row.id,error:{code:-32013,message:'Response exceeds its byte budget; request a narrower page',data:{reason:'response-byte-limit'}}}));
+      else peer.socket.close(1013,'Event exceeds capacity; reload a bounded view');
+      return;
+    }
+    peer.socket.send(wire);
   }
   private notify(method:string,params:Json,channel=ROOT) {const session=params.session??params.summary?.resource;if(channel===ROOT&&['root/sessionAdded','root/sessionSummaryChanged'].includes(method)&&typeof session==='string'&&this.presentation?.hidden(session))return;for(const peer of this.peers)if(peer.subscriptions.has(channel))this.send(peer,{jsonrpc:'2.0',method,params});}
   private root() {return {agents:this.config.engines.map(engine=>({provider:engine.id,displayName:engine.label,description:'ACP agent',models:[],capabilities:{}})),activeSessions:this.store.count,terminals:this.terminalList(),_meta:{'amplifier.dev/host':{version:1,privateDrafts:'client',boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},defaultDirectory:this.defaultWorkingDirectory?pathToFileURL(this.defaultWorkingDirectory).href:undefined,features:{libraryQuery:!!this.library,receipts:true,sharedDrafts:false,queue:true,steer:true,voice:false,canvas:false,nativeControl:false}}}};}
@@ -757,7 +765,7 @@ export class AmplifierHost {
     const turns=limit===undefined?merged:merged.slice(-limit);
     return {turns,hasOlder:!!native.nextCursor||!!live.before||merged.length>turns.length,revision:native.revision,diagnostics:native.diagnostics};
   }
-  private async snapshot(uri:string,turns?:number):Promise<Snapshot> {
+  private async snapshot(uri:string,turns=50):Promise<Snapshot> {
     let state:any;
     if(uri===ROOT)state=this.root();else if(this.watches.has(uri)){const {root,recursive}=this.watches.get(uri)!;state={root,recursive};}else if(uri.startsWith('ahp-terminal:/')){state=this.terminalState(uri);if(!state)throw new RpcFault(-32008,'Unknown terminal');}else {
       const record=await this.record(uri);
@@ -765,8 +773,9 @@ export class AmplifierHost {
       else {
         const page=this.store.turns(uri,turns);
         if((record.chat._meta?.['amplifier.dev/history'] as Json)?.source==='native') {
-          const previous=this.nativeWindows.get(uri),unbounded=turns===undefined||previous?.unbounded===true;
-          const page=await this.selectedHistory(record,unbounded?undefined:Math.max(turns!,previous?.ids.length??0)),fresh=this.getRecord(record.uri)!;
+          const previous=this.nativeWindows.get(uri),unbounded=false;
+          const page=await this.selectedHistory(record,Math.max(turns,previous?.ids.length??0)),fresh=this.getRecord(record.uri)!;
+          this.assertHistorySize(page.turns);
           const nextCursor=this.rememberMixedCursor(uri,page),ids=page.turns.map(turn=>turn.id);
           if(previous?.ids.length){const offset=ids.indexOf(previous.ids[0]);if(offset>0&&turnIdentityHash(ids.slice(offset,offset+previous.ids.length))===turnIdentityHash(previous.ids))this.emit(uri,{type:'chat/turnsLoaded',turns:page.turns.slice(0,offset),turnsNextCursor:nextCursor} as StateAction);}
           this.nativeWindows.set(uri,{ids,unbounded});
@@ -774,13 +783,18 @@ export class AmplifierHost {
         } else {
           const oldFloor=this.loadedFloors.get(uri),requestedFloor=page.first??Number.MAX_SAFE_INTEGER;
           const floor=Math.min(oldFloor??requestedFloor,requestedFloor);
+          this.assertHistorySize(this.store.turnsFrom(uri,floor));
           if(oldFloor!==undefined&&floor<oldFloor)this.emit(uri,{type:'chat/turnsLoaded',turns:this.store.turnsFrom(uri,floor,oldFloor),turnsNextCursor:this.turnCursor(uri,page.before)} as StateAction);
           this.loadedFloors.set(uri,floor);
           state={...record.chat,turns:this.store.turnsFrom(uri,floor),turnsNextCursor:this.turnCursor(uri,this.store.turns(uri,1,floor).turns.length?floor:undefined)};
         }
       }
     }
+    if(Buffer.byteLength(JSON.stringify(state))>8*1024*1024)throw new RpcFault(-32013,'Selected snapshot exceeds its byte budget; request a narrower history view',{reason:'history-byte-limit',available:false});
     return {resource:uri,state,fromSeq:this.store.seq};
+  }
+  private assertHistorySize(turns:Turn[]) {
+    if(Buffer.byteLength(JSON.stringify(turns))>4*1024*1024)throw new RpcFault(-32013,'History page exceeds its byte budget; request fewer turns. Native history is preserved.',{reason:'history-byte-limit',available:false});
   }
   private async subscribe(peer:Peer,uri:string,turns?:number) {
     if(peer.subscriptions.size>=(this.config.maxSubscriptions??64)&&!peer.subscriptions.has(uri))throw new RpcFault(-32000,'Subscription capacity reached');
@@ -791,7 +805,8 @@ export class AmplifierHost {
     if(method==='ping')return null;
     if(method==='initialize') {
       if(peer.initialized)throw new RpcFault(-32600,'Already initialized');
-      if(!p.protocolVersions?.includes('0.9.0'))throw new RpcFault(-32005,'Unsupported protocol version',{supportedVersions:['0.9.0']});
+      if(!Array.isArray(p.protocolVersions)||!p.protocolVersions.length||p.protocolVersions.length>32||p.protocolVersions.some((v:unknown)=>typeof v!=='string'||v.length>100||!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(v)))throw new RpcFault(-32602,'protocolVersions must be a nonempty bounded array of semantic versions');
+      if(!p.protocolVersions.includes('0.9.0'))throw new RpcFault(-32005,'Unsupported protocol version',{supportedVersions:['0.9.0']});
       if(typeof p.clientId!=='string'||!p.clientId||p.clientId.length>256)throw new RpcFault(-32602,'clientId required');
       if([...this.peers].some(other=>other!==peer&&other.clientId===p.clientId))throw new RpcFault(-32602,'Client identity already connected');
       peer.clientId=p.clientId;peer.initialized=true;
@@ -811,7 +826,7 @@ export class AmplifierHost {
       for(const uri of p.subscriptions)try {if(this.retentionChanging.has(uri))throw new Error('Retention operation in progress');if(uri!==ROOT&&!this.watches.has(uri)&&!this.terminalState(uri))await this.record(uri);peer.subscriptions.add(uri);this.refreshAgentInterest(uri);}catch{missing.push(uri);}
       const replay=this.store.replay(p.lastSeenServerSeq,peer.subscriptions);
       if(replay){peer.replayCut=this.store.seq;return {type:'replay',actions:replay,missing};}
-      // Snapshot recovery has no view hint in AHP 0.9; return all retained turns as specified.
+      // Reconnect has no view hint. Supply a bounded recent window and an older-page cursor.
       const snapshots:Snapshot[]=[];for(const uri of peer.subscriptions)snapshots.push(await this.snapshot(uri));
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       return {type:'snapshot',snapshots};
@@ -1876,17 +1891,21 @@ export class AmplifierHost {
         hostRuntimeRetention:true,
         admitEffect:work=>this.admittedNativeWork(uri,active,work),
         update:params=>{
-          const bytes=Buffer.byteLength(JSON.stringify(params));
-          // Rejected updates never enter the queue or own a completion callback.
-          if((active.updateCount??0)+1>512||(active.updateBytes??0)+bytes>8*1024*1024){agent.process.kill();return Promise.reject(new Error('ACP update queue capacity exceeded; execution outcome requires reconciliation'));}
-          active.updateCount=(active.updateCount??0)+1;active.updateBytes=(active.updateBytes??0)+bytes;
-          const update=(active.updates??Promise.resolve()).then(()=>this.update(uri,params)).finally(()=>{active.updateCount!--;active.updateBytes!-=bytes;this.intake.workChanged();});active.updates=update;return update;
+          active.updateIntake??=new UpdateIntake(value=>this.update(uri,value),()=>{
+            active.updateCount=active.updateIntake!.count;active.updateBytes=active.updateIntake!.bytes;this.intake.workChanged();
+          });
+          try{
+            const update=active.updateIntake.enqueue(params);
+            active.updates=active.updateIntake.settled;active.updateCount=active.updateIntake.count;active.updateBytes=active.updateIntake.bytes;
+            return update;
+          }catch(error){agent.process.kill();return Promise.reject(error);}
         },permission:async params=>{await active.updates;return this.permission(uri,params);},
         terminal:event=>this.terminalEvent(uri,event),
         stopped:event=>this.notifyAgentStopped(uri,active,active.retireReason??'process-closed',event),
         nativeEvent:async params=>{
           const event=params.event as Json|undefined;
           if(event) this.steeringEvent(uri,active,event);
+          if(event?.type==='execution.event')await active.updates;
           if(event?.type==='execution.event'&&active.busy&&active.turnId&&event.activeInputId===active.turnId&&event.event?.kind==='llm'){
             const node=event.event;
             if(typeof node.id!=='string'||node.id.length>200||Buffer.byteLength(JSON.stringify(node))>32768)return;
@@ -1986,6 +2005,7 @@ export class AmplifierHost {
     if(this.config.catalog.projectSessionArchives)this.store.db.prepare('DELETE FROM archive_projection_pending WHERE uri=? AND is_archived=?').run(record.uri,Number(!!(record.summary.status & SessionStatus.IsArchived)));
   }
   private emit(channel:string,action:StateAction,origin?:ActionEnvelope['origin'],rejectionReason?:string,publication?:{commit?:()=>void}):ActionEnvelope {
+    if(action.type==='chat/turnsLoaded')this.assertHistorySize(action.turns);
     let previous=this.getRecord(channel);
     // Read is shared session metadata. Record a standard unread action at work
     // boundaries so the session reducer cannot preserve an obsolete read flag.
