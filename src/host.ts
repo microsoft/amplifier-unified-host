@@ -1664,9 +1664,11 @@ export class AmplifierHost {
       if(!['restore','legacyCopy.purge'].includes(operation)&&!((operation==='export'||operation==='fork'&&args.mode==='recovery')&&this.managedFiles.fence(record.uri)?.status==='completed'))this.guardSessionLifecycle(record.uri);else if(this.store.db.prepare("SELECT 1 FROM lifecycle_commands WHERE session=? AND status IN ('dispatching','unknown')").get(record.uri))throw new RpcFault(-32011,'Resolve prior lifecycle receipt first');
       if(this.store.unknown(record.chat.resource)&&!(operation==='fork'&&args.mode==='recovery')||this.relocationFence(record.uri))throw new RpcFault(-32011,'Unresolved execution or relocation must be inspected before lifecycle changes',{executed:false});
       if(this.config.catalog&&['delete','restore'].includes(operation)&&!this.config.catalog.setVisibility)throw new RpcFault(-32601,'Catalog cannot project native visibility',{executed:false});
-      await this.quiesceLifecycle(record);
+      if(operation!=='export')await this.quiesceLifecycle(record);
       const execute=async(descendants:Json[])=>this.lifecycleAgent(record,async agent=>{
         const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.sessionLifecycle;
+        const activeExport=capability?.exportDetails?.activeSnapshot;
+        if(operation==='export'&&!(activeExport?.version===1&&activeExport.canonicalOnly===true&&activeExport.executionUnchanged===true))await this.quiesceLifecycle(record);
         if(args.mode==='recovery'&&capability?.recoveryCopy?.version!==1||args.bundle!==undefined&&capability?.bundleFork?.version!==1||descendants.length&&capability?.descendantGuard?.version!==1)throw new RpcFault(-32601,'Configured engine does not support this guarded copy operation',{executed:false});
         if(operation==='legacyCopy.purge'&&(capability?.retiredCopies?.version!==1||capability.retiredCopies.duplicateFilesOnly!==true))throw new RpcFault(-32601,'Configured engine does not support verified retired-copy purge',{executed:false});
         const inspected=await this.nativeLifecycle(agent,record,'inspect');if(inspected.historyRevision!==args.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed; inspect a fresh revision',{executed:false});

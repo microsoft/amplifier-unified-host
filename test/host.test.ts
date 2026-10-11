@@ -1006,3 +1006,21 @@ test('guarded peer inputs use exact recipient revisions and cannot become human 
   assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
  }finally{await f.cleanup();}
 });
+
+
+test('active export requires exact peer snapshot support and never interrupts old or malformed peers',async()=>{
+ for(const details of [undefined,{version:1},{version:1,activeSnapshot:{version:1,canonicalOnly:true,executionUnchanged:false}},{version:1,activeSnapshot:{version:2,canonicalOnly:true,executionUnchanged:true}}]){
+  const f=await setup();try{
+   if(details)(f.config.engines[0].env as any).FIXTURE_EXPORT_DETAILS=JSON.stringify(details);
+   const client=await f.connect(),{session}=await f.create(client);
+   await f.host.submitTurn(session,{commandId:'active-export-guard',text:'slow',clientId:'reviewer'});
+   const before=await f.host.inspectSession(session);
+   await assert.rejects(f.host.exportSession(session,{commandId:'export-not-admitted',expectedHistoryRevision:'fixture-history',format:'markdown'}),/active work/);
+   const during=await f.host.inspectSession(session);
+   assert.equal(during.activeTurnId,'active-export-guard');assert.equal(during.interruptionRevision,before.interruptionRevision);
+   assert.equal(f.host.store.receipt('export-not-admitted'),undefined);
+   assert.equal(f.host.store.db.prepare('SELECT 1 FROM lifecycle_commands WHERE command_id=?').get('export-not-admitted'),undefined);
+   await f.host.waitForTurn(session,'active-export-guard');
+  }finally{await f.cleanup();}
+ }
+});
