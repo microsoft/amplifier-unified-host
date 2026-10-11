@@ -403,6 +403,14 @@ source/package boundary; Native, bridge, browser and account acceptance are sepa
 
 ## Background work and runtime loss
 
+`inspectBackgroundReadiness()` is a trusted advisory snapshot for optional
+composition-owned background work. It requires a connected client, open intake,
+and no active execution, admission, continuation, retirement or control request.
+It is not an authorization or lease: each actual effect must still pass through
+the ordinary admitted owner boundary. Composition must additionally check its
+own media and other non-Host activity. The Host does not schedule naming or
+interpret Native history through this method.
+
 A settled prompt is not proof that its agent has no owned background work. Idle
 capacity eviction requires negotiated native
 `lifecycle: {version:1, gracefulRetire:true}` and a successful atomic

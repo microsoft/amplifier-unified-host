@@ -22,6 +22,20 @@ async function fixture(options:any={}){
 }
 function participant(id:string,extra:Partial<QuiescenceParticipant>={}):QuiescenceParticipant{return {id,acquire:async c=>({ownerId:id,fenceId:c.fenceId,release:async()=>{}}),...extra};}
 
+test('background readiness requires a viewer and excludes actual turns, owner admissions and fences',async()=>{
+ const f=await fixture();const gate=pause(),entered=pause();try{
+  assert.equal(f.host.inspectBackgroundReadiness().ready,false);
+  const client=await f.connect();assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+  const session=await f.create(client);assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+  const turn=randomUUID();await f.host.submitTurn(session,{commandId:turn,text:'slow',clientId:'owner'});assert.equal(f.host.inspectBackgroundReadiness().ready,false);
+  await f.host.waitForTurn(session,turn);await until(()=>f.host.inspectBackgroundReadiness().ready);
+  const work=f.host.withExternalMutation('test-background',async()=>{entered.release();await gate.promise;});await entered.promise;assert.equal(f.host.inspectBackgroundReadiness().ready,false);gate.release();await work;
+  assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+  const held=await f.host.admitQuiescence({commandId:'background-held',purpose:'distribution-update'});assert.equal(held.admitted,true);assert.equal(f.host.inspectBackgroundReadiness().ready,false);
+  await f.host.releaseQuiescence({fenceId:held.fenceId,commandId:'background-held',outcome:'unchanged'});assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+ }finally{gate.release();await f.close();}
+});
+
 test('zero viewers does not imply idle: active turns and native-owned background work refuse retirement',async()=>{
  const f=await fixture();try{
   const client=await f.connect(),session=await f.create(client),commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'slow',clientId:'owner'});await client.shutdown();
