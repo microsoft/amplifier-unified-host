@@ -430,8 +430,8 @@ export class AmplifierHost {
   }
   private getRecord(uri:string):SessionRecord|undefined {return this.hotRecords.get(uri.startsWith('ahp-chat:/')?'ahp-session:/'+uri.slice('ahp-chat:/'.length):uri)??this.store.get(uri);}
   private catalogSummary(record:CatalogRecord):SessionSummary {
-    const live=this.getRecord(record.uri);
-    return {resource:record.uri,provider:record.engineId,title:live?.summary.title??record.title,status:live?.summary.status??(1|(record.isArchived?SessionStatus.IsArchived:0)),createdAt:record.createdAt,modifiedAt:live?.summary.modifiedAt??record.modifiedAt,workingDirectories:[pathToFileURL(record.workingDirectory).href],_meta:{'amplifier.dev/native':{availability:record.availability??'available'},...(record.location?{'amplifier.dev/location':record.location}:{})}};
+    const live=this.hotRecords.get(record.uri)?.summary??this.store.summary(record.uri);
+    return {resource:record.uri,provider:record.engineId,title:live?.title??record.title,status:live?.status??(1|(record.isArchived?SessionStatus.IsArchived:0)),createdAt:record.createdAt,modifiedAt:live?.modifiedAt??record.modifiedAt,workingDirectories:[pathToFileURL(record.workingDirectory).href],_meta:{'amplifier.dev/native':{availability:record.availability??'available'},...(record.location?{'amplifier.dev/location':record.location}:{})}};
   }
   private chatSummary(chat:ChatState) {return {resource:chat.resource,title:chat.title,status:chat.status,modifiedAt:chat.modifiedAt};}
   private turnCursor(chat:string,before?:number):string|undefined {

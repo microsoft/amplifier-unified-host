@@ -131,6 +131,11 @@ export class Store {
     catch (error) {this.replayBytes=replayBytes;this.receiptChanges.clear();if(this.transactionOpen)this.db.exec('ROLLBACK');throw error;}
     finally {this.transactionOpen=false;}
   }
+  /** Navigation needs metadata only, never the active event log or chat snapshot. */
+  summary(uri:string):SessionSummary|undefined {
+    const row=this.db.prepare('SELECT summary FROM sessions WHERE uri=? OR chat_uri=?').get(uri,uri);
+    return row?JSON.parse(row.summary as string):undefined;
+  }
   get(uri: string): SessionRecord | undefined {
     const row = this.db.prepare('SELECT * FROM sessions WHERE uri=? OR chat_uri=?').get(uri, uri);
     if (!row) return;

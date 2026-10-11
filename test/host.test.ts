@@ -126,6 +126,37 @@ test('origin and Host authority resist DNS rebinding; external workspace and for
   }finally{await f.cleanup();}
 });
 
+test('catalog navigation reads persisted summaries without hydrating chat bodies or active events',async()=>{
+  const rows:any[]=[];
+  const f=await setup({catalog:{list:async({limit}:any)=>({items:rows.slice(0,limit)}),get:async(uri:string)=>rows.find(row=>row.uri===uri),upsert:async()=>{}}});
+  try {
+    const client=await f.connect(),timestamp='2026-01-01T00:00:00.000Z';
+    for(let i=0;i<3;i++){
+      const uri='ahp-session:/metadata-'+i,chat=uri.replace('ahp-session:','ahp-chat:');
+      rows.push({uri,engineId:'fixture',workingDirectory:f.dir,title:'Catalog '+i,createdAt:timestamp,modifiedAt:timestamp});
+      if(i===2)continue;
+      const summary={resource:uri,provider:'fixture',title:'Saved '+i,status:1,createdAt:timestamp,modifiedAt:'2026-01-02T00:00:00.000Z',workingDirectories:[pathToFileURL(f.dir).href]};
+      f.host.store.save({uri,engineId:'fixture',workingDirectory:f.dir,summary,state:{} as any,chat:{resource:chat,turns:[]} as any});
+      // Navigation must remain usable even when execution bodies require recovery.
+      f.host.store.db.prepare('UPDATE sessions SET chat=?,state=? WHERE uri=?').run('unreadable chat','unreadable execution state',uri);
+      f.host.store.db.prepare('INSERT INTO active_events(channel,action) VALUES(?,?)').run(chat,'unreadable active event');
+      assert.deepEqual(f.host.store.summary(chat),summary);
+    }
+    const before=f.host.store.db.prepare('SELECT uri,chat,state FROM sessions ORDER BY uri').all();
+    const events=f.host.store.db.prepare('SELECT * FROM active_events ORDER BY seq').all();
+    const page=await client.request('listSessions',{channel:'ahp-root://',limit:2});
+    assert.deepEqual(page.items.map((row:any)=>row.title),['Saved 0','Saved 1']);
+    assert.ok(page.items.every((row:any)=>row.modifiedAt==='2026-01-02T00:00:00.000Z'));
+    const all=await client.request('listSessions',{channel:'ahp-root://',limit:3});
+    assert.equal(all.items[2].title,'Catalog 2');
+    assert.equal(f.host.store.summary('ahp-session:/missing'),undefined);
+    assert.deepEqual(f.host.store.db.prepare('SELECT uri,chat,state FROM sessions ORDER BY uri').all(),before);
+    assert.deepEqual(f.host.store.db.prepare('SELECT * FROM active_events ORDER BY seq').all(),events);
+    assert.equal(f.host.diagnostics().activeAgents,0);
+    await assert.rejects(readFile(f.log,'utf8'));
+  }finally{await f.cleanup();}
+});
+
 test('server restart preserves history/native identity and marks an uncompleted admission unknown',async()=>{
   const f=await setup();let replacement:any;try {
     const a=await f.connect(),{session,chat}=await f.create(a);await a.subscribe(chat,{view:{turns:1}});const turn=action('persisted');a.dispatch(chat,turn);await waitFor(()=>f.host.store.receipt(turn.turnId)?.status==='completed');
