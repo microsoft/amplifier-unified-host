@@ -1,3 +1,5 @@
+import type {QuiescenceContext} from './quiescence.js';
+import {historyCleanupCensus,completedHistoryReceipt} from './history-cleanup.js';
 import {exportObservations,EXPORT_FLAGS} from './export-observations.js';
 import {workspaceCleanupCensus,completedCleanupReceipt} from './workspace-cleanup.js';
 import {capacityPolicy,evaluateCapacity} from './usage.js';
@@ -3235,6 +3237,43 @@ export class AmplifierHost {
     this.assertWorkspaceCleanupFence(fence);
     for(const uri of result.archiveSessions)if(this.libraryUnknown(uri))throw Error('Resolve uncertain conversation work before folder cleanup');
     return result;
+  }
+  /** Trusted composition joins exact Native selection with held product references. */
+  async inspectHistoryCleanup(input:{census:Json;engineId:string;canonicalOwners:string[]},fence:Json){
+    this.assertWorkspaceCleanupFence(fence);
+    const catalog=this.config.catalog;
+    if(!catalog?.workspaceCleanupCensus||!catalog.setVisibility||(await catalog.libraryCapabilities?.())?.workspaceCleanupCensus?.version!==1)throw Error('Catalog has no negotiated history identity/visibility support');
+    const local=this.store.db.prepare('SELECT uri,engine_id,native_id,cwd FROM sessions ORDER BY uri LIMIT 10001').all().map(row=>({uri:String(row.uri),engineId:String(row.engine_id),nativeSessionId:row.native_id?String(row.native_id):undefined,workingDirectory:String(row.cwd)}));
+    const selection=historyCleanupCensus(input.census,input.engineId,await catalog.workspaceCleanupCensus(),local);
+    for(const row of selection.sessions)if(this.libraryUnknown(row.session)||this.relocationFence(row.session)||this.transferFence(row.session))throw Error('Unresolved conversation work protects saved history');
+    const references=await this.intake.inspectRecoveryReferences(selection.sessions.map(row=>row.session),fence as QuiescenceContext,input.canonicalOwners);
+    this.assertWorkspaceCleanupFence(fence);
+    return {...selection,references,ownerCensus:{version:1,coverage:references.coverage,nativeRevision:selection.nativeRevision,revision:createHash('sha256').update(JSON.stringify([selection,references])).digest('hex')}};
+  }
+  historyCleanupReceipt(commandId:string){
+    const row=this.store.db.prepare('SELECT operation,status,result FROM lifecycle_commands WHERE command_id=?').get(commandId);
+    if(!row)return {receipt:null};if(row.operation!=='history.cleanup.hideChats')throw Error('History cleanup command belongs to another operation');
+    return {receipt:{commandId,operation:row.operation,state:row.status==='completed'?'succeeded':'unknown',...(row.status==='completed'?{result:JSON.parse(String(row.result))}:{})}};
+  }
+  async settleHistoryCleanup(input:{commandId:string;selection:Json;nativeReceipt:Json},fence:Json){
+    this.assertWorkspaceCleanupFence(fence);completedHistoryReceipt(input.nativeReceipt,input.selection);
+    const rows=input.selection.sessions;
+    if(typeof input.commandId!=='string'||!input.commandId||input.commandId.length>200||!Array.isArray(rows)||rows.length>1000||new Set(rows.map(row=>row.session)).size!==rows.length||!this.config.catalog?.setVisibility)throw Error('Exact bounded history projection identities required');
+    const payload=JSON.stringify({selection:input.selection,nativeCommandId:input.nativeReceipt.commandId,previewHash:input.nativeReceipt.result.previewHash});
+    const previous=this.store.db.prepare('SELECT operation,payload FROM lifecycle_commands WHERE command_id=?').get(input.commandId);
+    if(previous&&(previous.operation!=='history.cleanup.hideChats'||previous.payload!==payload))throw Error('History projection command identity changed');
+    for(const row of rows){const record=this.getRecord(row.session);if(record&&['nativeSessionId','workingDirectory','engineId'].some(key=>(record as any)[key]!==row[key]))throw Error('Retained Host mapping differs from reviewed history');}
+    this.assertWorkspaceCleanupFence(fence);
+    const result={removed:true,workspacePreserved:true,nativeCommandId:input.nativeReceipt.commandId,nativeRevision:input.selection.nativeRevision,sessions:rows.map(row=>row.session),replayed:false};
+    if(!previous)this.store.transaction(()=>{
+      for(const row of rows){this.store.db.prepare('INSERT INTO session_visibility VALUES(?,1,?) ON CONFLICT(uri) DO UPDATE SET deleted=1,command_id=excluded.command_id').run(row.session,input.commandId);this.store.db.prepare('UPDATE sessions SET hidden=1 WHERE uri=?').run(row.session);this.hotRecords.delete(row.session);}
+      this.store.db.prepare('INSERT INTO lifecycle_commands(command_id,session,operation,target,status,payload,result) VALUES(?,?,?,?,?,?,?)').run(input.commandId,'history:'+input.selection.nativeRevision,'history.cleanup.hideChats',null,'dispatching',payload,JSON.stringify(result));
+    });
+    // These are derived visibility writes. A lost response can repeat only this
+    // metadata projection after authenticating the original Native receipt.
+    for(const row of rows){await this.config.catalog.setVisibility({uri:row.session,nativeSessionId:row.nativeSessionId,workingDirectory:row.workingDirectory,deleted:true,commandId:input.commandId,evidence:'native-completed-receipt'});this.notify('root/sessionRemoved',{channel:ROOT,session:row.session});}
+    this.store.db.prepare("UPDATE lifecycle_commands SET status='completed' WHERE command_id=?").run(input.commandId);
+    return this.historyCleanupReceipt(input.commandId);
   }
   workspaceCleanupReceipt(commandId:string){
     const row=this.store.db.prepare('SELECT operation,status,result FROM lifecycle_commands WHERE command_id=?').get(commandId);

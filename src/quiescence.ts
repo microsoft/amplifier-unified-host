@@ -52,13 +52,15 @@ export interface AdmissionAbortProof extends AdmissionAbortBinding {kind:'distri
 export interface AdmissionAbortOwnerReceipt extends AdmissionAbortBinding {ownerId:string;status:'released'|'not-acquired';receiptId:string;}
 export interface HostAdmissionAbortReceipt extends AdmissionAbortBinding {schema:'host-admission-abort-v1';status:'aborted';intakeClosed:false;receiptId:string;owners:AdmissionAbortOwnerReceipt[];}
 interface AdmissionAbortAttempt {kind:'admission-abort-v1';requestSignature:string;proofSignature:string;context:QuiescenceFence;proof:AdmissionAbortProof;owners:AdmissionAbortOwnerReceipt[];result?:HostAdmissionAbortReceipt;}
-export interface QuiescenceLease {ownerId:string;fenceId:string;release:(outcome:QuiescenceOutcome,proof?:QuiescenceProof|{kind:'admission-refused'})=>Promise<void>;}
+export interface QuiescenceLease {inspectRetentionReferences?:(input:{sessions:string[];limit:number})=>Promise<any>;ownerId:string;fenceId:string;release:(outcome:QuiescenceOutcome,proof?:QuiescenceProof|{kind:'admission-refused'})=>Promise<void>;}
 export interface QuiescenceParticipant {
  id:string;
  /** Declares full persisted service identity and service-specific release proof support. */
  serviceStop?:{version:1};
  /** Supports persisted retention-purpose identity and exact selected-item release evidence. */
  retentionHide?:{version:1};
+ /** Read-only selected references under an already held recovery fence. */
+ recoveryReferences?:{version:1};
  /** Atomically closes this owner's intake; null is a proven no-effect busy refusal. */
  acquire:(context:Readonly<QuiescenceContext>)=>Promise<QuiescenceLease|null>;
  /** Exact persisted owner fence reconciliation after process/supervisor replacement. */
@@ -182,6 +184,28 @@ export class QuiescenceGate {
   if(!fence||fence.purpose!=='recovery'||!['held','unknown'].includes(fence.phase)||fence.admissionStage!=='held'||fence.dataScope!==this.config?.dataScope||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.pending.size||this.maintenance||this.calls||this.continuations)throw new QuiescenceError('Original completed recovery admission is required for metadata settlement',{executed:false});
   this.maintenance++;this.settlement++;
   try{return await this.scope.run({active:false},work);}finally{this.settlement--;this.maintenance--;}
+ }
+ /** Uses original live leases only. Exclusions are trusted composed canonical
+  * authorities whose references are inspected separately by their owner. */
+ async inspectRecoveryReferences(sessions:string[],input:QuiescenceContext,excludedOwners:string[]=[]){
+  const requireHeld=()=>{const f=this.fence();if(!f||f.phase!=='held'||f.purpose!=='recovery'||this.maintenance!==1||this.changing||this.settlement||['fenceId','commandId','instanceId','dataScope','purpose'].some(k=>(f as any)[k]!==(input as any)[k]))throw Error('Exact live recovery reference hold required');return f;};
+  const fence=requireHeld();
+  if(!Array.isArray(sessions)||sessions.length>1000||new Set(sessions).size!==sessions.length||sessions.some(s=>typeof s!=='string'||!/^ahp-session:\/[^\s\x00-\x1f]{1,480}$/.test(s))||!Array.isArray(excludedOwners)||new Set(excludedOwners).size!==excludedOwners.length||excludedOwners.some(id=>!fence.owners.includes(id)))throw Error('Bounded explicit history reference selection required');
+  const results=[];
+  for(const id of fence.owners){
+   requireHeld();if(excludedOwners.includes(id))continue;
+   const participant=this.config?.participants.find(p=>p.id===id),lease=this.leases.get(id);
+   if(participant?.recoveryReferences?.version!==1||!lease?.inspectRetentionReferences)throw Error('Held reference coverage unavailable: '+id);
+   // Empty mappings contain only unindexed Native histories; no product session
+   // can reference them. Owner support and live ownership still remain required.
+   for(let offset=0;offset<sessions.length;offset+=101){
+    const refs=await this.deadline(lease.inspectRetentionReferences({sessions:sessions.slice(offset,offset+101),limit:101}));
+    requireHeld();
+    if(!refs||refs.coverage!=='complete'||!Array.isArray(refs.protected)||!Array.isArray(refs.omissions)||refs.protected.length||refs.omissions.length)throw Error('Saved work or incomplete references protect history: '+id);
+   }
+   results.push(id);
+  }
+  return {coverage:'all-configured-owners-held',owners:results.sort(),canonicalOwners:[...excludedOwners].sort()};
  }
  workChanged(){this.maybeIdle();}
  /** End observations of this local lifetime without treating process shutdown as drained work. */

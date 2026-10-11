@@ -1537,3 +1537,5 @@ configured otherwise. In-flight calls can finish above the limit.
 partial/duplicate revisions, unknowns, edited-away backfill and restart. The
 composed distribution test separately exercises installed Native admission and
 selected-main accounting migration before a provider invocation.
+
+Shared-history cleanup exposes trusted composition ports for metadata census, held owner reference checks, and completed-Native visibility projection. Families of up to 1000 indexed conversations are checked in batches of at most 101. Incomplete owner coverage, identity disagreement, external descendants, or protected work refuse review. Projection commands deduplicate exact retained evidence and cannot delete or replay Native history.
