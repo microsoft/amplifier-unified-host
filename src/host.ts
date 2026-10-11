@@ -858,7 +858,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/readState':{version:1,manualUnreadKey:'amplifier.dev/readState'},'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
@@ -2059,6 +2059,11 @@ export class AmplifierHost {
         action.type==='chat/turnResume'||action.type==='chat/inputRequested'||
         ['chat/turnComplete','chat/turnCancelled','chat/error'].includes(action.type)&&
           'turnId' in action&&action.turnId===previous.chat.activeTurn?.id));
+    if(unread&&previous!.state._meta?.['amplifier.dev/readState']){
+      const metadata={...previous!.state._meta};delete metadata['amplifier.dev/readState'];
+      this.emit(previous!.uri,{type:'session/metaChanged',_meta:metadata} as StateAction);
+      previous=this.getRecord(channel)!;
+    }
     if(unread&&(previous!.state.status&SessionStatus.IsRead)!==0){
       this.emit(previous!.uri,{type:'session/isReadChanged',isRead:false} as StateAction);
       previous=this.getRecord(channel)!;
@@ -2081,7 +2086,10 @@ export class AmplifierHost {
           if(action.type!=='chat/turnsLoaded')for(const turn of reduced.turns){const ordinal=this.store.saveTurn(channel,turn);if(this.loadedFloors.has(channel))this.loadedFloors.set(channel,Math.min(this.loadedFloors.get(channel)!,ordinal));const window=this.nativeWindows.get(channel);if(window&&!window.ids.includes(turn.id))window.ids.push(turn.id);}
           record.chat={...reduced,turns:[]};
         } else {record.state=sessionReducer(record.state,action as any);if(action.type==='session/titleChanged'&&!this.titleAdapter(record)){const revision=this.titleRevision(previous!)+1;if(!Number.isSafeInteger(revision))throw new RpcFault(-32000,'Title revision capacity reached');record.state._meta={...record.state._meta,'amplifier.dev/sessionTitle':{revision}};}}
-        record.summary={...record.summary,title:record.state.title,status:(record.chat.status & ~(SessionStatus.IsArchived|SessionStatus.IsRead)) | (record.state.status & (SessionStatus.IsArchived|SessionStatus.IsRead)),modifiedAt:record.chat.modifiedAt};
+        const summaryMeta={...record.summary._meta};
+        if(record.state._meta?.['amplifier.dev/readState'])summaryMeta['amplifier.dev/readState']=record.state._meta['amplifier.dev/readState'];
+        else delete summaryMeta['amplifier.dev/readState'];
+        record.summary={...record.summary,_meta:summaryMeta,title:record.state.title,status:(record.chat.status & ~(SessionStatus.IsArchived|SessionStatus.IsRead)) | (record.state.status & (SessionStatus.IsArchived|SessionStatus.IsRead)),modifiedAt:record.chat.modifiedAt};
         if(channel===record.uri)this.store.saveSessionMetadata(record);
         else if(record.chat.activeTurn&&action.type!=='chat/turnStarted'&&action.type!=='chat/turnsLoaded')this.store.appendActive(channel,action);
         else this.store.save(record);
@@ -2364,7 +2372,14 @@ export class AmplifierHost {
         if(action.type==='session/titleChanged'&&this.titleAdapter(record)){if(p.channel!==record.uri)throw new Error('Action requires session channel');await this.manualTitle(record,action.title,origin);return;}
         if(action.type==='session/titleChanged'||action.type==='session/isReadChanged'||action.type==='session/isArchivedChanged') {
           if(p.channel!==record.uri)throw new Error('Action requires session channel');
-          this.emit(p.channel,action,origin);this.notify('root/sessionSummaryChanged',{channel:ROOT,session:record.uri,changes:{title:this.getRecord(record.uri)!.summary.title,status:this.getRecord(record.uri)!.summary.status}});await this.syncCatalog(this.getRecord(record.uri)!);return;
+          if(action.type==='session/isReadChanged'){
+            if(typeof action.isRead!=='boolean')throw new Error('Read status must be boolean');
+            const metadata={...record.state._meta};
+            if(action.isRead)delete metadata['amplifier.dev/readState'];
+            else metadata['amplifier.dev/readState']={version:1,manualUnread:randomUUID()};
+            this.emit(record.uri,{type:'session/metaChanged',_meta:metadata} as StateAction);
+          }
+          this.emit(p.channel,action,origin);this.notify('root/sessionSummaryChanged',{channel:ROOT,session:record.uri,changes:{title:this.getRecord(record.uri)!.summary.title,status:this.getRecord(record.uri)!.summary.status,_meta:this.getRecord(record.uri)!.summary._meta}});await this.syncCatalog(this.getRecord(record.uri)!);return;
         }
         if(action.type==='session/configChanged') {
           if(p.channel!==record.uri)throw new Error('Config action requires session channel');

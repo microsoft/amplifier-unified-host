@@ -42,3 +42,22 @@ test('marking an approval read does not acknowledge or resolve its input require
   client.dispatch(chat,{type:'chat/toolCallConfirmed',turnId:id,toolCallId:'tool-1',approved:false,selectedOptionId:'deny'});await host.waitForTurn(uri,id);assert.equal(host.store.get(uri)!.state.inputNeeded?.length??0,0);
  }finally{await client?.shutdown();await host.close();await rm(root,{recursive:true,force:true});}
 });
+
+test('explicit unread marks are shared and durable, clear on read or new work, and never start work',async()=>{
+ const root=await realpath(await mkdtemp(join(tmpdir(),'ahp-manual-unread-'))),config={stateDirectory:join(root,'host'),allowedWorkspaceRoots:[root],engines:[{id:'fixture',command:process.execPath,args:[fileURLToPath(new URL('../fixtures/acp-peer.mjs',import.meta.url))]}]};
+ let host=await createHost(config);const clients:AhpClient[]=[];
+ const connect=async(id:string)=>{const c=new AhpClient(await WebSocketTransport.connect(host.url));c.connect();const init:any=await c.initialize({clientId:id,protocolVersions:['0.9.0'],initialSubscriptions:['ahp-root://']});assert.equal(init._meta['amplifier.dev/readState'].version,1);clients.push(c);return c;};
+ const key='amplifier.dev/readState',uri='ahp-session:/'+randomUUID(),mark=()=>host.store.get(uri)!.state._meta?.[key] as {manualUnread:string}|undefined;
+ try{
+  const a=await connect('a'),b=await connect('b');await a.request('createSession',{channel:uri,provider:'fixture',workingDirectories:[pathToFileURL(root).href]});await a.subscribe(uri);await b.subscribe(uri);const initialAgents=host.diagnostics().activeAgents;
+  a.dispatch(uri,{type:'session/isReadChanged',isRead:true});await wait(()=>Boolean(host.store.get(uri)!.state.status&SessionStatus.IsRead));
+  a.dispatch(uri,{type:'session/isReadChanged',isRead:false});await wait(()=>mark());const first=mark()!.manualUnread;
+  const listed:any=await b.request('listSessions',{channel:'ahp-root://',limit:10});assert.equal(listed.items.find((r:any)=>r.resource===uri)._meta[key].manualUnread,first);
+  assert.equal(host.diagnostics().activeAgents,initialAgents);assert.equal(host.store.get(uri)!.chat.activeTurn,undefined);
+  for(const c of clients)await c.shutdown();clients.length=0;await host.close();host=await createHost(config);assert.equal(mark()!.manualUnread,first);
+  const c=await connect('restored');await c.subscribe(uri);c.dispatch(uri,{type:'session/isReadChanged',isRead:true});await wait(()=>!mark());assert.ok(host.store.get(uri)!.state.status&SessionStatus.IsRead);
+  c.dispatch(uri,{type:'session/isReadChanged',isRead:false});await wait(()=>mark());assert.notEqual(mark()!.manualUnread,first);
+  const turn=randomUUID();await host.submitTurn(uri,{commandId:turn,text:'hello',clientId:'restored'});assert.equal(mark(),undefined);await host.waitForTurn(uri,turn);
+  assert.equal(host.store.get(uri)!.summary._meta?.[key],undefined);assert.equal(Boolean(host.store.get(uri)!.state.status&SessionStatus.IsRead),false);
+ }finally{for(const c of clients)await c.shutdown();await host.close();await rm(root,{recursive:true,force:true});}
+});
