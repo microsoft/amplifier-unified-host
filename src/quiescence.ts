@@ -74,7 +74,7 @@ export interface QuiescenceConfig {
  coverage:{capabilities?:Record<string,string>;resources?:Record<string,string>;nativeHost?:string;nativeHostOwners?:string[]};
  participants:QuiescenceParticipant[];
  /** Reads authenticated supervisor receipts; caller assertions never count as proof. */
- verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';evidence:unknown})=>Promise<QuiescenceProof>;
+ verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';evidence:unknown})=>Promise<QuiescenceProof&{participantProof?:QuiescenceProof}>;
  /** Distinct supervisor authority proving pre-retirement admission abort, not a running/release assertion. */
  verifyAdmissionAbort?:(request:Readonly<QuiescenceContext>&{evidence?:unknown})=>Promise<AdmissionAbortProof>;
  serviceLifecycle?:ServiceLifecycleConfig;
@@ -448,11 +448,23 @@ export class QuiescenceGate {
    const proof=await this.deadline(this.config.verifyRelease({...fence,outcome:input.outcome,evidence:input.evidence}));
    if(!proof||proof.verified!==true||proof.fenceId!==fence.fenceId||proof.commandId!==fence.commandId||proof.outcome!==input.outcome||proof.dataScope!==fence.dataScope||proof.dataScope!==this.config.dataScope||proof.instanceId!==this.config.instanceId||(input.outcome==='ready'?proof.instanceId===fence.instanceId:proof.instanceId!==fence.instanceId))throw Error('Supervisor proof does not bind the exact fence, outcome and running instance');
    token(proof.receiptId,'supervisor receipt');
+   // A replacement may authenticate today's Host generation while settling the
+   // original owner release. Pin that owner proof before the first callback so
+   // lost acknowledgements keep identical arguments across further restarts.
+   const participantProof=proof.participantProof??proof;
+   if(proof.participantProof&&fence.purpose!=='recovery')throw Error('Participant continuation is limited to authenticated recovery settlement');
+   if(fence.purpose==='recovery'){
+    if((proof.participantProof&&Object.keys(participantProof).sort().join(',')!=='commandId,dataScope,fenceId,instanceId,outcome,receiptId,verified')||participantProof.verified!==true||participantProof.fenceId!==fence.fenceId||participantProof.commandId!==fence.commandId||participantProof.dataScope!==fence.dataScope||participantProof.receiptId!==proof.receiptId||!['unchanged','ready'].includes(participantProof.outcome)||((participantProof.instanceId===fence.instanceId)!==(participantProof.outcome==='unchanged')))throw Error('Exact original recovery participant proof required');
+    token(participantProof.instanceId,'participant generation');
+    const saved=this.db.prepare("SELECT payload FROM host_quiescence_attempts WHERE command_id=? AND json_extract(payload,'$.kind')='recovery-release-v1' ORDER BY id DESC LIMIT 1").get(fence.commandId);
+    if(saved){const prior=JSON.parse(String(saved.payload));if(prior.fenceId!==fence.fenceId||canonical(prior.proof)!==canonical(participantProof))throw Error('Recovery participant proof differs from its original release');}
+    else this.db.prepare('INSERT INTO host_quiescence_attempts(command_id,payload) VALUES(?,?)').run(fence.commandId,JSON.stringify({kind:'recovery-release-v1',fenceId:fence.fenceId,proof:participantProof}));
+   }
    fence.phase='releasing';this.save(fence);
    for(const owner of [...fence.owners].reverse()){
     const lease=this.leases.get(owner),participant=this.config.participants.find(p=>p.id===owner);
-    if(lease)await this.deadline(lease.release(input.outcome,proof));
-    else if(participant?.reconcileRelease)await this.deadline(participant.reconcileRelease({...fence,outcome:input.outcome,proof}));
+    if(lease)await this.deadline(lease.release(participantProof.outcome,participantProof));
+    else if(participant?.reconcileRelease)await this.deadline(participant.reconcileRelease({...fence,outcome:participantProof.outcome,proof:participantProof}));
     else throw Error('Participant recovery release is unavailable:'+owner);
     this.leases.delete(owner);
    }

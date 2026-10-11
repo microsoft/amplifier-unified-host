@@ -244,3 +244,24 @@ test('restarted metadata settlement retains intake protection and grants no nati
   await assert.rejects(f.host.withQuiescenceSettlement({...fence,commandId:'other'},async()=>{}),/Original completed/);
  }finally{await f.close();}
 });
+
+test('recovery release keeps original participant arguments after lost replies and two replacements',async()=>{
+ let original:any,attempts=0,fail=true;
+ const owner=participant('owner',{acquire:async c=>({ownerId:'owner',fenceId:c.fenceId,release:async(_outcome,proof)=>{
+  original=structuredClone(proof);attempts++;throw Error('Owner released but acknowledgement was lost');
+ }}),reconcileRelease:async input=>{assert.deepEqual(input.proof,original);assert.equal(input.outcome,original.outcome);attempts++;if(fail)throw Error('Second acknowledgement lost');}});
+ const f=await fixture({quiescence:configuration({requiredOwners:['owner'],participants:[owner]})});
+ try{
+  const held=await f.host.admitQuiescence({commandId:'original-recovery',purpose:'recovery'}),request={fenceId:held.fenceId!,commandId:'original-recovery'};
+  await assert.rejects(f.host.releaseQuiescence({...request,outcome:'unchanged'}),/remains unknown/);assert.equal(attempts,1);
+  let wrong=0;
+  const next=(instanceId:string)=>configuration({instanceId,requiredOwners:['owner'],participants:[owner],verifyRelease:async context=>({verified:true,fenceId:context.fenceId,commandId:context.commandId,outcome:context.outcome,instanceId,dataScope:context.dataScope,receiptId:original.receiptId,participantProof:wrong===1?{...original,receiptId:'changed'}:wrong===2?{...original,instanceId:'other-launch',outcome:'ready'}:original})});
+  await f.restart({quiescence:next('launch-two')});wrong=1;
+  await assert.rejects(f.host.releaseQuiescence({...request,outcome:'ready'}),/remains unknown/);assert.equal(attempts,1);
+  wrong=2;await assert.rejects(f.host.releaseQuiescence({...request,outcome:'ready'}),/remains unknown/);assert.equal(attempts,1);
+  wrong=0;await assert.rejects(f.host.releaseQuiescence({...request,outcome:'ready'}),/remains unknown/);assert.equal(attempts,2);
+  await f.restart({quiescence:next('launch-three')});fail=false;
+  const result=await f.host.releaseQuiescence({...request,outcome:'ready'});
+  assert.equal(result.released,true);assert.equal(result.instanceId,'launch-three');assert.equal(attempts,3);assert.equal(f.host.inspectQuiescence().intakeClosed,false);
+ }finally{await f.close()}
+});
