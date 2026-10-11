@@ -1503,3 +1503,29 @@ a user input or starts execution. Invalid/oversized latest updates retain an
 explicit unavailable snapshot rather than substituting a stale plan. Optional
 Native todo active wording and unavailable metadata are presentation only.
 `test/plan.test.ts` checks the official reducer and serialization boundary.
+
+### Durable model-call accounting
+
+The Host retains scalar model-call receipts independently of the loaded turn
+window. Native owns the revisioned budget policy and supplies its snapshot for
+each pre-provider `capacity.admit` request. The Host binds that request to its
+currently owned Native process and session, records admission before replying,
+and uses cumulative call snapshots rather than adding repeated usage events.
+Input plus cache writes plus output is the gross token total; cache reads and
+reasoning tokens are not added twice. Estimated cost, known zero, pending usage
+and unknown settled usage remain distinct. Editing history does not refund calls.
+
+`readCapacity` uses passive persisted Native policy without starting a worker.
+`historicalUsage` is an optional trusted distribution migration callback. It
+returns bounded scalar call rows for the exact engine, Native identity and
+canonical history workspace; it is not a public import or policy authority.
+The Host imports it before both inspection and admission, atomically and
+idempotently by call identity. Invalid or ambiguous migration refuses rather
+than reporting a zero balance. Interrupted calls become unknown and are never
+replayed. An enabled policy pauses on unknown settled usage unless explicitly
+configured otherwise. In-flight calls can finish above the limit.
+
+`test/usage.test.ts` covers retained-window independence, cache accounting,
+partial/duplicate revisions, unknowns, edited-away backfill and restart. The
+composed distribution test separately exercises installed Native admission and
+selected-main accounting migration before a provider invocation.

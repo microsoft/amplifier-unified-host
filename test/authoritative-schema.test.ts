@@ -24,7 +24,7 @@ const refused={code:'HOST_AUTHORITATIVE_SCHEMA'};
 function damage(directory:string,sql:string){const db=new DatabaseSync(join(directory,'host.sqlite'));db.exec(sql);db.close();}
 function withoutWrites(directory:string,open:()=>unknown){const path=join(directory,'host.sqlite'),before=hash(path);assert.throws(open,refused);assert.equal(hash(path),before);}
 
-for(const table of ['receipts','lifecycle_commands','transfer_fences','queue_intents','turns','library_identity'])test(`existing ${table} loss refuses before restart normalization`,()=>{
+for(const table of ['receipts','lifecycle_commands','transfer_fences','queue_intents','turns','library_identity','model_usage'])test(`existing ${table} loss refuses before restart normalization`,()=>{
  const directory=fixture();try{const store=new Store(directory);admit(store);store.close();damage(directory,`DROP TABLE ${table}`);
   withoutWrites(directory,()=>new Store(directory));withoutWrites(directory,()=>new Store(directory));
   const db=new DatabaseSync(join(directory,'host.sqlite'),{readOnly:true});try{assert.equal(absent(db,table),true);if(table!=='receipts')assert.equal(JSON.parse(String(db.prepare('SELECT payload FROM receipts').get()!.payload)).status,'admitted');}finally{db.close();}
@@ -115,7 +115,7 @@ test('crash-left WAL evidence is unchanged when missing schema rejects startup',
 
 test('pre-identity marked store migrates once and retains the original path identity',()=>{
  const directory=fixture();try{let store=new Store(directory);const source=store.librarySource;admit(store);store.close();
- damage(directory,'DROP TABLE library_identity; PRAGMA user_version=1095237889');
+ damage(directory,'DROP TABLE library_identity; DROP TABLE model_usage; PRAGMA user_version=1095237889');
  store=new Store(directory);assert.equal(store.librarySource,source);assert.equal(store.receipt('original-input')!.status,'unknown');store.close();
  }finally{rmSync(directory,{recursive:true,force:true});}
 });

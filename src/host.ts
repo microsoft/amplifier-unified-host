@@ -1,3 +1,4 @@
+import {capacityPolicy,evaluateCapacity} from './usage.js';
 import {planPart} from './plan.js';
 import {checkedCreation} from './navigation.js';
 import {UpdateIntake} from './update-intake.js';
@@ -99,6 +100,8 @@ export interface HostConfig {
   transferIdentity?:string;
   /** Optional bounded handshake metadata, resolved by the authenticated distribution. */
   clientMetadata?:(context:{clientId:string;metadata:Json})=>Promise<Json|undefined>;
+  /** Read-only historical accounting from an explicitly configured migration owner. */
+  historicalUsage?:(context:{session:string;engineId:string;nativeSessionId:string;workingDirectory:string})=>Promise<Json[]>;
   capabilities?: {
     manifest:{version:1;topics:Record<string,{uri:string;version:number;watch?:boolean;scope?:'context'|'host'}>;actions:Record<string,{topic:string;operation:string;method:string}>};
     /** Trusted exact manifest action classification; no ordinary mutation rights are inherited. */
@@ -552,9 +555,41 @@ export class AmplifierHost {
       if(capability?.version!==1||capability.passive!==true)throw new RpcFault(-32601,'Agent does not advertise passive persisted task state');
       const result=await agent.client.extMethod('_amplifier/task/inspect',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,...input});
       if(typeof result.available!=='boolean'||result.source!=='persisted-native-controls'||(result.revision!==null&&(typeof result.revision!=='string'||result.revision.length>512))||Buffer.byteLength(JSON.stringify(result))>65536||result.task!==null&&(typeof result.task!=='object'||Array.isArray(result.task)||Buffer.byteLength(JSON.stringify(result.task))>32768))throw new RpcFault(-32000,'Invalid or oversized persisted task state');
+      if(result.capacity!==undefined){if((result.capacity as Json)?.version!==1)throw new RpcFault(-32000,'Invalid persisted budget inspection');capacityPolicy((result.capacity as Json).budget);}
       if(input.expectedRevision!==undefined&&result.revision!==input.expectedRevision)throw new RpcFault(-32011,'Persisted task source revision changed');
       return result;
     }finally{this.passiveReads--;await agent.retire();}
+  }
+  /** Passive receipt view. The native owner alone supplies persisted budget policy. */
+  async readCapacity(session:string,input:{offset?:number;limit?:number}={}) {
+    const saved=await this.readTaskState(session);
+    if((saved.capacity as Json)?.version!==1)throw new RpcFault(-32601,'Native persisted budget inspection is not advertised');
+    await this.importHistoricalUsage(session);
+    const budget=capacityPolicy((saved.capacity as Json).budget),usage=this.store.usage.snapshot(session,input);
+    return {budget,usage,admission:evaluateCapacity(budget,usage),observedAt:Date.now()/1000};
+  }
+  /** Private owned-worker boundary. No wire action accepts usage or policy assertions. */
+  async admitNativeCapacity(session:string,nativeSessionId:string,input:Json) {
+    await this.importHistoricalUsage(session);
+    const active=this.active.get(session);
+    if(!active||active.agent.closed||active.agent.nativeId!==nativeSessionId||active.stopNotified||(!active.busy&&!active.controlDepth))throw new RpcFault(-32009,'Budget admission requires the currently owned native execution');
+    return this.store.transaction(()=>this.store.usage.admit(session,nativeSessionId,input.call,input.budget));
+  }
+  private historicalUsageReads=new Map<string,Promise<void>>();
+  private async importHistoricalUsage(session:string) {
+    if(!this.config.historicalUsage)return;
+    const record=await this.record(session);if(!record.nativeSessionId)return;
+    const identity=JSON.stringify([session,record.engineId,record.nativeSessionId,record.workingDirectory]);
+    let pending=this.historicalUsageReads.get(identity);
+    if(!pending){
+      pending=(async()=>{const rows=await this.config.historicalUsage!({session,engineId:record.engineId,nativeSessionId:record.nativeSessionId!,workingDirectory:record.workingDirectory});
+        if(!Array.isArray(rows)||rows.length>100000||Buffer.byteLength(JSON.stringify(rows))>64*1024*1024)throw new RpcFault(-32000,'Historical accounting exceeds its complete migration bound');
+        this.store.transaction(()=>{for(const row of rows){if(row.kind!=='llm'||row.rootSessionId!==record.nativeSessionId)throw new RpcFault(-32000,'Historical accounting scope differs');this.store.usage.observe(session,record.nativeSessionId!,row);}});
+      })();
+      this.historicalUsageReads.set(identity,pending);
+      try{await pending;}catch(error){this.historicalUsageReads.delete(identity);throw error;}
+      if(this.historicalUsageReads.size>128)this.historicalUsageReads.delete(this.historicalUsageReads.keys().next().value!);
+    }else await pending;
   }
   /** Storage-owner stat only. Missing/unsupported history is explicit, never an empty success. */
   async inspectRecallSource(id:string) {
@@ -1908,6 +1943,8 @@ export class AmplifierHost {
         stopped:event=>this.notifyAgentStopped(uri,active,active.retireReason??'process-closed',event),
         nativeEvent:async params=>{
           const event=params.event as Json|undefined;
+          // Scalar accounting is independent of selected-turn and UI byte bounds.
+          if(event?.type==='execution.event'&&agent.nativeId)this.store.usage.observe(uri,agent.nativeId,event.event??{});
           if(event) this.steeringEvent(uri,active,event);
           if(event?.type==='execution.event')await active.updates;
           if(event?.type==='execution.event'&&active.busy&&active.turnId&&event.activeInputId===active.turnId&&event.event?.kind==='llm'){
@@ -3006,7 +3043,7 @@ export class AmplifierHost {
     this.settledCallbacks.add(pending);
   }
   private notifyAgentStopped(session:string,active:Active,reason:AgentStopped['reason'],details:{exitCode?:number;signal?:string}={}) {
-    if(active.stopNotified)return;active.stopNotified=true;active.steeringMount=undefined;active.generationId=undefined;this.publishSteeringSupport(session,active);
+    if(active.stopNotified)return;active.stopNotified=true;this.store.usage.interrupted(session);active.steeringMount=undefined;active.generationId=undefined;this.publishSteeringSupport(session,active);
     for(const row of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND status='dispatching'").all(chatURI(session)))this.settleSteering(session,String(row.id),'unknown','Native runtime stopped without confirmed steering disposition');
     if(!this.config.agentStopped)return;
     const event=Object.freeze({session,nativeSessionId:active.agent.nativeId,engineId:active.agent.engine.id,workingDirectory:active.agent.cwd,reason,...details});

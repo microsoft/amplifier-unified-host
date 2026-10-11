@@ -5,6 +5,7 @@ import {lstatSync} from 'node:fs';
 type Tables=Record<string,Record<string,string>>;
 const tables = {
  store: {
+  model_usage: {"session":"TEXT","call_id":"TEXT","payload":"TEXT"},
   meta: {"key":"TEXT","value":"INTEGER"},
   library_identity: {"id":"INTEGER","source":"TEXT"},
   sessions: {"uri":"TEXT","chat_uri":"TEXT","engine_id":"TEXT","native_id":"TEXT","cwd":"TEXT","modified":"TEXT","summary":"TEXT","state":"TEXT","chat":"TEXT","execution_cwd":"TEXT","native_location_revision":"INTEGER","hidden":"INTEGER"},
@@ -63,9 +64,11 @@ type Owner=keyof typeof tables;
 const owners=Object.keys(tables) as Owner[];
 const ownedTables=owners.flatMap(owner=>Object.keys(tables[owner]));
 // AH schema admission v1. Low six bits record initialized namespaces; bit 64
-// records the additive library-identity epoch. Both survive table loss.
-const marker=0x41480100, mask=0x7f, libraryIdentityBit=64;
-const previousStore=Object.fromEntries(Object.entries(tables.store).filter(([name])=>name!=='library_identity'));
+// records the additive library-identity epoch; bit 128 records usage receipts.
+// The markers survive table loss.
+const marker=0x41480100, mask=0xff, libraryIdentityBit=64, usageBit=128;
+const beforeUsageStore=Object.fromEntries(Object.entries(tables.store).filter(([name])=>name!=='model_usage'));
+const previousStore=Object.fromEntries(Object.entries(beforeUsageStore).filter(([name])=>name!=='library_identity'));
 const namespaceBits:Record<Owner,number>={store:1,quiescence:2,managedFiles:4,retention:8,presentation:16,managed:32};
 const bits=(owner:Owner)=>namespaceBits[owner];
 const initialStore=['meta','sessions','turns','actions','receipts','terminals','active_events'];
@@ -90,7 +93,7 @@ function profile(owner:Owner,names:string[],omit:Record<string,string[]>={}):Tab
 // These are completed initializer schemas, including ALTER migrations. Columns
 // are bound to their exact table epoch; newer tables cannot excuse lost columns.
 const legacyProfiles:Partial<Record<Owner,Tables[]>>={
- store:[...storeEpochs.map((names,i)=>profile('store',names,{sessions:i<2?['execution_cwd','native_location_revision','hidden']:i<6?['hidden']:[]})),tables.store],
+ store:[...storeEpochs.map((names,i)=>profile('store',names,{sessions:i<2?['execution_cwd','native_location_revision','hidden']:i<6?['hidden']:[]})),beforeUsageStore,tables.store],
  quiescence:[profile('quiescence',['host_quiescence_fence','host_quiescence_commands']),profile('quiescence',['host_quiescence_fence','host_quiescence_commands','host_quiescence_attempts']),tables.quiescence],
  managed:[profile('managed',['allocations'],{allocations:['copy_source']}),tables.managed],
 };
@@ -104,7 +107,7 @@ function inspect(db:DatabaseSync){
  if(version!==0&&((version&~mask)!==marker||(version&mask)===0))fail('unsupported schema version');
  const objects=new Map(db.prepare(`SELECT name,type FROM sqlite_schema WHERE type IN ('table','view') AND name IN (${ownedTables.map(()=>'?').join(',')})`).all(...ownedTables).map(row=>[String(row.name),String(row.type)]));
  let presentBits=version===0?0:version&mask;
- if((presentBits&libraryIdentityBit)&&!(presentBits&bits('store')))fail('library identity without Store');
+ if((presentBits&(libraryIdentityBit|usageBit))&&!(presentBits&bits('store')))fail('library identity without Store');
  for(const owner of owners){
   const spec:Tables=tables[owner],expected=Object.keys(spec),present=expected.filter(name=>objects.has(name)),marked=!!(presentBits&bits(owner));
   if(!marked&&!present.length)continue;
@@ -116,13 +119,13 @@ function inspect(db:DatabaseSync){
   const matches=(schema:Tables,exact:boolean)=>Object.keys(schema).length===present.length&&Object.entries(schema).every(([name,fields])=>{
    const actual=columns.get(name);return !!actual&&(!exact||actual.size===Object.keys(fields).length)&&Object.entries(fields).every(([column,type])=>actual.get(column)===type);
   });
-  const profiles=marked?[owner==='store'&&!(presentBits&libraryIdentityBit)?previousStore:spec]:(legacyProfiles[owner]??[spec]);
+  const profiles=marked?[owner==='store'&&!(presentBits&libraryIdentityBit)?previousStore:owner==='store'&&!(presentBits&usageBit)?beforeUsageStore:spec]:(legacyProfiles[owner]??[spec]);
   if(!profiles.some(schema=>matches(schema,!marked)))fail(`${owner} table/column profile`);
   if(owner==='store'&&objects.has('library_identity')){
    const rows=db.prepare('SELECT id,source FROM library_identity LIMIT 2').all();
    if(rows.length!==1||rows[0].id!==1||typeof rows[0].source!=='string'||!/^[a-f0-9]{64}$/.test(rows[0].source))fail('library identity missing or invalid');
   }
-  if(matches(spec,false))presentBits|=bits(owner)|(owner==='store'?libraryIdentityBit:0);
+  if(matches(spec,false))presentBits|=bits(owner)|(owner==='store'?libraryIdentityBit|usageBit:0);
  }
  return {version,presentBits,objects};
 }
@@ -155,7 +158,7 @@ export function initializeAuthority(db:DatabaseSync,owner:Owner,initialize:()=>v
   db.exec('PRAGMA user_version = '+before.version);
   const locked=inspect(db);
   initialize();
-  db.exec('PRAGMA user_version = '+(marker|locked.presentBits|bits(owner)|(owner==='store'?libraryIdentityBit:0)));
+  db.exec('PRAGMA user_version = '+(marker|locked.presentBits|bits(owner)|(owner==='store'?libraryIdentityBit|usageBit:0)));
   const after=inspect(db);
   db.exec('PRAGMA user_version = '+(marker|after.presentBits));
   db.exec('RELEASE host_schema_admission');

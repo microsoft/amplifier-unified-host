@@ -1,3 +1,4 @@
+import {UsageReceipts} from './usage.js';
 import {initializeAuthority,preflightAuthorityFile,AuthoritativeSchemaError} from './authoritative-schema.js';
 import type {NativeFailedInput} from './input-outcome.js';
 import {NavigationIndex} from './navigation.js';
@@ -23,6 +24,7 @@ export interface Receipt {
 export class Store {
   readonly db: DatabaseSync;
   readonly navigation:NavigationIndex;
+  readonly usage:UsageReceipts;
   readonly incarnation = randomUUID();
   private replayBytes=0;
   private lease:OwnerLease;
@@ -46,6 +48,7 @@ export class Store {
     const identities=this.db.prepare('SELECT id,source FROM library_identity LIMIT 2').all();
     if(identities.length!==1||identities[0].id!==1||typeof identities[0].source!=='string'||!/^[a-f0-9]{64}$/.test(identities[0].source))throw new AuthoritativeSchemaError('library identity missing or invalid');
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS model_usage(session TEXT NOT NULL,call_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session,call_id));
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES('seq',0);
       CREATE TABLE IF NOT EXISTS sessions(uri TEXT PRIMARY KEY,chat_uri TEXT UNIQUE NOT NULL,engine_id TEXT NOT NULL,native_id TEXT,cwd TEXT NOT NULL,modified TEXT NOT NULL,summary TEXT NOT NULL,state TEXT NOT NULL,chat TEXT NOT NULL);
@@ -120,6 +123,8 @@ export class Store {
       this.finish(receipt.commandId, 'unknown', 'Host restarted before a conclusive ACP outcome; reconcile native history before new work.');
     }
     },{existingFile,configure:'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'});
+    this.usage=new UsageReceipts(this.db);
+    this.transaction(()=>{this.usage.backfill();this.usage.interrupted();});
     this.navigation=new NavigationIndex(this.db);
     }catch(error){opened?.close();this.lease.close();throw error;}
   }
@@ -166,6 +171,8 @@ export class Store {
   saveTurn(chat: string, turn: Turn):number {
     if(!this.transactionOpen)return this.transaction(()=>this.saveTurn(chat,turn));
     this.db.prepare('INSERT INTO turns(chat,turn_id,payload) VALUES(?,?,?) ON CONFLICT(chat,turn_id) DO UPDATE SET payload=excluded.payload').run(chat, turn.id, JSON.stringify(turn));
+    const identity=this.db.prepare('SELECT uri,native_id FROM sessions WHERE chat_uri=?').get(chat);
+    if(identity?.native_id)this.usage.observeTurn(String(identity.uri),String(identity.native_id),turn);
     const ordinal=Number(this.db.prepare('SELECT ordinal FROM turns WHERE chat=? AND turn_id=?').get(chat,turn.id)!.ordinal);
     const text=turn.responseParts.filter(part=>part.kind==='markdown').map(part=>(part as {content:string}).content).join('\n'),bytes=Buffer.from(text),preview=bytes.subarray(0,20000).toString('utf8');
     this.db.prepare('INSERT INTO coordination_results VALUES(?,?,?,?,?,?) ON CONFLICT(chat,turn_id) DO UPDATE SET text=excluded.text,truncated=excluded.truncated,state=excluded.state').run(chat,turn.id,ordinal,preview,bytes.length>20000?1:0,turn.state);
