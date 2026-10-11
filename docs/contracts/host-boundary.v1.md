@@ -365,3 +365,27 @@ It never substitutes that directory for execution or rewrites the native cwd.
 Native still proves the original identity and metadata. Mutation/lifecycle
 admission is refused; restoring the original folder clears this temporary state.
 Managed allocation recovery continues to use its separate receipt contract.
+
+## Detailed readable exports
+
+The optional Native `sessionLifecycle.exportDetails` version 1 enables boolean
+`includeExecution`, `includeConversationId`, `includeTimestamps`, and
+`includeReferenceIds` arguments on `exportSession`. A caller cannot supply
+`exportContext`. The Host constructs it from its retained materialized turn
+observations and the Resources owner's revision-stable metadata list, after
+binding the selected session and before the export journal records an effect.
+No additional event journal or transcript authority is introduced.
+
+Only recorded status, tool/model counts and optional duration cross the work
+summary boundary. Unknown outcomes remain unknown and unrecorded durations are
+omitted. Up to 1,000 recent work summaries and 1,000 artifact references fit within
+a 1 MiB contribution. Artifact metadata pages must retain the same session scope,
+revision and unique identities/cursors. Unavailable/inconsistent references are
+omitted with explicit coverage rather than fabricated or partially mixed.
+
+Native binds observations to canonical ranges and freezes all content in its
+existing immutable snapshot. The Host validates the requested format, scope,
+minimal setting and explicit option proof before exposing the resource. Exact
+command recovery uses the original journal and snapshot rather than recapturing
+observations or replaying an export. Busy or uncertain native ownership remains a
+pre-effect refusal. Clipboard/download delivery stays local to the client.
