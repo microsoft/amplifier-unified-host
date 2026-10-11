@@ -99,6 +99,7 @@ export class QuiescenceGate {
  private calls=0;
  private continuations=0;
  private maintenance=0;
+ private settlement=0;
  private leases=new Map<string,QuiescenceLease>();
  private changing=false;
  // A timeout is not cancellation: late owner work must settle before an abort can be admitted.
@@ -149,7 +150,7 @@ export class QuiescenceGate {
  private result(commandId:string,result:unknown){this.db.prepare('UPDATE host_quiescence_commands SET payload=? WHERE command_id=?').run(JSON.stringify(result),commandId);}
  private bindResult(fence:QuiescenceFence,result:any){return fence.purpose==='service-stop'?{...result,purpose:'service-stop',expected:fence.serviceIdentity}:fence.purpose==='initial-start'?{...result,purpose:'initial-start',expected:fence.serviceIdentity,fenceId:fence.fenceId,commandId:fence.commandId}:result;}
  private clear(fence:QuiescenceFence,result:unknown){this.db.exec('BEGIN IMMEDIATE');try{this.result(fence.commandId,this.bindResult(fence,result));this.db.prepare('DELETE FROM host_quiescence_fence WHERE id=1').run();this.db.exec('COMMIT');}catch(e){this.db.exec('ROLLBACK');throw e;}}
- inspect(){return {enabled:!!this.config,intakeClosed:!!this.fence(),fence:this.fence(),activeAdmissions:this.calls,continuations:this.continuations,activeMaintenance:this.maintenance};}
+ inspect(){return {enabled:!!this.config,intakeClosed:!!this.fence(),fence:this.fence(),activeAdmissions:this.calls,continuations:this.continuations,activeMaintenance:this.maintenance,activeSettlement:this.settlement};}
  receipt(commandId:string){token(commandId,'command identity');const row=this.db.prepare('SELECT payload FROM host_quiescence_commands WHERE command_id=?').get(commandId);return row?JSON.parse(String(row.payload)):undefined;}
  /** The scope expires with the outer call; detached promises cannot inherit an open gate forever. */
  async run<T>(work:()=>Promise<T>):Promise<T>{
@@ -172,6 +173,15 @@ export class QuiescenceGate {
   if(!fence||['service-stop','initial-start'].includes(fence.purpose)||fence.phase!=='held'||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.maintenance)throw new QuiescenceError('Exact idle held maintenance fence required',{executed:false});
   this.maintenance++;
   try{return await this.scope.run({active:false},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{this.maintenance--;}
+ }
+ /** Trusted metadata settlement only, including after a process replacement.
+  * Each metadata owner must verify its own retained fence. This neither
+  * reacquires leases nor provides ordinary or native execution authority. */
+ async settle<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T>{
+  const fence=this.fence();
+  if(!fence||fence.purpose!=='recovery'||!['held','unknown'].includes(fence.phase)||fence.admissionStage!=='held'||fence.dataScope!==this.config?.dataScope||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.pending.size||this.maintenance||this.calls||this.continuations)throw new QuiescenceError('Original completed recovery admission is required for metadata settlement',{executed:false});
+  this.maintenance++;this.settlement++;
+  try{return await this.scope.run({active:false},work);}finally{this.settlement--;this.maintenance--;}
  }
  workChanged(){this.maybeIdle();}
  /** End observations of this local lifetime without treating process shutdown as drained work. */

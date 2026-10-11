@@ -1,4 +1,5 @@
 import {exportObservations,EXPORT_FLAGS} from './export-observations.js';
+import {workspaceCleanupCensus,completedCleanupReceipt} from './workspace-cleanup.js';
 import {capacityPolicy,evaluateCapacity} from './usage.js';
 import {planPart,checkedPlanOverview,activePlanOverview} from './plan.js';
 import {checkedCreation} from './navigation.js';
@@ -39,6 +40,7 @@ export interface CatalogRecord {uri:string;engineId:string;nativeSessionId?:stri
 export interface CatalogFamilyDiscovery {version:1;scope:'selected-native-project-namespaces';phase:'complete'|'refused';issues:string[];maxEntries:number;metadataByteLimit:number;metadataFileLimit:number;indexRevision:string;verificationToken:string;inventoryHash:string;entriesExamined:number;metadataReads:number;metadataBytesAdmitted:number;namespaces:string[];completedAt:string;externalWriterCoverage:false;transcriptBodiesRead:false;nativeOwnershipVerified:false;}
 export interface CatalogFamily {parentUri:string;rootKnown:boolean;root?:CatalogRecord;items:CatalogRecord[];completeIndexedCoverage:boolean;truncated:boolean;issues:string[];excludedKinds:string[];revision:string;coverage:string;externalWriterCoverage:false;freshness:{phase?:string;completedAt?:string;issues?:number};familyDiscovery?:CatalogFamilyDiscovery;}
 export interface Catalog {
+  workspaceCleanupCensus?():Promise<Json>;
   libraryCapabilities?():Promise<Json>;
   supportsLibraryQuery?:()=>Promise<boolean>;
   libraryQuery?:(params:LibraryRead)=>Promise<{version:1;items:CatalogRecord[];nextCursor?:string;observationFreshness?:unknown;[key:string]:unknown}>;
@@ -3215,6 +3217,48 @@ export class AmplifierHost {
   releaseQuiescence(input:{fenceId:string;commandId:string;outcome:QuiescenceOutcome;evidence?:unknown}) {return this.intake.release(input);}
   /** Trusted recovery owner only. This does not permit ordinary nested host mutations. */
   withQuiescenceMaintenance<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T> {return this.intake.maintain(input,work);}
+  withQuiescenceSettlement<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T> {return this.intake.settle(input,work);}
+  private assertWorkspaceCleanupFence(input:Json){
+    const current=this.intake.inspect(),fence=current.fence;
+    if(current.activeMaintenance!==1||!fence||!(fence.phase==='held'||fence.phase==='unknown'&&current.activeSettlement===1)||fence.purpose!=='recovery'||['fenceId','commandId','instanceId','dataScope','purpose'].some(key=>(fence as Json)[key]!==input[key]))throw Error('Exact active held recovery maintenance required');
+  }
+  /** Trusted composition only: no public browser-selected path or discovery. */
+  async inspectWorkspaceCleanup(input:{path:string;engineId:string},fence:Json){
+    this.assertWorkspaceCleanupFence(fence);
+    if(!isAbsolute(input.path)||resolve(input.path)!==input.path||!this.roots.some(root=>input.path===root||input.path.startsWith(root+'/')))throw Error('Workspace cleanup path is outside configured roots');
+    const catalog=this.config.catalog;
+    if(!catalog?.workspaceCleanupCensus||(await catalog.libraryCapabilities?.())?.workspaceCleanupCensus?.version!==1)throw Error('Catalog has no negotiated cleanup identity census');
+    const local=this.store.db.prepare('SELECT uri,engine_id,native_id,cwd,execution_cwd FROM sessions ORDER BY uri LIMIT 10001').all().map(row=>({uri:String(row.uri),engineId:String(row.engine_id),nativeSessionId:row.native_id?String(row.native_id):undefined,workingDirectory:String(row.cwd),executionDirectory:String(row.execution_cwd??row.cwd)}));
+    const result=workspaceCleanupCensus(input.path,input.engineId,await catalog.workspaceCleanupCensus(),local);
+    this.assertWorkspaceCleanupFence(fence);
+    for(const uri of result.archiveSessions)if(this.libraryUnknown(uri))throw Error('Resolve uncertain conversation work before folder cleanup');
+    return result;
+  }
+  workspaceCleanupReceipt(commandId:string){
+    const row=this.store.db.prepare('SELECT operation,status,result FROM lifecycle_commands WHERE command_id=?').get(commandId);
+    if(!row)return {receipt:null};if(row.operation!=='workspace.cleanup.archiveChats')throw Error('Cleanup command belongs to another operation');
+    return {receipt:{commandId,operation:row.operation,state:row.status==='completed'?'succeeded':'unknown',...(row.status==='completed'?{result:JSON.parse(String(row.result))}:{})}};
+  }
+  async archiveWorkspaceCleanup(input:{commandId:string;workspaceId:string;path:string;sessions:string[];nativeReceipt:Json},fence:Json){
+    this.assertWorkspaceCleanupFence(fence);completedCleanupReceipt(input.nativeReceipt,input.workspaceId);
+    if(typeof input.commandId!=='string'||!input.commandId||input.commandId.length>200||!Array.isArray(input.sessions)||input.sessions.length>10000||new Set(input.sessions).size!==input.sessions.length||input.sessions.some(uri=>typeof uri!=='string'||!uri.startsWith('ahp-session:/')))throw Error('Exact bounded cleanup archival identities required');
+    const payload=JSON.stringify({workspaceId:input.workspaceId,path:input.path,sessions:input.sessions,nativeCommandId:input.nativeReceipt.commandId,previewHash:input.nativeReceipt.result.previewHash});
+    const prior=this.store.db.prepare('SELECT operation,payload FROM lifecycle_commands WHERE command_id=?').get(input.commandId);
+    if(prior){if(prior.operation!=='workspace.cleanup.archiveChats'||prior.payload!==payload)throw Error('Cleanup archival identity has different arguments');await this.repairArchiveProjection();return this.workspaceCleanupReceipt(input.commandId);}
+    const records:SessionRecord[]=[];
+    for(const uri of input.sessions){const record=await this.record(uri);if(record.workingDirectory!==input.path&&(record.executionDirectory??record.workingDirectory)!==input.path)throw Error('Conversation moved after workspace cleanup review');records.push(record);}
+    this.assertWorkspaceCleanupFence(fence);
+    const result={workspaceId:input.workspaceId,archived:true,historyPreserved:true,nativeCommandId:input.nativeReceipt.commandId,archivedSessions:input.sessions,replayed:false};
+    this.store.transaction(()=>{
+      for(const record of records){record.summary.status|=SessionStatus.IsArchived;record.state.status|=SessionStatus.IsArchived;this.store.save(record);this.hotRecords.delete(record.uri);}
+      this.store.db.prepare('INSERT INTO lifecycle_commands(command_id,session,operation,target,status,payload,result) VALUES(?,?,?,?,?,?,?)').run(input.commandId,'workspace:'+input.workspaceId,'workspace.cleanup.archiveChats',null,'completed',payload,JSON.stringify(result));
+    });
+    // Archive projection is durable in the Host store before catalog publication.
+    // Failed publication can be retried without repeating any filesystem effect.
+    await this.repairArchiveProjection();
+    for(const record of records)this.notify('root/sessionSummaryChanged',{channel:ROOT,session:record.uri,changes:{status:record.summary.status}});
+    return this.workspaceCleanupReceipt(input.commandId);
+  }
   /** Composition uses this for native-admin and other effects outside normal AHP methods. */
   withExternalMutation<T>(ownerId:string,work:()=>Promise<T>):Promise<T> {return this.intake.external(ownerId,work);}
   /** Advisory scheduling only. The actual effect must still enter normal intake. */

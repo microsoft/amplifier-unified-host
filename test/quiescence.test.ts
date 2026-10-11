@@ -227,3 +227,20 @@ test('public Host retires the resident and joins stop callbacks before acquiring
   assert.deepEqual(await host.admitQuiescence({commandId:'resident-writer-order',purpose:'distribution-update'}),result);assert.equal(acquired,1);
  }finally{await f.close();}
 });
+
+test('restarted metadata settlement retains intake protection and grants no native maintenance or ordinary admission',async()=>{
+ const owner=participant('owner'),f=await fixture({quiescence:configuration({requiredOwners:['owner'],participants:[owner]})});
+ try{
+  const held=await f.host.admitQuiescence({commandId:'cleanup-original',purpose:'recovery'});
+  const fence={fenceId:held.fenceId,commandId:'cleanup-original'};assert.equal(held.admitted,true);
+  await f.restart({quiescence:configuration({instanceId:'replacement',requiredOwners:['owner'],participants:[owner]})});
+  assert.equal(f.host.inspectQuiescence().fence?.phase,'unknown');
+  await f.host.withQuiescenceSettlement(fence,async()=>{
+   assert.equal(f.host.inspectQuiescence().activeSettlement,1);
+   await assert.rejects(f.host.withExternalMutation('owner',async()=>assert.fail('No ordinary admission')),/intake is closed/);
+   await assert.rejects(f.host.withQuiescenceMaintenance(fence,async()=>assert.fail('No native scope')),/held maintenance/);
+  });
+  assert.equal(f.host.inspectQuiescence().intakeClosed,true);
+  await assert.rejects(f.host.withQuiescenceSettlement({...fence,commandId:'other'},async()=>{}),/Original completed/);
+ }finally{await f.close();}
+});

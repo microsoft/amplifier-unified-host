@@ -58,6 +58,7 @@ export class StdioCatalog implements Catalog {
   reconcileFamily(params:{parentUri:string;limit:number;maxEntries:number}){return this.discovery('reconcileFamily',params);}
   verifyFamily(params:{parentUri:string;verificationToken:string}){return this.request('verifyFamily',params);}
   directoryInUse(path:string){return this.request('directoryInUse',{path});}
+  workspaceCleanupCensus(){return this.request('workspaceCleanupCensus',{});}
   hint(sessionDirectory:string,_context?:{attemptId:string}){return this.discovery('hint',{sessionDirectory});}
   private async discovery(method:string,params:Record<string,unknown>){try{return await this.request(method,params);}catch(error){
     // A timed-out RPC can still be writing. Join this owned process's actual exit
