@@ -112,3 +112,29 @@ test('canonical refresh retains model recordings and child tools across native r
   assert.deepEqual(f.host.store.receipt(id),receipt);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
  }finally{await f.close();}
 });
+
+test('parallel root tools restore saved references without rearranging live recordings or crossing message boundaries',async()=>{
+ const f=await fixture({principal:'trusted',grant,history:true});try{
+  const id=randomUUID();await f.host.submitTurn(f.session,{commandId:id,text:'Parallel request',clientId:'observed'});await wait(()=>f.host.store.receipt(id)?.status==='completed');
+  const native=(await f.host.inspectSession(f.session)).nativeSessionId,original=f.host.store.turns(f.chat,1).turns[0];
+  const model={kind:'systemNotification',content:'',_meta:{'amplifier.dev/modelCall':{version:1,id:'llm:recorded',kind:'llm',phase:'completed',usage:{inputTokens:123}}}};
+  const tool=(toolCallId:string)=>({kind:'toolCall',toolCall:{toolCallId,toolName:'read',status:'completed',toolInput:'{}',success:true}});
+  const parts:any[]=[model,{kind:'markdown',content:'Progress'},tool(native+':a'),tool('child:one'),tool(native+':c'),model,tool(native+':b'),{kind:'markdown',content:'Final'}];
+  f.host.store.saveTurn(f.chat,{...original,responseParts:parts});
+  const history=(separate=false)=>[{id,state:'complete',updates:[
+   {sessionUpdate:'user_message_chunk',content:{type:'text',text:'Parallel request'},_meta:{'amplifier.dev/history':{messageId:ref.messageId,messageReference:{...ref,sessionId:native}}}},
+   {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Progress'},_meta:{'amplifier.dev/history':{messageId:'native:progress'}}},
+   ...['a','b','c'].map((toolCallId,index)=>({sessionUpdate:'tool_call',toolCallId,title:'read',kind:'read',status:'in_progress',rawInput:{},_meta:{'amplifier.dev/history':{messageId:separate?'native:batch-'+index:'native:batch'}}})),
+   ...['a','b','c'].map(toolCallId=>({sessionUpdate:'tool_call_update',toolCallId,status:'completed',rawOutput:'done',_meta:{'amplifier.dev/history':{messageId:'native:result-'+toolCallId}}})),
+   {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Final'},_meta:{'amplifier.dev/history':{messageId:'native:final',messageReference:{...ref,sessionId:native,messageId:'native:final',position:500}}}}
+  ]}];
+  await writeFile(join(f.dir,'history.json'),JSON.stringify(history()));
+  const receipt=f.host.store.receipt(id),result=await f.host.refreshSessionHistory(f.session,{limit:1});assert.equal(result.refreshedTurns,1);assert.equal(result.retainedTurns,0);
+  const saved=f.host.store.turns(f.chat,1).turns[0];assert.deepEqual(saved.message._meta?.['amplifier.dev/history']?.messageReference,{...ref,sessionId:native});
+  assert.equal((saved.responseParts.at(-1) as any)._meta['amplifier.dev/history'].messageReference.messageId,'native:final');
+  assert.deepEqual(saved.responseParts.filter(p=>p.kind!=='markdown'),parts.filter(p=>p.kind!=='markdown'));
+  assert.equal((await f.host.refreshSessionHistory(f.session,{limit:1})).refreshedTurns,1);
+  await writeFile(join(f.dir,'history.json'),JSON.stringify(history(true)));assert.equal((await f.host.refreshSessionHistory(f.session,{limit:1})).retainedTurns,1);
+  assert.deepEqual(f.host.store.turns(f.chat,1).turns[0],saved);assert.deepEqual(f.host.store.receipt(id),receipt);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.close();}
+});

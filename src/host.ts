@@ -28,7 +28,7 @@ import { chatReducer, sessionReducer, terminalReducer, SessionLifecycle, Session
 import type { ContentBlock, SessionNotification, RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { Store, type SessionRecord } from './store.js';
 import { AcpProcess, type EngineConfig, type AgentHandlers } from './acp.js';
-import { mergeHistoryTurns, retainPassiveInputs, turnIdentityHash } from './history.js';
+import { mergeHistoryTurns, retainPassiveInputs, samePublicResponseOrder, turnIdentityHash } from './history.js';
 import { recallRows, RECALL_LIMITS, type RecallSource } from './recall.js';
 
 type Json = Record<string,any>;
@@ -730,7 +730,11 @@ export class AmplifierHost {
             await this.update(record.uri,{sessionId:record.nativeSessionId,update} as SessionNotification,{active,emit:action=>{state=chatReducer(state,action as any);}});
           }
           const action=group.recordedOnly||group.state==='complete'?{type:'chat/turnComplete',turnId:group.id,duration:0}:{type:'chat/error',turnId:group.id,duration:0,part:{kind:'error',error:{errorType:'NATIVE_OUTCOME_UNKNOWN',message:'Historical content is preserved; its execution outcome was not recorded.'}}};
-          state=chatReducer(state,action as any);page.push(...state.turns);
+          state=chatReducer(state,action as any);
+          // Keep the originating assistant row as the concurrency boundary.
+          // Tool-result rows have different positions and must not replace it.
+          const toolOrigins=new Map((group.updates as Json[]).filter(update=>update.sessionUpdate==='tool_call').map(update=>[update.toolCallId,update._meta?.['amplifier.dev/history']]));
+          page.push(...state.turns.map(turn=>({...turn,responseParts:turn.responseParts.map(part=>part.kind==='toolCall'&&toolOrigins.get(part.toolCall.toolCallId)?{...part,_meta:{...(part as Json)._meta,'amplifier.dev/history':toolOrigins.get(part.toolCall.toolCallId)}}:part)})));
         }
         turns=[...page,...turns];next=result.nextCursor??undefined;
       } while(next&&(limit===undefined||turns.length<limit));
@@ -1438,17 +1442,11 @@ export class AmplifierHost {
           let responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
           const hasRecords=live.responseParts.some(part=>(part as Json)._meta?.['amplifier.dev/modelCall']);
           const responseText=(parts:typeof responseParts)=>parts.filter(part=>part.kind==='markdown').map(part=>typeof (part as any).content==='string'?(part as any).content:(part as any).content?.value??'').join('');
-          const toolIds=(parts:typeof responseParts)=>parts.filter(part=>part.kind==='toolCall').map(part=>String((part as any).toolCall.toolCallId));
-          const savedTools=toolIds(responseParts),savedToolSet=new Set(savedTools);
           const normalizeTool=(id:string)=>record.nativeSessionId&&id.startsWith(record.nativeSessionId+':')?id.slice(record.nativeSessionId.length+1):id;
-          // Native live updates namespace root tool IDs and also observe child
-          // tools absent from the root transcript. Match the complete ordered
-          // root subsequence, preserving all observed diagnostics around it.
-          const observedTools=toolIds(live.responseParts).map(normalizeTool).filter(id=>savedToolSet.has(id));
           let retainedObservations=false;
           // A canonical reread has no provider timing records. Retain the
           // observed ordering only when its answer and tool identities agree.
-          if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&JSON.stringify(observedTools)===JSON.stringify(savedTools)){
+          if(hasRecords&&responseText(live.responseParts)===responseText(responseParts)&&samePublicResponseOrder(responseParts,live.responseParts,normalizeTool)){
             const savedText=responseParts.filter(part=>part.kind==='markdown'),liveText=live.responseParts.filter(part=>part.kind==='markdown');
             if(savedText.length===liveText.length&&savedText.every((part,index)=>responseText([part])===responseText([liveText[index]]))){
               const savedSteering=new Map(responseParts.filter(part=>(part as Json)._meta?.['amplifier.dev/history']?.nativeInput?.kind==='steer').map(part=>[(part as Json)._meta['amplifier.dev/history'].nativeInput.id,part]));

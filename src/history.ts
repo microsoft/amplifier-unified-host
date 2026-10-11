@@ -1,6 +1,35 @@
 import { createHash } from 'node:crypto';
 import type { Turn } from '@microsoft/agent-host-protocol';
 
+/** Concurrent calls from one recorded assistant message may start in any
+ * order. Match that batch exactly while preserving every text/input boundary
+ * and the order between different assistant messages. Child diagnostics are
+ * not part of the root transcript and remain in their observed positions.
+ */
+export function samePublicResponseOrder(canonical:any[],observed:any[],normalizeTool:(id:string)=>string):boolean {
+  const calls=canonical.filter(part=>part.kind==='toolCall');
+  const ids=calls.map(part=>String(part.toolCall.toolCallId));
+  if(new Set(ids).size!==ids.length)return false;
+  const batches=new Map(calls.map(part=>{
+    const id=String(part.toolCall.toolCallId),history=part._meta?.['amplifier.dev/history'];
+    return [id,typeof history?.messageId==='string'?'batch:'+history.messageId:'tool:'+id];
+  }));
+  const liveIds=observed.filter(part=>part.kind==='toolCall').map(part=>normalizeTool(String(part.toolCall.toolCallId))).filter(id=>batches.has(id));
+  if(liveIds.length!==ids.length||new Set(liveIds).size!==ids.length)return false;
+  const order=(parts:any[],live:boolean)=>{
+    const result:string[]=[];let text=0;
+    for(const part of parts){
+      let token:string|undefined;
+      if(part.kind==='markdown')token='text:'+text++;
+      else if(part.kind==='toolCall')token=batches.get(live?normalizeTool(String(part.toolCall.toolCallId)):String(part.toolCall.toolCallId));
+      else {const history=part._meta?.['amplifier.dev/history'],input=part._meta?.['amplifier.dev/steering']?.inputId??(history?.nativeInput?.kind==='steer'?history.nativeInput.id:undefined);if(input)token='input:'+input;}
+      if(token&&(token!==result.at(-1)||!token.startsWith('batch:')))result.push(token);
+    }
+    return result;
+  };
+  return JSON.stringify(order(canonical,false))===JSON.stringify(order(observed,true));
+}
+
 /** Add saved passive inputs between matched public parts without losing live
  * provider recordings. Their order relative to public content is canonical;
  * diagnostics retain their observed order within each public-content interval.
