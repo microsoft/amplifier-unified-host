@@ -1,3 +1,4 @@
+import {planPart} from './plan.js';
 import {UpdateIntake} from './update-intake.js';
 import {peerTerminal} from './peer-results.js';
 import {toolInputDetail,toolResultDetail} from './tool-details.js';
@@ -2965,7 +2966,7 @@ export class AmplifierHost {
       if(update.status==='completed'||update.status==='failed')emit({type:'chat/toolCallComplete',turnId,toolCallId:id,result:await toolResultDetail({success:update.status==='completed',pastTenseMessage:current.title??'Tool finished',content:await this.toolContent(current.content??[]),structuredContent:current.rawOutput===undefined?undefined:{output:current.rawOutput}},block=>this.content(block))} as StateAction);
       else if(update.content!==undefined)emit({type:'chat/toolCallContentChanged',turnId,toolCallId:id,content:(await toolResultDetail({content:await this.toolContent(current.content??[])},block=>this.content(block))).content} as StateAction);
     } else if(update.sessionUpdate==='plan') {
-      emit({type:'chat/responsePart',turnId,part:{kind:'systemNotification',content:update.entries.map((e:any)=>`${e.status}: ${e.content}`).join('\n')}} as StateAction);
+      emit({type:'chat/responsePart',turnId,part:planPart(update)} as StateAction);
     }
   }
   private async permission(uri:string,params:RequestPermissionRequest):Promise<RequestPermissionResponse> {

@@ -1492,3 +1492,14 @@ trusted Workspace read with indexed whole-domain predicates and explicit freshne
 It preserves standard listSessions and selected-session AHP authority. Cold runtime
 unknown differs from a retained uncertain executed effect; no global current count
 or frozen-result snapshot is promised.
+
+### ACP plans
+
+Standard ACP `plan` updates retain bounded structured entries in an AHP
+`systemNotification` part under `_meta["amplifier.dev/acp"].plan` (version 1).
+The part also carries a plain-text fallback for generic clients. The shared
+projection handles live updates and passive history identically; it never adds
+a user input or starts execution. Invalid/oversized latest updates retain an
+explicit unavailable snapshot rather than substituting a stale plan. Optional
+Native todo active wording and unavailable metadata are presentation only.
+`test/plan.test.ts` checks the official reducer and serialization boundary.
