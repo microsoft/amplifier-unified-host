@@ -1,5 +1,5 @@
 import {capacityPolicy,evaluateCapacity} from './usage.js';
-import {planPart} from './plan.js';
+import {planPart,checkedPlanOverview,activePlanOverview} from './plan.js';
 import {checkedCreation} from './navigation.js';
 import {UpdateIntake} from './update-intake.js';
 import {peerTerminal} from './peer-results.js';
@@ -858,7 +858,7 @@ export class AmplifierHost {
       for(const snapshot of snapshots)peer.cuts.set(snapshot.resource,snapshot.fromSeq);
       const metadata=await this.config.clientMetadata?.({clientId:p.clientId,metadata:p._meta??{}});
       if(metadata&&Buffer.byteLength(JSON.stringify(metadata))>65536)throw new RpcFault(-32000,'Handshake metadata exceeds capacity');
-      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/readState':{version:1,manualUnreadKey:'amplifier.dev/readState'},'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
+      return {protocolVersion:'0.9.0',serverSeq:this.store.seq,defaultDirectory:pathToFileURL(this.defaultWorkingDirectory).href,serverInfo:{name:'amplifier-unified-host',version:'0.1.0'},snapshots,_meta:{...metadata,'amplifier.dev/host':{version:1,incarnation:this.store.incarnation,receipts:{method:'x-commandReceipt'},boundSteering:{version:1,messageMetaKey:'amplifier.dev/steering',turnIdField:'activeTurnId',contentVersion:1},features:this.root()._meta['amplifier.dev/host'].features},...(this.managed?{'amplifier.dev/managedCreation':{version:1,method:'x-amplifier/managedSession',operations:['options','defaults','models','create','receipt'],passive:true,typedSelection:true}}:{}),'amplifier.dev/planOverview':{version:1,method:'x-amplifier/sessionPlans',maxSessions:50,passive:true},'amplifier.dev/readState':{version:1,manualUnreadKey:'amplifier.dev/readState'},'amplifier.dev/sessionLifecycle':{version:1,method:'x-amplifier/sessionLifecycle',deletion:'preserve-history',export:{pageBytes:65536}},...(this.config.capabilities?{'amplifier.dev/capabilities':this.config.capabilities.manifest}:{})}};
     }
     if(method==='reconnect') {
       if(peer.initialized)throw new RpcFault(-32600,'Reconnect must open a fresh connection');
@@ -910,6 +910,7 @@ export class AmplifierHost {
       }
       case 'dispatchAction':await this.dispatch(peer,p);return null;
       case 'x-amplifier/managedSession':if(p.channel!==ROOT)throw new RpcFault(-32602,'Managed creation uses the root channel');if(p.operation==='options')return this.managedSessionOptions(p.args);if(p.operation==='defaults')return this.managedSessionDefaults(p.args);if(p.operation==='models')return this.managedSessionModels(p.args);if(p.operation==='create')return this.createManagedSession(p.args);if(p.operation==='receipt'&&Object.keys(p.args??{}).length===1)return this.managedSessionReceipt(p.args.commandId);throw new RpcFault(-32602,'Unknown managed creation operation');
+      case 'x-amplifier/sessionPlans':return this.sessionPlans(p);
       case 'x-amplifier/sessionLifecycle':return this.sessionLifecycleRequest(p.channel,p.operation,p.args??{},{actorId:peer.clientId!,clientId:peer.clientId!});
       case 'x-commandReceipt': {
         const receipt=this.store.receipt(p.commandId);if(!receipt)throw new RpcFault(-32008,'Command receipt not found');
@@ -1417,6 +1418,34 @@ export class AmplifierHost {
   private async nativeLifecycle(agent:AcpProcess,record:SessionRecord,operation:string,args:Json={}) {
     const result:Json=await agent.client.extMethod('_amplifier/session',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,operation,args});
     if(!result||typeof result!=='object'||Array.isArray(result)||Buffer.byteLength(JSON.stringify(result))>256*1024)throw new RpcFault(-32000,'Invalid or oversized native lifecycle response');return result;
+  }
+  /** Bounded workspace progress. Does not subscribe, load history, or activate workers. */
+  async sessionPlans(input:Json) {return this.intake.inspectOnly(()=>this.readSessionPlans(input));}
+  private async readSessionPlans(input:Json) {
+    if(!input||Object.keys(input).some(k=>!['ids','includeItems'].includes(k))||!Array.isArray(input.ids)||input.ids.length>50||new Set(input.ids).size!==input.ids.length||input.ids.some((id:any)=>typeof id!=='string'||!/^ahp-session:\/[^?#\s]+$/.test(id))||input.includeItems!==undefined&&typeof input.includeItems!=='boolean')throw new RpcFault(-32602,'Up to 50 exact session IDs and optional includeItems are required');
+    const includeItems=input.includeItems===true,items:Json[]=[],groups=new Map<string,SessionRecord[]>();
+    for(const id of input.ids){
+      try{const record=await this.record(id);if(this.store.db.prepare('SELECT 1 FROM session_visibility WHERE uri=? AND deleted=1').get(id))throw Error('Hidden history');const group=groups.get(record.engineId)??[];group.push(record);groups.set(record.engineId,group);}
+      catch{items.push({sessionId:id,plan:{unavailable:true,readFailed:true,done:0,total:0,history:[]}});}
+    }
+    for(const [engineId,records] of groups){
+      try{await this.passiveCreationAgent(engineId,this.defaultWorkingDirectory,async agent=>{
+        const capability=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.history;
+        for(const record of records){
+          let plan:any;
+          try{
+            if(capability?.planOverview?.version!==1||capability.planOverview.passive!==true)throw Error('Passive plans unavailable');
+            const missing=(record.state._meta?.['amplifier.dev/native'] as Json|undefined)?.historyReadOnly===true;
+            if(missing&&capability.missingWorkspaceRead?.version!==1)throw Error('Missing-workspace plans unavailable');
+            const result=await agent.client.extMethod('_amplifier/history/plan',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,includeItems,...(missing?{readOnlyMissingWorkspace:true}:{})}) as Json;
+            if(!result||Buffer.byteLength(JSON.stringify(result))>65536)throw Error('Invalid native plan response');
+            plan=checkedPlanOverview(result.plan,includeItems);
+          }catch{plan={unavailable:true,readFailed:true,done:0,total:0,history:[]};}
+          items.push({sessionId:record.uri,plan:activePlanOverview(this.getRecord(record.uri)?.chat.activeTurn,plan,includeItems)});
+        }
+      });}catch{for(const record of records)if(!items.some(row=>row.sessionId===record.uri))items.push({sessionId:record.uri,plan:{unavailable:true,readFailed:true,done:0,total:0,history:[]}});}
+    }
+    return {items,readOnly:true};
   }
   /** Native storage owner inspection; no transcript body or prepared runtime. */
   async inspectSessionHistory(session:string):Promise<Json> {
