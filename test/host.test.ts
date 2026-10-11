@@ -269,8 +269,11 @@ test('scheduled admission compares durable revisions, shares stop lifecycle, and
 test('source-config creation shares durable creation and rejects changed or uncertain reuse',async()=>{
  const f=await setup();try{
   const client=await f.connect(),{session}=await f.create(client),before=await f.host.inspectSession(session);
-  const input={commandId:randomUUID(),idempotencyKey:'scheduled-once',sourceSession:session,expectedConfigurationHash:before.configurationHash,title:'Created task'};
+  assert.equal(f.host.store.navigation.projection(session,0).agentCreated,false);
+  await assert.rejects(f.host.createSession({commandId:randomUUID(),idempotencyKey:'bad-provenance',sourceSession:session,expectedConfigurationHash:before.configurationHash,creation:{creatorSessionId:'other',requestId:'r'}}),/Creation source differs/);
+  const input={commandId:randomUUID(),idempotencyKey:'scheduled-once',sourceSession:session,expectedConfigurationHash:before.configurationHash,title:'Created task',creation:{creatorSessionId:session,requestId:'r'}};
   const created=await f.host.createSession(input);assert.equal(created.creationConfirmed,true);assert.equal((await f.host.inspectSession(created.uri)).title,'Created task');
+  assert.equal(f.host.store.navigation.projection(created.uri,0).agentCreated,true);
   assert.equal((await f.host.createSession(input)).uri,created.uri);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
   await assert.rejects(f.host.createSession({...input,title:'different'}),/reused/);
   await client.subscribe(session);client.dispatch(session,{type:'session/configChanged',config:{mode:'fast'}});

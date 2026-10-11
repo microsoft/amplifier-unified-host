@@ -1,4 +1,5 @@
 import {planPart} from './plan.js';
+import {checkedCreation} from './navigation.js';
 import {UpdateIntake} from './update-intake.js';
 import {peerTerminal} from './peer-results.js';
 import {toolInputDetail,toolResultDetail} from './tool-details.js';
@@ -142,6 +143,7 @@ export class AmplifierHost {
   private retentionChanging=new Set<string>();
   private active=new Map<string,Active>();
   private library?:LibraryIndex;
+  private navigationSupported=false;
   private starting=new Map<string,Promise<Active>>();
   private resourceLocks=new Map<string,Promise<unknown>>();
   private cursors=new Map<string,{chat:string;before:number}>();
@@ -250,9 +252,11 @@ export class AmplifierHost {
   }
   async listen():Promise<this> {
     this.roots=await Promise.all(this.config.allowedWorkspaceRoots.map(root=>realpath(root)));
+    try{this.navigationSupported=(await this.config.catalog?.libraryCapabilities?.())?.navigation?.version===1;}catch(error){if((error as Json).code!==-32601)throw error;}
     if(this.config.catalog?.libraryQuery&&(!this.config.catalog.supportsLibraryQuery||await this.config.catalog.supportsLibraryQuery()))this.library=new LibraryIndex(this.config.catalog,{
       page:after=>this.store.db.prepare('SELECT uri FROM sessions WHERE uri>? ORDER BY uri LIMIT 100').all(after).map(row=>String(row.uri)),
       record:uri=>this.libraryMetadata(uri),unknown:uri=>this.libraryUnknown(uri),live:()=>this.libraryLiveFacts(),
+      ...(this.navigationSupported?{navigation:(record:CatalogRecord)=>this.store.navigation.projection(record.uri,Date.parse(record.modifiedAt)/1000)}:{}),
       changed:()=>this.invalidateCapability('workspaces','host'),
     },this.store.librarySource,this.store.incarnation);
     this.store.onReceiptChanged=this.library?channel=>{if(channel==='*capacity')this.library?.degraded();else if(channel.startsWith('ahp-chat:/')||channel.startsWith('ahp-session:/'))this.library?.point(channel.replace('ahp-chat:/','ahp-session:/'));}:undefined;
@@ -1985,12 +1989,13 @@ export class AmplifierHost {
     const uris=new Set([...this.active.keys(),...this.starting.keys()]);if(uris.size>64)throw Error('Live library fact capacity exceeded');
     const items:LiveFact[]=[];
     for(const uri of uris){const row=this.libraryMetadata(uri);if(!row)continue;const status=Number(row.status)||0,active=this.active.get(uri),unknown=this.libraryUnknown(uri);
-      items.push({uri,runtime:unknown?'unknown':status&16?'input-needed':active?.busy||active?.finishing||this.starting.has(uri)?'working':'idle',effect:unknown?'unknown':status&SessionStatus.Error?'error':active?.busy?'unverified':'settled',modifiedAt:active?.busy&&active.started?active.started/1000:Date.parse(row.modifiedAt)/1000});}
+      items.push({uri,runtime:unknown?'unknown':status&16?'input-needed':active?.busy||active?.finishing||this.starting.has(uri)?'working':'idle',effect:unknown?'unknown':status&SessionStatus.Error?'error':active?.busy?'unverified':'settled',modifiedAt:active?.busy&&active.started?active.started/1000:Date.parse(row.modifiedAt)/1000,...(this.navigationSupported?{navigation:this.store.navigation.projection(uri,Date.parse(row.modifiedAt)/1000)}:{})});}
     return items;
   }
   /** Trusted Workspace callback. Grants are intersected, never widened by caller roots. */
   async queryLibrary(params:LibraryQuery){
     if(!this.library)throw new RpcFault(-32601,'Versioned library query unavailable');
+    if((params.navigationVersion!==undefined||params.includeAgentCreated!==undefined||params.selectedUri!==undefined||params.sort==='recent')&&(!this.navigationSupported||params.navigationVersion!==1))throw new RpcFault(-32601,'Recent navigation query unavailable');
     if(!Array.isArray(params.allowedWorkspaceRoots)||params.allowedWorkspaceRoots.length>128)throw new RpcFault(-32602,'Workspace owner grants required');
     const roots=new Set<string>();for(const grant of params.allowedWorkspaceRoots){if(typeof grant!=='string'||!isAbsolute(grant))throw new RpcFault(-32602,'Absolute workspace grant required');const candidate=resolve(grant);for(const host of this.roots){const within=(child:string,parent:string)=>child===parent||child.startsWith(parent.endsWith('/')?parent:parent+'/');if(within(candidate,host))roots.add(candidate);else if(within(host,candidate))roots.add(host);}}
     try{return await this.withConversationCatalogRead(()=>this.library!.query({...params,allowedWorkspaceRoots:[...roots],allowedManagedRoots:this.managed?[this.managed.root]:[]}));}
@@ -1999,6 +2004,7 @@ export class AmplifierHost {
   reconcileLibrary(){return this.library?.reconcile()??Promise.resolve();}
   private async syncCatalog(record:SessionRecord) {
     if(!this.config.catalog)return;
+    this.store.navigation.initialize(record.uri,Date.parse(record.summary.modifiedAt)/1000);
     const projection:CatalogRecord={uri:record.uri,engineId:record.engineId,nativeSessionId:record.nativeSessionId,workingDirectory:record.workingDirectory,title:record.summary.title,createdAt:record.summary.createdAt,modifiedAt:record.summary.modifiedAt,status:record.summary.status,isArchived:!!(record.summary.status & SessionStatus.IsArchived),availability:'available',workspaceAvailability:'present',...((record.state._meta?.['amplifier.dev/location'])?{location:record.state._meta!['amplifier.dev/location'] as ManagedLocation}:{})};
     if(this.library)await this.library.write(projection);else await this.config.catalog.upsert(projection);
     if(this.presentation){const indexed=await this.config.catalog.get(record.uri);if(indexed?.nativeSessionId)this.presentation.retainMapping(indexed as unknown as Json);}
@@ -2027,6 +2033,11 @@ export class AmplifierHost {
       const terminal=this.terminalState(channel);
       if(terminal&&!rejectionReason){const next=terminalReducer(terminal,action as any);this.store.db.prepare('UPDATE terminals SET payload=?,modified=?,lifecycle=? WHERE uri=?').run(JSON.stringify(next),now(),next.lifecycle.status,channel);}
       if(record&&!rejectionReason) {
+        const seed=Date.parse(previous!.summary.modifiedAt)/1000;
+        if(!['chat/delta','chat/reasoning','chat/toolCallDelta'].includes(action.type))this.store.navigation.initialize(record.uri,seed);
+        const refused=action.type==='chat/error'&&(action as Json).part?.error?.errorType==='INPUT_REJECTED';
+        if(!refused&&['chat/turnComplete','chat/turnCancelled','chat/error','chat/inputRequested','session/inputNeededSet'].includes(action.type))this.store.navigation.progress(record.uri,Date.now()/1000,seed,true);
+        else if(['chat/responsePart','chat/toolCallStart','chat/toolCallComplete'].includes(action.type))this.store.navigation.progress(record.uri,Date.now()/1000,seed);
         if(channel===record.chat.resource) {
           // The projection holds only the active turn. Completed history is independently indexed.
           const reduced=chatReducer({...record.chat,turns:[]},action as any);
@@ -2096,9 +2107,10 @@ export class AmplifierHost {
       const position=prior?.position??Number(this.store.db.prepare("SELECT coalesce(max(position),-1)+1 n FROM queue_intents WHERE chat=? AND status='pending'").get(channel)!.n);
       this.store.transaction(()=>{
         this.store.db.prepare("INSERT INTO queue_intents(id,chat,message,origin,position,status,held,reason) VALUES(?,?,?,?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET message=excluded.message,origin=excluded.origin,held=excluded.held,reason=excluded.reason").run(action.id,channel,payload,JSON.stringify(origin),position,held?1:0,reason??null);
+        if(!prior){this.store.navigation.post(record.uri,action.id,Date.now()/1000,Date.parse(record.summary.modifiedAt)/1000);this.store.navigation.disposition(record.uri,action.id,'accepted',0);}
         this.emit(channel,{...action,message:this.queueMessage(message,held,reason)},origin.clientSeq>=0?origin:undefined);
       });
-      await this.drainQueue(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
+      this.library?.point(record.uri);await this.drainQueue(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
     }
     if(action.type==='chat/pendingMessageRemoved'){
       if(action.kind!=='queued'||typeof action.id!=='string'||!action.id||action.id.length>128)throw new RpcFault(-32602,'Queued message identity required');
@@ -2119,7 +2131,7 @@ export class AmplifierHost {
     if(prior&&prior.chat!==chat)throw new RpcFault(-32009,'Steering identity belongs to another conversation');
     if(action.type==='chat/pendingMessageRemoved'){
       if(!prior||prior.status!=='pending')throw new RpcFault(-32011,'No unconsumed steering input; already consumed input cannot be retracted');
-      this.store.transaction(()=>{this.store.db.prepare("UPDATE steering_intents SET status='removed',message=NULL WHERE id=?").run(action.id);this.emit(chat,action,origin.clientSeq>=0?origin:undefined);});return {accepted:true,id:action.id,pending:false};
+      this.store.transaction(()=>{this.store.db.prepare("UPDATE steering_intents SET status='removed',message=NULL WHERE id=?").run(action.id);this.store.navigation.disposition(record.uri,action.id,'rejected',Date.parse(record.summary.modifiedAt)/1000);this.emit(chat,action,origin.clientSeq>=0?origin:undefined);});this.library?.point(record.uri);return {accepted:true,id:action.id,pending:false};
     }
     const native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
     if(native?.activeSteering?.version!==1||native.activeSteering.mode!=='request_boundary')throw new RpcFault(-32601,'Agent does not advertise generation-anchored request-boundary steering');
@@ -2143,11 +2155,13 @@ export class AmplifierHost {
     if(Number(capacity.n)>=1024||Number(capacity.bytes)+Buffer.byteLength(payload)>16*1024*1024)throw new RpcFault(-32000,'Pending steering capacity reached');
     const held=!!this.store.unknown(chat),activeTurnId=this.getRecord(record.uri)!.chat.activeTurn?.id??null;
     this.store.transaction(()=>{
+      for(const pending of this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND status='pending' AND id!=?").all(chat,action.id))this.store.navigation.disposition(record.uri,String(pending.id),'rejected',Date.parse(record.summary.modifiedAt)/1000);
+      if(!prior)this.store.navigation.post(record.uri,action.id,Date.now()/1000,Date.parse(record.summary.modifiedAt)/1000);
       this.store.db.prepare("UPDATE steering_intents SET status='removed',message=NULL WHERE chat=? AND status='pending' AND id!=?").run(chat,action.id);
       this.store.db.prepare("INSERT INTO steering_intents(id,chat,message,origin,status,held,active_turn_id) VALUES(?,?,?,?,'pending',?,?) ON CONFLICT(id) DO UPDATE SET message=excluded.message,origin=excluded.origin,held=excluded.held,active_turn_id=excluded.active_turn_id").run(action.id,chat,payload,JSON.stringify(origin),held?1:0,activeTurnId);
       this.emit(chat,{...action,message:{...action.message,_meta:{...action.message._meta,'amplifier.dev/steering':{...(action.message._meta?.['amplifier.dev/steering'] as Json),held,...(held?{reason:'prior-execution-unknown'}:{})}}}},origin.clientSeq>=0?origin:undefined);
     });
-    await this.consumeSteering(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
+    this.library?.point(record.uri);await this.consumeSteering(record.uri);return {accepted:true,id:action.id,pending:!this.store.receipt(action.id)};
   }
   private richSteeringSupported(record:SessionRecord) {
     const active=this.active.get(record.uri),native=(record.state._meta?.['amplifier.dev/acp'] as Json)?.capabilities?._meta?.['amplifier.dev/native'];
@@ -2227,7 +2241,7 @@ export class AmplifierHost {
     if(!row||row.status!=='dispatching')return;
     clearTimeout(this.steeringTimers.get(id));this.steeringTimers.delete(id);
     const active=this.active.get(session);if(active?.turnId===row.active_turn_id)this.touchAgent(active);
-    this.store.transaction(()=>{this.store.db.prepare('UPDATE steering_intents SET status=?,held=1,reason=? WHERE id=?').run(disposition,reason.slice(0,1024),id);this.store.finish(id,disposition==='applied'?'completed':disposition==='held'?'failed':'unknown','steering:'+disposition+': '+reason.slice(0,512));});
+    this.store.transaction(()=>{this.store.navigation.disposition(session,id,disposition==='held'?'rejected':disposition==='applied'?'accepted':'retained',0);this.store.db.prepare('UPDATE steering_intents SET status=?,held=1,reason=? WHERE id=?').run(disposition,reason.slice(0,1024),id);this.store.finish(id,disposition==='applied'?'completed':disposition==='held'?'failed':'unknown','steering:'+disposition+': '+reason.slice(0,512));});
     if(active&&!active.busy&&!active.cancel&&!active.controlDepth&&!this.closing&&this.store.receipt(active.turnId!)?.detail==='end_turn')void this.withLock(session,()=>this.drainQueue(session)).catch(()=>{});
     this.intake.workChanged();
   }
@@ -2386,7 +2400,7 @@ export class AmplifierHost {
     const historyArgs=special?.operation==='history.revise'?special.args:undefined;
     if(historyPrefix?.editContext&&special)special={...special,args:{...special.args,prompt:blocks}};
     const params=this.inputParams(active,record,action.turnId,action.message,blocks,special,publicOriginal);
-    this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(historyArgs));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
+    this.store.transaction(()=>{if(special?.operation==='history.revise'){this.store.db.prepare('INSERT INTO history_edits VALUES(?,?,?,?,?)').run(special.args.operationId,record.uri,action.turnId,'admitted',JSON.stringify(historyArgs));this.store.bump(record.uri,'interruption');}if(special?.operation==='observation.submit')this.store.reopenKnownRefusal(action.turnId,channel,special.requestSignature!);this.store.admission(channel,action,action.turnId,origin.clientId,origin.clientSeq);if(action.message.origin?.kind==='user'&&(!special||['history.revise','question.submit'].includes(special.operation))&&!action.queuedMessageId)this.store.navigation.post(record.uri,action.turnId,Date.now()/1000,Date.parse(record.summary.modifiedAt)/1000);if(special?.requestSignature)this.store.annotateReceipt(action.turnId,{requestSignature:special.requestSignature});if(action.queuedMessageId){const changed=this.store.db.prepare("UPDATE queue_intents SET status='consumed',message=NULL,projected=0 WHERE id=? AND chat=? AND status='pending' AND held=0").run(action.queuedMessageId,channel);if(changed.changes!==1)throw new Error('Queued intent changed before admission');}this.store.bump(record.uri,'execution');});
     this.store.db.prepare("UPDATE steering_intents SET active_turn_id=? WHERE chat=? AND status='pending' AND held=0 AND active_turn_id IS NULL").run(action.turnId,channel);
     this.touchAgent(active);active.busy=true;active.generationId=undefined;active.steeringMount=undefined;active.steeringRuns=new Set();active.cancel=undefined;active.projectionBytes=Buffer.byteLength(JSON.stringify(action));active.turnId=action.turnId;active.started=Date.now();active.textPart=undefined;active.textMessageId=undefined;active.reasoningPart=undefined;active.tools.clear();active.toolStates=new Map();this.publishSteeringSupport(record.uri,active);
     if(action.queuedMessageId)this.emit(channel,{type:'chat/pendingMessageRemoved',kind:'queued',id:action.queuedMessageId} as PendingQueueAction);
@@ -2402,6 +2416,7 @@ export class AmplifierHost {
     if(typeof input.commandId!=='string'||!input.commandId||input.commandId.length>512||typeof input.clientId!=='string'||!input.clientId||typeof input.text!=='string'||Buffer.byteLength(input.text)>1024*1024)throw new RpcFault(-32602,'Bounded command, client identity and text are required');
     if(input.delivery&&(input.delivery.version!==1||typeof input.delivery.callId!=='string'||input.delivery.callId.length>200||!Array.isArray(input.delivery.sourceItemIds)||input.delivery.sourceItemIds.length>32||input.delivery.sourceItemIds.some(id=>typeof id!=='string'||id.length>200)||Buffer.byteLength(JSON.stringify(input.delivery))>16000))throw new RpcFault(-32602,'Invalid bounded voice delivery');
     if(input.origin!==undefined&&!['agent','ui'].includes(input.origin))throw new RpcFault(-32602,'Unsupported turn origin');
+    if(input.origin==='agent'&&input.delivery)throw new RpcFault(-32602,'Agent input cannot claim human voice delivery');
     if(input.attachments&&(!Array.isArray(input.attachments)||input.attachments.length>16||Buffer.byteLength(JSON.stringify(input.attachments))>8*1024*1024))throw new RpcFault(-32602,'Attachments exceed the admitted input bound');
     const record=await this.record(session);
     let activeInputId:string|undefined;
@@ -2417,10 +2432,11 @@ export class AmplifierHost {
       });
   }
   /** Durable common creation for a configured source; no native history or goals are copied. */
-  async createSession(input:{commandId:string;idempotencyKey:string;sourceSession:string;expectedConfigurationHash:string;title?:string}) {
+  async createSession(input:{commandId:string;idempotencyKey:string;sourceSession:string;expectedConfigurationHash:string;title?:string;creation?:{creatorSessionId:string;requestId:string}}) {
     return this.intake.run(async()=>{
     if(!input||typeof input.commandId!=='string'||!input.commandId||input.commandId.length>128||typeof input.idempotencyKey!=='string'||!input.idempotencyKey||input.idempotencyKey.length>512||typeof input.expectedConfigurationHash!=='string'||(input.title!==undefined&&(typeof input.title!=='string'||input.title.length>1000)))throw new RpcFault(-32602,'Bounded creation identity and expected configuration required');
-    const source=await this.record(input.sourceSession);const identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
+    if(input.creation)checkedCreation(input.creation);
+    const source=await this.record(input.sourceSession);if(input.creation&&input.creation.creatorSessionId!==source.uri)throw new RpcFault(-32602,'Creation source differs');const identity=createHash('sha256').update(JSON.stringify([source.uri,input.idempotencyKey])).digest('hex');
     const nativeId=identity.slice(0,8)+'-'+identity.slice(8,12)+'-5'+identity.slice(13,16)+'-a'+identity.slice(17,20)+'-'+identity.slice(20,32),uri='ahp-session:/'+nativeId;
     const fingerprint=createHash('sha256').update(JSON.stringify(input)).digest('hex');
     return this.withLock(source.uri,async()=>{
@@ -2439,13 +2455,13 @@ export class AmplifierHost {
       const snapshot=await this.withAgentUse(active,()=>active.agent.client.extMethod('_amplifier/native',{sessionId:active.agent.nativeId!,operation:'configuration.snapshot',args:{}}));
       if(snapshot.version!==1||snapshot.sourceSessionId!==active.agent.nativeId||snapshot.sourceCwd!==source.workingDirectory||typeof snapshot.configurationHash!=='string'||Buffer.byteLength(JSON.stringify(snapshot))>65536)throw new RpcFault(-32000,'Invalid native configuration snapshot reference');
       if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed while preparing creation');
-      this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);
+      this.store.transaction(()=>{this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);if(input.creation){if(input.creation.creatorSessionId!==source.uri)throw Error('Creation source differs');this.store.navigation.created(uri,input.creation,Date.now()/1000);}});
       await this.createSessionResource({channel:uri,provider:source.engineId,workingDirectories:[pathToFileURL(source.workingDirectory).href],title:input.title},{sessionId:nativeId,source:snapshot,commandId:input.commandId});
       return {uri,creationConfirmed:true as const,receipt:this.store.receipt(input.commandId)};
     });
       });
   }
-  private async cloneManagedSession(source:SessionRecord,input:{commandId:string;title?:string;expectedConfigurationHash:string},uri:string,identity:string,fingerprint:string){
+  private async cloneManagedSession(source:SessionRecord,input:{commandId:string;title?:string;expectedConfigurationHash:string;creation?:{creatorSessionId:string;requestId:string}},uri:string,identity:string,fingerprint:string){
     this.guardSessionLifecycle(source.uri);this.guardTransfer(source.uri);
     if(this.store.unknown(source.chat.resource)||this.relocationFence(source.uri))throw new RpcFault(-32011,'Source execution is unresolved; configuration cannot be copied',{executed:false});
     const request={session:uri,commandId:input.commandId,provider:source.engineId,title:input.title??source.summary.title};this.managed!.validate(request);
@@ -2455,7 +2471,7 @@ export class AmplifierHost {
       const snapshot:Json=await agent.client.extMethod('_amplifier/managed',{operation:'configuration.snapshot',sessionId:source.nativeSessionId,cwd:source.workingDirectory});
       if(snapshot.version!==1||snapshot.sourceSessionId!==source.nativeSessionId||snapshot.sourceCwd!==source.workingDirectory||snapshot.executionDirectory!==source.workingDirectory||typeof snapshot.configurationHash!=='string'||!/^[a-f0-9]{64}$/.test(snapshot.configurationHash))throw new RpcFault(-32000,'Invalid exact native configuration reference');
       if((await this.inspectSession(source.uri)).configurationHash!==input.expectedConfigurationHash)throw new RpcFault(-32011,'Source configuration changed while preparing creation',{executed:false});
-      this.store.transaction(()=>{this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);this.store.admission(uri,{operation:'managed.configuration-clone',source:source.uri,snapshot},input.commandId,'host:create',this.store.extensionSequence('host:create'));this.store.finish(input.commandId,'dispatching');});
+      this.store.transaction(()=>{this.store.db.prepare('INSERT INTO creation_keys VALUES(?,?,?,?)').run(identity,input.commandId,uri,fingerprint);if(input.creation){if(input.creation.creatorSessionId!==source.uri)throw Error('Creation source differs');this.store.navigation.created(uri,input.creation,Date.now()/1000);}this.store.admission(uri,{operation:'managed.configuration-clone',source:source.uri,snapshot},input.commandId,'host:create',this.store.extensionSequence('host:create'));this.store.finish(input.commandId,'dispatching');});
       let allocation:Json|undefined;
       try{
         await this.withLock('@directory-reservations',async()=>{allocation=this.managed!.reserve(request,{operation:'configuration-clone',sessionId:source.nativeSessionId,configurationHash:snapshot.configurationHash});await this.managed!.allocate(allocation);this.managed!.settle(input.commandId,'dispatching');});
@@ -2816,7 +2832,7 @@ export class AmplifierHost {
       finally{await active.agent.drainNativeEventIntake();}
       if(special&&response.accepted!==true){
         if(response.accepted!==false)throw new Error('Native admitted input outcome was not conclusive');
-        await active.updates;this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
+        await active.updates;this.store.navigation.disposition(uri,turnId,'rejected',0);this.store.finish(turnId,'failed',String(response.reason??'Native input rejected'));
         if(['observation.submit','history.revise','peer.submit'].includes(special.operation)&&!active.pendingTurn)throw new Error('Native refused observation after execution evidence');
         if(special.operation==='observation.submit'&&response.executed===false&&response.reason==='waiting_worker')this.store.annotateReceipt(turnId,{retryEligibility:'waiting_worker'});
         if(!active.pendingTurn)this.emit(channel,{type:'chat/error',turnId,duration:Date.now()-active.started!,part:{kind:'error',error:{errorType:'INPUT_REJECTED',message:String(response.reason??'Native input rejected before execution')}}} as StateAction);return;

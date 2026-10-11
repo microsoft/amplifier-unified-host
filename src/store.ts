@@ -1,5 +1,6 @@
 import {initializeAuthority,preflightAuthorityFile,AuthoritativeSchemaError} from './authoritative-schema.js';
 import type {NativeFailedInput} from './input-outcome.js';
+import {NavigationIndex} from './navigation.js';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync,realpathSync } from 'node:fs';
 import { OwnerLease } from './owner-lease.js';
@@ -21,6 +22,7 @@ export interface Receipt {
 /** Host projections and admission only. Native agent history is never rewritten here. */
 export class Store {
   readonly db: DatabaseSync;
+  readonly navigation:NavigationIndex;
   readonly incarnation = randomUUID();
   private replayBytes=0;
   private lease:OwnerLease;
@@ -97,6 +99,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);
     `);
+    if(!this.db.prepare('PRAGMA table_info(session_admission)').all().some(column=>column.name==='navigation'))this.db.exec('ALTER TABLE session_admission ADD COLUMN navigation TEXT');
     if(!this.db.prepare('PRAGMA table_info(terminals)').all().some(column=>column.name==='lifecycle'))this.db.exec("ALTER TABLE terminals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'exited'; UPDATE terminals SET lifecycle=json_extract(payload,'$.lifecycle.status');");
     if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='execution_cwd'))this.db.exec('ALTER TABLE sessions ADD COLUMN execution_cwd TEXT; ALTER TABLE sessions ADD COLUMN native_location_revision INTEGER NOT NULL DEFAULT 0; UPDATE sessions SET execution_cwd=cwd');
     if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='hidden'))this.db.exec('ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0');
@@ -117,6 +120,7 @@ export class Store {
       this.finish(receipt.commandId, 'unknown', 'Host restarted before a conclusive ACP outcome; reconcile native history before new work.');
     }
     },{existingFile,configure:'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'});
+    this.navigation=new NavigationIndex(this.db);
     }catch(error){opened?.close();this.lease.close();throw error;}
   }
   get seq(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='seq'").get()!.value); }
