@@ -1,3 +1,4 @@
+import {PassiveMediaReaders} from './passive-media-readers.js';
 import {toolExecutionMetadata} from './execution-metadata.js';
 import {delegateObservation} from './delegate-observation.js';
 import type {QuiescenceContext} from './quiescence.js';
@@ -118,6 +119,8 @@ export interface HostConfig {
     manifest:{version:1;topics:Record<string,{uri:string;version:number;watch?:boolean;scope?:'context'|'host'}>;actions:Record<string,{topic:string;operation:string;method:string}>};
     /** Trusted exact manifest action classification; no ordinary mutation rights are inherited. */
     quiescenceAccess?:Record<string,'read'|'reconcile'>;
+    /** Trusted owners may retain bounded client observations in memory only. */
+    ephemeralActions?:Record<string,true>;
     read:(request:{uri:string;topic:string;scope:string;clientId:string})=>Promise<{topic:string;scope:string;revision:number;data:unknown}>;
     action:(request:Json,context:{actorId:string;clientId:string;origin:'agent'|'ui';session?:SessionRecord})=>Promise<{accepted:boolean;updates?:Array<{topic:string;scope:string;revision:number;data:unknown}>;invalidate?:string[]}>;
   };
@@ -171,6 +174,21 @@ export class AmplifierHost {
   private mixedCursors=new Map<string,{chat:string;count:number;first:string;hash:string;revision:string}>();
   private coordinationCursors=new Map<string,{modified:string;uri:string}>();
   private passiveReads=0;
+  private mediaReaders=new PassiveMediaReaders<AcpProcess>(key=>this.openMediaReader(key),async agent=>{
+    try{await agent.retire();}finally{this.passiveReads--;this.intake.workChanged();}
+  });
+  private async openMediaReader(key:string){
+    if(this.closing||this.passiveReads>=4)throw new RpcFault(-32000,'Passive native read capacity reached');
+    const [engineId,cwd]=JSON.parse(key),engine=this.config.engines.find(engine=>engine.id===engineId);
+    if(!engine)throw new RpcFault(-32601,'Native media identity is unavailable');
+    this.passiveReads++;
+    const agent=new AcpProcess(engine,cwd,{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Passive media inspection cannot perform effects');}});
+    try{
+      const initialized=await agent.initialize(),history=(initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
+      if(history?.passive!==true||history.exactMessageRead?.mediaReferenceOnly!==1)throw new RpcFault(-32601,'Native media message references are unavailable');
+      return agent;
+    }catch(error){try{await agent.retire();}finally{this.passiveReads--;this.intake.workChanged();}throw error;}
+  }
   private recallCursors=new Map<string,{scope:string;cursor?:string;after?:{modified:string;uri:string}}>();
   private hotRecords=new Map<string,SessionRecord>();
   private clientTools=new Map<string,{session:string;chat:string;turnId:string;clientId:string;resolve:(result:Json)=>void;timer:ReturnType<typeof setTimeout>}>();
@@ -2824,13 +2842,13 @@ export class AmplifierHost {
       sourceDigest:message.sourceDigest}};
   }
   /** Verify a saved resource's originating public message without granting input authority. */
-  async verifyOutputMessage(session:string,messageId:string,turnId?:string):Promise<boolean> {
+  async verifyOutputMessage(session:string,messageId:string,turnId?:string,savedAssistantOnly=false):Promise<boolean> {
     if(typeof messageId!=='string'||!messageId||messageId.length>512||turnId!==undefined&&(typeof turnId!=='string'||!turnId||turnId.length>256))throw new RpcFault(-32602,'Exact bounded message identities required');
     const record=await this.record(session);
     if(turnId){
       const saved=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,turnId);
-      const turn=saved?JSON.parse(String(saved.payload)):record.chat.activeTurn?.id===turnId?record.chat.activeTurn:undefined;
-      if(turn){if(messageId===turn.id+':input'&&turn.message.text)return true;
+      const turn=saved?JSON.parse(String(saved.payload)):!savedAssistantOnly&&record.chat.activeTurn?.id===turnId?record.chat.activeTurn:undefined;
+      if(turn&&(!savedAssistantOnly||turn.state==='complete')){if(!savedAssistantOnly&&messageId===turn.id+':input'&&turn.message.text)return true;
         if(turn.responseParts.some((part:Json,index:number)=>part.kind==='markdown'&&typeof part.content==='string'&&part.content.trim()&&(messageId===(part.id||`${turn.id}:${part.kind}:${index}`)||messageId===part._meta?.['amplifier.dev/history']?.messageId)))return true;}
     }
     if(!messageId.startsWith('native:'))return false;
@@ -2844,8 +2862,36 @@ export class AmplifierHost {
       if(inspected.available!==true||typeof inspected.revision!=='string'||!inspected.revision)throw new RpcFault(-32008,'Historical source is unavailable');
       const result:Json=await agent.client.extMethod('_amplifier/history/message',{...scope,messageId,expectedRevision:inspected.revision,visibleReferenceOnly:true});
       if(result.revision!==inspected.revision||result.selection!=='exact-visible-reference'||result.complete!==true||result.execution!==false||result.mutationAuthority!=='none'||result.message?.id!==messageId||!['user','assistant'].includes(result.message.role)||Buffer.byteLength(JSON.stringify(result))>4096)throw new RpcFault(-32000,'Invalid visible message reference');
-      return true;
+      return !savedAssistantOnly||result.message.role==='assistant';
     }finally{this.passiveReads--;await agent.retire();}
+  }
+  /** Read-only proof for saved inline media; streaming parts never grant publication. */
+  async verifyMediaMessage(session:string,messageId:string,turnId?:string) {
+    if(typeof messageId!=='string'||!messageId||messageId.length>512)throw new RpcFault(-32602,'Exact bounded media message identity required');
+    if(messageId.startsWith('native:')||/^[a-f0-9]{32}$/.test(messageId)){
+      const record=await this.record(session);
+      if(!record.nativeSessionId)throw new RpcFault(-32601,'Native media identity is unavailable');
+      return this.mediaReaders.use(JSON.stringify([record.engineId,this.passiveProcessDirectory(record),record.nativeSessionId]),async agent=>{
+        const history=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
+        if(history?.exactMessageRead?.mediaReferenceOnly!==1)throw new RpcFault(-32601,'Native media message references are unavailable');
+        const scope={sessionId:record.nativeSessionId,cwd:record.workingDirectory},inspected:Json=await agent.client.extMethod('_amplifier/history/inspect',scope);
+        if(inspected.available!==true||typeof inspected.revision!=='string'||!inspected.revision)throw new RpcFault(-32008,'Historical media source is unavailable');
+        const result:Json=await agent.client.extMethod('_amplifier/history/message',{...scope,messageId,expectedRevision:inspected.revision,mediaReferenceOnly:true});
+        if(result.revision!==inspected.revision||result.selection!=='exact-media-reference'||result.requestedId!==messageId||result.complete!==true||result.execution!==false||result.mutationAuthority!=='none'||result.message?.role!=='assistant'||typeof result.message.id!=='string'||!result.message.id.startsWith('native:')||result.message.id.length>512||result.message.legacyMessageId!==undefined&&!/^[a-f0-9]{32}$/.test(result.message.legacyMessageId)||Buffer.byteLength(JSON.stringify(result))>4096)throw new RpcFault(-32000,'Invalid saved media reference');
+        return {messageId:result.message.id,sourceDigest:createHash('sha256').update(result.message.id).digest('hex'),...(result.message.legacyMessageId?{legacyMessageId:result.message.legacyMessageId}:{})};
+      });
+    }
+    if(!await this.verifyOutputMessage(session,messageId,turnId,true))throw new RpcFault(-32602,'Choose a saved assistant message in this conversation');
+    const record=await this.record(session);
+    const saved=turnId&&this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,turnId);
+    if(!saved)throw new RpcFault(-32011,'Saved assistant message changed');
+    const turn=JSON.parse(String(saved.payload)),parts=turn.responseParts.filter((part:Json,index:number)=>part.kind==='markdown'&&typeof part.content==='string'&&part.content.trim()&&(messageId===(part.id||`${turn.id}:${part.kind}:${index}`)||messageId===part._meta?.['amplifier.dev/history']?.messageId));
+    if(turn.state!=='complete'||parts.length!==1||parts[0]._meta?.['amplifier.dev/observation'])throw new RpcFault(-32011,'Saved assistant message is unavailable or ambiguous');
+    return {messageId,sourceDigest:createHash('sha256').update(JSON.stringify([turn.id,parts[0]])).digest('hex')};
+  }
+  /** Ephemeral authenticated subscription, never a browser-supplied identity claim. */
+  mediaClientBound(session:string,clientId:string):boolean {
+    const record=this.getRecord(session);return !!record&&typeof clientId==='string'&&!!clientId&&[...this.peers].some(peer=>peer.initialized&&peer.clientId===clientId&&peer.subscriptions.has(record.uri));
   }
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
@@ -3215,7 +3261,7 @@ export class AmplifierHost {
   }
   private quiescenceWork(service=false) {
     const active=[...this.active.values()];
-    return {counts:{shuttingDown:this.closing?1:0,startingAgents:this.starting.size,activeTurns:active.filter(a=>a.busy).length,finishingTurns:active.filter(a=>a.finishing).length,activeControls:active.reduce((n,a)=>n+(a.controlDepth??0),0),nativeUpdates:active.reduce((n,a)=>n+(a.updateCount??0)+(a.observationPending??0),0),permissions:active.reduce((n,a)=>n+a.permissions.size,0),clientTools:this.clientTools.size,settledCallbacks:this.settledCallbacks.size,stoppedCallbacks:this.stoppedCallbacks.size,steeringDispositions:this.steeringTimers.size,terminalJobs:Number(this.store.db.prepare("SELECT count(*) n FROM terminals WHERE lifecycle='running'").get()!.n),...(service?{}:{pendingQueue:Number(this.store.db.prepare("SELECT count(*) n FROM queue_intents WHERE status='pending'").get()!.n),pendingSteering:Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE status IN ('pending','dispatching')").get()!.n)})},gaps:!service&&active.filter(a=>!a.agent.closed&&((a.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle?.gracefulRetire!==true)).length?['resident-agent-has-no-atomic-retirement']:[]};
+    return {counts:{shuttingDown:this.closing?1:0,mediaReaders:this.mediaReaders.size,startingAgents:this.starting.size,activeTurns:active.filter(a=>a.busy).length,finishingTurns:active.filter(a=>a.finishing).length,activeControls:active.reduce((n,a)=>n+(a.controlDepth??0),0),nativeUpdates:active.reduce((n,a)=>n+(a.updateCount??0)+(a.observationPending??0),0),permissions:active.reduce((n,a)=>n+a.permissions.size,0),clientTools:this.clientTools.size,settledCallbacks:this.settledCallbacks.size,stoppedCallbacks:this.stoppedCallbacks.size,steeringDispositions:this.steeringTimers.size,terminalJobs:Number(this.store.db.prepare("SELECT count(*) n FROM terminals WHERE lifecycle='running'").get()!.n),...(service?{}:{pendingQueue:Number(this.store.db.prepare("SELECT count(*) n FROM queue_intents WHERE status='pending'").get()!.n),pendingSteering:Number(this.store.db.prepare("SELECT count(*) n FROM steering_intents WHERE status IN ('pending','dispatching')").get()!.n)})},gaps:!service&&active.filter(a=>!a.agent.closed&&((a.agent.initialized?.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.lifecycle?.gracefulRetire!==true)).length?['resident-agent-has-no-atomic-retirement']:[]};
   }
   private async quiesceAgents():Promise<{ready:boolean;reason?:string;unknown?:boolean}> {
     if(this.store.db.prepare("SELECT 1 FROM receipts WHERE client_id='host:retirement' AND json_extract(payload,'$.status') IN ('admitted','unknown') LIMIT 1").get())return {ready:false,unknown:true,reason:'native-retirement-unconfirmed'};
@@ -3535,6 +3581,12 @@ export class AmplifierHost {
     const channelSession=request.channel===ROOT?undefined:await this.record(request.channel);
     const session=actor.session===undefined?channelSession:await this.record(actor.session);
     if(channelSession&&session?.uri!==channelSession.uri)throw new RpcFault(-32602,'Capability channel differs from the trusted agent session',{executed:false});
+    if(namedAction&&provider.ephemeralActions?.[namedAction[0]]===true){
+      if(access!=='read'||(actor.origin??'ui')!=='ui'||!actor.clientId||!channelSession||!this.mediaClientBound(channelSession.uri,actor.clientId))throw new RpcFault(-32009,'Ephemeral observations require an authenticated selected browser',{executed:false});
+      const result=await provider.action(request,{actorId:actor.actorId,clientId:actor.clientId,origin:'ui',session});
+      if(result.invalidate?.length||result.updates?.length)throw new RpcFault(-32603,'Ephemeral observations cannot publish durable state');
+      return result;
+    }
     this.store.transaction(()=>this.store.admission(request.channel,request,request.commandId,actor.actorId,this.store.extensionSequence(actor.actorId)));
     this.store.finish(request.commandId,'dispatching');
     try {const result=await provider.action(request,{actorId:actor.actorId,clientId:actor.clientId??'',origin:actor.origin??'ui',session});this.store.finish(request.commandId,result.accepted?'completed':'failed');for(const topic of result.invalidate??[])this.invalidateCapability(topic,request.channel===ROOT?'host':request.channel);for(const update of result.updates??[])this.invalidateCapability(update.topic,update.scope);return result;}
@@ -3595,6 +3647,7 @@ export class AmplifierHost {
   async close() {
     this.closing=true;
     this.intake.hostClosing();
+    await this.mediaReaders.close();
     clearInterval(this.retireTimer);
     for(const observer of this.observers){observer.closed=true;observer.queue=[];}this.observers.clear();
     for(const peer of this.peers)peer.socket.terminate();

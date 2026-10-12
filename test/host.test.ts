@@ -22,6 +22,19 @@ async function setup(options:any={}) {
 }
 function action(text:string,turnId=randomUUID()):any{return {type:'chat/turnStarted',turnId,startedAt:new Date().toISOString(),message:{text,origin:{kind:'user'}}};}
 
+test('declared ephemeral observations require the authenticated selected UI and never acquire durable receipts',async()=>{
+ let calls=0;const capability={manifest:{version:1,topics:{observed:{uri:'amplifier-capability://observed',version:1}},actions:{'observed.frame':{topic:'observed',operation:'observed.frame',method:'x-amplifier/capabilityAction'}}},quiescenceAccess:{'observed.frame':'read'},ephemeralActions:{'observed.frame':true},read:async()=>({}),action:async()=>{calls++;return {accepted:true,result:{sequence:calls}}}};
+ const f=await setup({capabilities:capability});try{
+  const client=await f.connect('viewer'),one=await f.create(client),two=await f.create(client);await client.subscribe(one.session);
+  const commandId=randomUUID(),request={version:1,topic:'observed',operation:'observed.frame',channel:one.session,commandId,args:{}};
+  await client.request('x-amplifier/capabilityAction',request);
+  assert.equal(calls,1);assert.equal(f.host.store.receipt(commandId),undefined);
+  for(const actor of [{actorId:'agent',clientId:'viewer',origin:'agent' as const},{actorId:'other',clientId:'other',origin:'ui' as const}])await assert.rejects(f.host.invokeCapability({...request,commandId:randomUUID()},actor),/authenticated selected browser/);
+  await assert.rejects(f.host.invokeCapability({...request,channel:two.session},{actorId:'viewer',clientId:'viewer',origin:'ui'}),/authenticated selected browser/);
+  assert.equal(calls,1);
+ }finally{await f.cleanup();}
+});
+
 test('saved output origin checks exact indexed public parts without starting another turn',async()=>{
  const f=await setup();try{
   const client=await f.connect(),one=await f.create(client),two=await f.create(client),turnId=randomUUID();
@@ -29,6 +42,17 @@ test('saved output origin checks exact indexed public parts without starting ano
   const row=f.host.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(one.chat,turnId),turn=JSON.parse(String(row!.payload));
   const index=turn.responseParts.findIndex((p:any)=>p.kind==='markdown'),part=turn.responseParts[index],id=part.id||`${turnId}:markdown:${index}`;
   assert.equal(await f.host.verifyOutputMessage(one.session,id,turnId),true);
+  assert.equal((await f.host.verifyMediaMessage(one.session,id,turnId)).messageId,id);
+  await assert.rejects(f.host.verifyMediaMessage(one.session,turnId+':input',turnId),/saved assistant/);
+  await assert.rejects(f.host.verifyMediaMessage(two.session,id,turnId),/saved assistant/);
+  turn.responseParts[index]._meta={'amplifier.dev/observation':{source:'test'}};
+  f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
+  await assert.rejects(f.host.verifyMediaMessage(one.session,id,turnId),/unavailable or ambiguous/);
+  delete turn.responseParts[index]._meta;
+  turn.state='cancelled';f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
+  await assert.rejects(f.host.verifyMediaMessage(one.session,id,turnId),/saved assistant/);
+  turn.state='complete';f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
+
   assert.equal(await f.host.verifyOutputMessage(one.session,'invented',turnId),false);
   assert.equal(await f.host.verifyOutputMessage(two.session,id,turnId),false);
   assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
