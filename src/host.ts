@@ -1,4 +1,5 @@
 import {toolExecutionMetadata} from './execution-metadata.js';
+import {delegateObservation} from './delegate-observation.js';
 import type {QuiescenceContext} from './quiescence.js';
 import {historyCleanupCensus,completedHistoryReceipt} from './history-cleanup.js';
 import {exportObservations,EXPORT_FLAGS} from './export-observations.js';
@@ -6,7 +7,7 @@ import {workspaceCleanupCensus,completedCleanupReceipt} from './workspace-cleanu
 import {capacityPolicy,evaluateCapacity} from './usage.js';
 import {planPart,checkedPlanOverview,activePlanOverview} from './plan.js';
 import {checkedCreation} from './navigation.js';
-import {UpdateIntake} from './update-intake.js';
+import {UpdateIntake,coalesceSessionUpdates} from './update-intake.js';
 import {peerTerminal} from './peer-results.js';
 import {toolInputDetail,toolResultDetail} from './tool-details.js';
 import {missingHistoryWorkspace} from './history-workspace.js';
@@ -131,7 +132,8 @@ export interface HostConfig {
 }
 interface Peer {socket:WebSocket;clientId?:string;connectionId:string;handshakeQueued:boolean;initialized:boolean;ready:boolean;buffer:Json[];bufferBytes:number;cuts:Map<string,number>;replayCut?:number;lastClientSeq:number;seenClientSeq:Set<number>;subscriptions:Set<string>;pending:number;queue:Promise<unknown>;channels:Map<string,Promise<unknown>>;cursors:Map<string,Json>;}
 interface SettledInput {requestSignature?:string;operation:'schedule.submit'|'question.submit'|'observation.submit'|'history.revise'|'peer.submit';args:Json;expected?:{interruptionRevision:number;executionRevision:number;configurationHash:string;nativeSessionId?:string;nativeLocationRevision?:number};}
-interface Active {updateIntake?:UpdateIntake;peerTerminals?:Json[];steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
+type OrderedProjection = {source:'acp';params:SessionNotification}|{source:'execution';turnId:string;node:Json};
+interface Active {updateIntake?:UpdateIntake<OrderedProjection>;peerTerminals?:Json[];steeringMount?:{activeTurnId:string;generationId:string;capability?:Json};admittedControls?:number;retirementCommandId?:string;finishing?:boolean;publicOriginalMount?:Json;historyRevision?:{args:Json;prefix:{turns:Turn[];nextCursor?:string;revision:string;diagnostics:unknown[]};confirmed:boolean};pendingTurn?:{action:Extract<StateAction,{type:'chat/turnStarted'}>;origin:ActionEnvelope['origin']};observationAdmission?:Json;peerAdmission?:Json;generationId?:string;steeringRuns?:Set<Promise<void>>;observationPending?:number;observationBytes?:number;stopCallback?:Promise<void>;stopNotified?:boolean;retireReason?:AgentStopped['reason'];agent:AcpProcess;busy:boolean;lastUsed:number;useOrder?:number;interested?:boolean;uninterestedSince?:number;projectionBytes?:number;cancel?:{action:StateAction;origin:ActionEnvelope['origin']};updates?:Promise<void>;updateCount?:number;updateBytes?:number;controlDepth?:number;pendingHints?:string[];turnId?:string;started?:number;textPart?:string;textMessageId?:string;reasoningPart?:string;run?:Promise<void>;tools:Set<string>;toolStates?:Map<string,Json>;permissions:Map<string,{params:RequestPermissionRequest;resolve:(r:RequestPermissionResponse)=>void}>;}
 class RpcFault extends Error {constructor(readonly code:number,message:string,readonly data?:unknown){super(message);}}
 const ROOT='ahp-root://';
 const now=()=>new Date().toISOString();
@@ -1538,7 +1540,7 @@ export class AmplifierHost {
           // Native history is canonical for persisted response boundaries; the
           // live host remains authority for admission outcome and input provenance.
           let responseParts=canonical.responseParts.filter(part=>part.kind!=='error'||(part as any).error?.errorType!=='NATIVE_OUTCOME_UNKNOWN');
-          const hasRecords=live.responseParts.some(part=>(part as Json)._meta?.['amplifier.dev/modelCall']);
+          const hasRecords=live.responseParts.some(part=>(part as Json)._meta?.['amplifier.dev/modelCall']||(part as Json)._meta?.['amplifier.dev/delegate']);
           const responseText=(parts:typeof responseParts)=>parts.filter(part=>part.kind==='markdown').map(part=>typeof (part as any).content==='string'?(part as any).content:(part as any).content?.value??'').join('');
           const normalizeTool=(id:string)=>record.nativeSessionId&&id.startsWith(record.nativeSessionId+':')?id.slice(record.nativeSessionId.length+1):id;
           let retainedObservations=false;
@@ -1993,20 +1995,27 @@ export class AmplifierHost {
       if(!engine)throw new RpcFault(-32002,'Session engine is not configured');
       await this.selectedWorkspace(record,true);
       const active:Active={agent:null as any,busy:false,lastUsed:performance.now(),uninterestedSince:performance.now(),interested:this.agentInterested(uri),tools:new Set(),permissions:new Map()};
+      // Reserve both ACP updates and optional execution observations before any
+      // asynchronous content write. Prompt completion joins this exact ordered
+      // queue, without awaiting duplex Native control callbacks.
+      const enqueue=(params:OrderedProjection)=>{
+        active.updateIntake??=new UpdateIntake<OrderedProjection>(
+          value=>value.source==='execution'
+            ?this.projectExecutionObservation(uri,active,value)
+            :this.update(uri,value.params),()=>{
+            active.updateCount=active.updateIntake!.count;active.updateBytes=active.updateIntake!.bytes;this.intake.workChanged();
+          },(a,b)=>a.source==='acp'&&b.source==='acp'&&coalesceSessionUpdates(a.params,b.params));
+        try{
+          const update=active.updateIntake.enqueue(params);
+          active.updates=active.updateIntake.settled;active.updateCount=active.updateIntake.count;active.updateBytes=active.updateIntake.bytes;
+          return update;
+        }catch(error){active.agent.process.kill();return Promise.reject(error);}
+      };
       const agent=new AcpProcess(engine,record.executionDirectory??record.workingDirectory,{
         hostCapabilities:this.config.nativeHostCapabilities,
         hostRuntimeRetention:true,
         admitEffect:work=>this.admittedNativeWork(uri,active,work),
-        update:params=>{
-          active.updateIntake??=new UpdateIntake(value=>this.update(uri,value),()=>{
-            active.updateCount=active.updateIntake!.count;active.updateBytes=active.updateIntake!.bytes;this.intake.workChanged();
-          });
-          try{
-            const update=active.updateIntake.enqueue(params);
-            active.updates=active.updateIntake.settled;active.updateCount=active.updateIntake.count;active.updateBytes=active.updateIntake.bytes;
-            return update;
-          }catch(error){agent.process.kill();return Promise.reject(error);}
-        },permission:async params=>{await active.updates;return this.permission(uri,params);},
+        update:params=>enqueue({source:'acp',params}),permission:async params=>{await active.updates;return this.permission(uri,params);},
         terminal:event=>this.terminalEvent(uri,event),
         stopped:event=>this.notifyAgentStopped(uri,active,active.retireReason??'process-closed',event),
         nativeEvent:async params=>{
@@ -2014,23 +2023,8 @@ export class AmplifierHost {
           // Scalar accounting is independent of selected-turn and UI byte bounds.
           if(event?.type==='execution.event'&&agent.nativeId)this.store.usage.observe(uri,agent.nativeId,event.event??{});
           if(event) this.steeringEvent(uri,active,event);
-          if(event?.type==='execution.event')await active.updates;
-          if(event?.type==='execution.event'&&active.busy&&active.turnId&&event.activeInputId===active.turnId&&event.event?.kind==='llm'){
-            const node=event.event;
-            if(typeof node.id!=='string'||node.id.length>200||Buffer.byteLength(JSON.stringify(node))>32768)return;
-            const details:Json={};
-            for(const field of ['request','response']){
-              const detail=node[field+'Detail'];
-              if(detail?.callId===node.id&&detail.field===field&&/^[a-f0-9]{64}$/.test(detail.sha256)){
-                details[field+'Detail']={...detail,uri:'amplifier-model://recording?'+new URLSearchParams({session:uri,callId:node.id,field,sha256:detail.sha256})};
-              }
-            }
-            const action={type:'chat/responsePart',turnId:active.turnId,part:{kind:'systemNotification',content:'',_meta:{'amplifier.dev/modelCall':{version:1,...node,...details}}}} as StateAction;
-            const bytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(action));
-            // Optional diagnostics must not exhaust the active conversation view.
-            if(bytes>(this.config.maxActiveProjectionBytes??8*1024*1024))return;
-            active.projectionBytes=bytes;this.projectPendingTurn(uri,active);
-            this.emit(chatURI(uri),action);
+          if(event?.type==='execution.event'&&active.busy&&active.turnId&&event.activeInputId===active.turnId&&['worker','llm'].includes(event.event?.kind)){
+            if(Buffer.byteLength(JSON.stringify(event.event))<=(event.event.kind==='worker'?65536:32768))await enqueue({source:'execution',turnId:active.turnId,node:event.event});
           }
           if(event?.type==='history.revised')this.confirmHistoryRevision(uri,active,event);
           if(active.busy&&((event?.type==='input.accepted'&&event.input_id===active.turnId)||(event?.type==='generation.started'&&event.activeInputId===active.turnId)))this.projectPendingTurn(uri,active);
@@ -2056,6 +2050,29 @@ export class AmplifierHost {
       catch(error){active.retireReason='startup-failed';this.active.delete(uri);await agent.retire();throw error;}
     })();this.starting.set(uri,pending);try{return await pending;}finally{this.starting.delete(uri);this.admittedStarts.delete(uri);}
       });
+  }
+  private async projectExecutionObservation(uri:string,active:Active,observation:{turnId:string;node:Json}) {
+    if(!active.busy||active.turnId!==observation.turnId)return;
+    const node=observation.node;let metadata:Json;
+    if(node.kind==='worker'){
+      const report=await delegateObservation(node,block=>this.content(block));
+      if(!report)return;
+      metadata={'amplifier.dev/delegate':report};
+    }else{
+      if(node.kind!=='llm'||typeof node.id!=='string'||node.id.length>200||Buffer.byteLength(JSON.stringify(node))>32768)return;
+      const details:Json={};
+      for(const field of ['request','response']){
+        const detail=node[field+'Detail'];
+        if(detail?.callId===node.id&&detail.field===field&&/^[a-f0-9]{64}$/.test(detail.sha256)){
+          details[field+'Detail']={...detail,uri:'amplifier-model://recording?'+new URLSearchParams({session:uri,callId:node.id,field,sha256:detail.sha256})};
+        }
+      }
+      metadata={'amplifier.dev/modelCall':{version:1,...node,...details}};
+    }
+    const action={type:'chat/responsePart',turnId:observation.turnId,part:{kind:'systemNotification',content:'',_meta:metadata}} as StateAction;
+    const bytes=(active.projectionBytes??0)+Buffer.byteLength(JSON.stringify(action));
+    if(bytes>(this.config.maxActiveProjectionBytes??8*1024*1024))return;
+    active.projectionBytes=bytes;this.projectPendingTurn(uri,active);this.emit(chatURI(uri),action);
   }
   private nativeWorkAdmitted(session:string,active:Active){return this.active.get(session)===active&&!active.agent.closed&&!active.stopNotified&&(this.starting.has(session)||!!active.admittedControls||!!active.turnId&&(active.busy||active.finishing));}
   private async admittedNativeWork<T>(session:string,active:Active,work:()=>Promise<T>):Promise<T>{
