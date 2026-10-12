@@ -2865,6 +2865,38 @@ export class AmplifierHost {
       return !savedAssistantOnly||result.message.role==='assistant';
     }finally{this.passiveReads--;await agent.retire();}
   }
+  /** Bounded saved identities for agent output placement, without shared-history refresh. */
+  async readSavedAssistantMessages(session:string) {
+    const record=await this.record(session);
+    const nativeHistory=(record.state._meta?.['amplifier.dev/acp'] as Json|undefined)?.capabilities?._meta?.['amplifier.dev/native']?.history;
+    if(record.nativeSessionId&&nativeHistory?.savedMessages?.version===1){
+      return this.mediaReaders.use(JSON.stringify([record.engineId,this.passiveProcessDirectory(record),record.nativeSessionId]),async agent=>{
+        const history=(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
+        if(history?.savedMessages?.version!==1)throw new RpcFault(-32601,'Saved-message discovery is unavailable in this native agent');
+        const result:Json=await agent.client.extMethod('_amplifier/history/saved-messages',{sessionId:record.nativeSessionId,cwd:record.workingDirectory});
+        const fresh=this.getRecord(record.uri);
+        if(!fresh||fresh.nativeSessionId!==record.nativeSessionId||fresh.workingDirectory!==record.workingDirectory||fresh.engineId!==record.engineId)throw new RpcFault(-32011,'Saved-message scope changed');
+        if(result.version!==1||result.selection!=='recent-saved-assistant'||!/^([a-f0-9]{64})$/.test(result.revision)||result.execution!==false||result.mutationAuthority!=='none'||result.currentSegmentOnly!==true||typeof result.hasOlder!=='boolean'||!Array.isArray(result.messages)||result.messages.length>12||Buffer.byteLength(JSON.stringify(result))>32768)throw new RpcFault(-32000,'Invalid saved-message discovery result');
+        const ids=new Set<string>();
+        const messages=result.messages.map((row:Json)=>{
+          if(typeof row.messageId!=='string'||!row.messageId.startsWith('native:')||row.messageId.length>512||ids.has(row.messageId)||row.role!=='assistant'||row.saved!==true||typeof row.text!=='string'||!row.text.trim()||[...row.text].length>512||typeof row.truncated!=='boolean')throw new RpcFault(-32000,'Invalid saved assistant message');
+          ids.add(row.messageId);return {messageId:row.messageId,role:'assistant',saved:true,text:row.text,truncated:row.truncated};
+        });
+        return {version:1,sessionId:record.uri,source:'native',selection:result.selection,revision:result.revision,currentSegmentOnly:true,hasOlder:result.hasOlder,execution:false,mutationAuthority:'none',messages};
+      });
+    }
+    const messages:Json[]=[];
+    for(const turn of this.store.turns(record.chat.resource,24).turns){
+      if(turn.state!=='complete')continue;
+      for(const [index,part] of (turn.responseParts as Json[]).entries()){
+        if(part.kind!=='markdown'||typeof part.content!=='string'||!part.content.trim()||part._meta?.['amplifier.dev/observation'])continue;
+        const messageId=part.id||`${turn.id}:${part.kind}:${index}`;
+        if(typeof messageId!=='string'||messageId.length>512)continue;
+        const text=[...part.content];messages.push({messageId,messageTurnId:turn.id,role:'assistant',saved:true,text:text.slice(0,512).join(''),truncated:text.length>512});
+      }
+    }
+    return {version:1,sessionId:record.uri,source:'host-saved',selection:'recent-saved-assistant',messages:messages.slice(-12),hasOlder:true,execution:false,mutationAuthority:'none'};
+  }
   /** Read-only proof for saved inline media; streaming parts never grant publication. */
   async verifyMediaMessage(session:string,messageId:string,turnId?:string) {
     if(typeof messageId!=='string'||!messageId||messageId.length>512)throw new RpcFault(-32602,'Exact bounded media message identity required');

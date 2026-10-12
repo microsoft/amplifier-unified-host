@@ -1552,6 +1552,15 @@ prompting again. Host verifies ordinary saved-output message links through its
 retained exact turn or a passive canonical visible-message read. It never grants
 history mutation authority through a display reference.
 
+The trusted composition port `readSavedAssistantMessages(session)` discovers
+up to 12 saved assistant references. Native engines negotiate the bounded
+`history.savedMessages` passive read; other engines expose only completed saved
+host turns, with their required `messageTurnId`. Results carry 512-character
+previews and no execution or mutation authority. The composition exposes this
+as `app_control get_state {path:"/messages"}` so an agent can attach media to
+its saved commentary. Normal idle history refresh binds those same canonical
+IDs to the client message while retaining provider and tool observations.
+
 Workspace `createSession.config` can include an exact `bundle` reference when the
 Native engine advertises `initialSelection.bundleSelection`. The passive standard
 resolver validates it in the requested workspace; a bundle-only choice does not

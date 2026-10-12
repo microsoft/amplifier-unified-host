@@ -43,14 +43,19 @@ test('saved output origin checks exact indexed public parts without starting ano
   const index=turn.responseParts.findIndex((p:any)=>p.kind==='markdown'),part=turn.responseParts[index],id=part.id||`${turnId}:markdown:${index}`;
   assert.equal(await f.host.verifyOutputMessage(one.session,id,turnId),true);
   assert.equal((await f.host.verifyMediaMessage(one.session,id,turnId)).messageId,id);
+  const discovered=await f.host.readSavedAssistantMessages(one.session);
+  assert.equal(discovered.messages.at(-1)!.messageId,id);assert.equal(discovered.messages.at(-1)!.messageTurnId,turnId);
+  assert.equal(discovered.execution,false);assert.equal((await f.host.readSavedAssistantMessages(two.session)).messages.length,0);
   await assert.rejects(f.host.verifyMediaMessage(one.session,turnId+':input',turnId),/saved assistant/);
   await assert.rejects(f.host.verifyMediaMessage(two.session,id,turnId),/saved assistant/);
   turn.responseParts[index]._meta={'amplifier.dev/observation':{source:'test'}};
   f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
   await assert.rejects(f.host.verifyMediaMessage(one.session,id,turnId),/unavailable or ambiguous/);
+  assert.equal((await f.host.readSavedAssistantMessages(one.session)).messages.length,0);
   delete turn.responseParts[index]._meta;
   turn.state='cancelled';f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
   await assert.rejects(f.host.verifyMediaMessage(one.session,id,turnId),/saved assistant/);
+  assert.equal((await f.host.readSavedAssistantMessages(one.session)).messages.length,0);
   turn.state='complete';f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
 
   assert.equal(await f.host.verifyOutputMessage(one.session,'invented',turnId),false);

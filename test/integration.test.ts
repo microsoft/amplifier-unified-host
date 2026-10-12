@@ -25,6 +25,10 @@ test('independent catalog process + real Amplifier passive ACP history, with no 
     const list=await client.request('listSessions',{channel:'ahp-root://',limit:1});assert.equal(list.items[0].resource,'ahp-session:/imported');assert.equal(list.items[0].status,1);
     const snapshot=(await client.subscribe('ahp-chat:/imported',{view:{turns:1}})).result.snapshot!.state as any;
     assert.equal(snapshot.turns[0].id,'stable-native-turn');assert.equal(snapshot.turns[0].message.text,'historical request');assert.ok(snapshot.turns[0].responseParts.some((part:any)=>part.content==='historical answer'));
+    const saved=await host.readSavedAssistantMessages('ahp-session:/imported');
+    assert.equal(saved.messages.length,1);assert.equal(saved.messages[0].text,'historical answer');
+    assert.equal((await host.verifyMediaMessage('ahp-session:/imported',saved.messages[0].messageId)).messageId,saved.messages[0].messageId);
+    assert.equal(saved.execution,false);assert.equal(saved.mutationAuthority,'none');
     const sources=await host.listRecallSources({session:'ahp-session:/imported',scope:'workspace',limit:25});assert.equal(sources.items[0].id,'ahp-session:/imported');
     const inspection=await host.inspectRecallSource('ahp-session:/imported'),page=await host.readRecallSource('ahp-session:/imported',{expectedRevision:inspection.revision,limit:1});assert.equal(page.rows.length,2);assert.equal(page.rows[0].text,'historical request');assert.equal(page.rows[0].inputOrigin,'unknown');assert.equal(page.rows[0].authorization,'unverified-native-history');assert.equal((await host.inspectRecallSource('ahp-session:/imported')).revision,inspection.revision);
     assert.equal(host.diagnostics().activeAgents,0);assert.equal(await readFile(transcript,'utf8'),source);
