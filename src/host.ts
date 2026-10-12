@@ -1,3 +1,4 @@
+import {toolExecutionMetadata} from './execution-metadata.js';
 import type {QuiescenceContext} from './quiescence.js';
 import {historyCleanupCensus,completedHistoryReceipt} from './history-cleanup.js';
 import {exportObservations,EXPORT_FLAGS} from './export-observations.js';
@@ -3115,7 +3116,7 @@ export class AmplifierHost {
       // A pending decision must keep the complete reviewed input visible,
       // including replacement arguments received while the prompt is open.
       const raw=active.permissions.has(id)?(current.rawInput===undefined?undefined:JSON.stringify(current.rawInput)):await toolInputDetail(current.rawInput,block=>this.content(block));
-      const metadata={'amplifier.dev/acp':{kind:current.kind,locations:current.locations,title:current.title,...(typeof raw==='string'?{rawInput:current.rawInput}:{})}};
+      const metadata={...toolExecutionMetadata(current._meta),'amplifier.dev/acp':{kind:current.kind,locations:current.locations,title:current.title,...(typeof raw==='string'?{rawInput:current.rawInput}:{})}};
       if(!active.tools.has(id)){active.tools.add(id);emit({type:'chat/toolCallStart',turnId,toolCallId:id,toolName:current.name??current.kind??'tool',displayName:current.title??'Tool',_meta:metadata} as StateAction);}
       // ACP rawInput is a replacement object, never an appendable JSON fragment.
       if(['in_progress','completed','failed'].includes(current.status)||active.permissions.has(id))emit({type:'chat/toolCallReady',turnId,toolCallId:id,invocationMessage:current.title??'Running tool',toolInput:raw,...(active.permissions.has(id)?{}:{confirmed:'not-needed'}),_meta:metadata} as StateAction);

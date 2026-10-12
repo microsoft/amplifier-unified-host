@@ -27,6 +27,7 @@ test('large tool bodies are read on demand and survive host restart without exec
   const view:any=(await client!.subscribe(chat,{view:{turns:20}})).result.snapshot!.state;
   const raw=JSON.stringify(view);assert.ok(raw.length<14000,`Snapshot too large: ${raw.length}`);assert.ok(!raw.includes('OUTPUT-LARGE-'));assert.ok(!raw.includes('INPUT-LARGE-'));
   const tool=view.turns[0].responseParts.find((p:any)=>p.kind==='toolCall').toolCall;
+  assert.deepEqual(tool._meta['amplifier.dev/execution'],{version:1,sessionId:'review',startedAt:12,delegate:{id:'worker:review',sessionId:'review',label:'Reviewer'}});
   assert.equal(tool.toolInput.contentType,'application/json');assert.equal(tool.structuredContent,undefined);assert.equal(tool.content[0].contentType,TOOL_RESULT_TYPE);
   const outputRef=tool.content[0].uri,inputRef=tool.toolInput.uri;
   const read=async(uri:string)=>client!.request('resourceRead',{channel:'ahp-root://',uri,encoding:'utf-8'}) as Promise<any>;

@@ -15,7 +15,7 @@ for await(const line of readline.createInterface({input:process.stdin})){
   const update=body=>send({method:'session/update',params:{sessionId:p.sessionId,update:body}});
   const input={command:'echo details',payload:'INPUT-LARGE-'.repeat(1000)};
   const finish=()=>{
-   update({sessionUpdate:'tool_call',toolCallId:'large',name:'bash',kind:'execute',title:'Read large output',status:'in_progress',rawInput:input});
+   update({sessionUpdate:'tool_call',toolCallId:'large',name:'bash',kind:'execute',title:'Read large output',status:'in_progress',rawInput:input,_meta:{'amplifier.dev/execution':{version:1,sessionId:'review',startedAt:12,delegate:{id:'worker:review',sessionId:'review',label:'Reviewer',summary:'PRIVATE-REPORT-NOT-IN-HEADER'}}}});
    update({sessionUpdate:'tool_call_update',toolCallId:'large',status:'completed',rawOutput:{stdout:'OUTPUT-LARGE-'.repeat(12000)+'FINAL-OUTPUT-MARKER',stderr:'',exit_code:0},content:[{type:'content',content:{type:'text',text:'OUTPUT-LARGE-'.repeat(12000)+'FINAL-OUTPUT-MARKER'}}]});
    update({sessionUpdate:'agent_message_chunk',content:{type:'text',text:'The first output is saved.'}});
    update({sessionUpdate:'tool_call',toolCallId:'failed',name:'read_file',kind:'read',title:'Second result failed',status:'failed',rawInput:{path:'missing'},rawOutput:{success:false,error:'FAILURE-LARGE-'.repeat(1000)+'FINAL-ERROR-MARKER'}});
