@@ -1,4 +1,5 @@
 import type {SessionMetadataAdapter} from './session-metadata.js';
+import {NativeEventIntake} from './native-event-intake.js';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Readable, Writable, Transform } from 'node:stream';
 import { readFile, writeFile, realpath, stat } from 'node:fs/promises';
@@ -45,6 +46,9 @@ export class AcpProcess {
   private retirement?:Promise<void>;
   private processClose:Promise<void>;
   private stderr = '';
+  private nativeEvents = new NativeEventIntake();
+  /** Called after an input RPC settles, before its generation is released. */
+  drainNativeEventIntake(){return this.nativeEvents.drain();}
   constructor(readonly engine: EngineConfig, readonly cwd: string, readonly handlers: AgentHandlers) {
     if(engine.messagePrincipal!==undefined&&(typeof engine.messagePrincipal!=='string'||!engine.messagePrincipal.trim()||[...engine.messagePrincipal].length>200||/[\x00-\x1f]/.test(engine.messagePrincipal)))throw Error('Server message principal must be a bounded nonempty account string');
     this.process = spawn(engine.command, engine.args ?? [], {cwd, env: {...process.env,...engine.env}, stdio:'pipe'});
@@ -57,6 +61,10 @@ export class AcpProcess {
     framingGuard.on('error', () => this.process.kill());
     this.process.stdout.pipe(framingGuard);
     const stream = ndJsonStream(Writable.toWeb(this.process.stdin) as WritableStream<Uint8Array>, Readable.toWeb(framingGuard) as ReadableStream<Uint8Array>);
+    const received=stream.readable.pipeThrough(new TransformStream({transform:(message,controller)=>{
+      if(!Array.isArray(message)&&'method' in message&&message.method==='_amplifier/event'&&!('id' in message))this.nativeEvents.observe(message.params);
+      controller.enqueue(message);
+    }}));
     const callbacks: Client = {
       sessionUpdate: async params => {this.validateSession(params.sessionId); await handlers.update(params);},
       requestPermission: async params => {this.validateSession(params.sessionId); return handlers.permission(params);},
@@ -98,10 +106,20 @@ export class AcpProcess {
         if (!handlers.hostRequest || method !== '_amplifier/host') throw new Error(`Unsupported client extension: ${method}`);
         this.validateSession(String(params.sessionId)); return handlers.hostRequest(method,params);
       },
-      extNotification:async(method,params)=>{if(method==='_amplifier/event'){this.validateSession(String(params.sessionId));await handlers.nativeEvent?.(params);}},
+      extNotification:async(method,params)=>{
+        if(method!=='_amplifier/event')return;
+        try{
+          this.validateSession(String(params.sessionId));
+          // The Host synchronously admits generation evidence and schedules its
+          // projections before this callback's first asynchronous continuation.
+          const continuation=handlers.nativeEvent?.(params);
+          this.nativeEvents.admit(params);
+          await continuation;
+        }catch(error){this.nativeEvents.fail(error);throw error;}
+      },
     };
-    this.client = new ClientSideConnection(()=>callbacks,stream);
-    let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;for(const terminal of this.terminalLifetimes)terminal.process.kill();handlers.stopped?.(event);};
+    this.client = new ClientSideConnection(()=>callbacks,{...stream,readable:received});
+    let stopped=false;const reportStopped=(event:{exitCode?:number;signal?:string})=>{if(stopped)return;stopped=true;this.closed=true;this.nativeEvents.closed();for(const terminal of this.terminalLifetimes)terminal.process.kill();handlers.stopped?.(event);};
     this.processClose=new Promise(resolve=>this.process.once('close',(code,signal)=>{try{reportStopped({...(code!==null?{exitCode:code}:{}),...(signal?{signal}:{})});}finally{resolve();}}));
     this.process.once('error',()=>reportStopped({}));
   }
@@ -151,7 +169,7 @@ export class AcpProcess {
         if(created.sessionId!==creation.sessionId||(created._meta as any)?.['amplifier.dev/native']?.creationConfirmed!==true)throw new Error('Native creation was not conclusively confirmed');
         this.nativeId=String(created.sessionId);return created as {sessionId:string;configOptions?:any[];modes?:any;_meta?:Record<string,unknown>};
       }
-      if(initialSelection){const native=this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any;if(native?.version!==1||native.initialSelection?.version!==1||native.initialSelection.typedSelection!==true||native.initialSelection.passive!==true)throw new Error('Agent does not advertise initial selection');}
+      if(initialSelection){const native=this.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as any;if(native?.version!==1||native.initialSelection?.version!==1||native.initialSelection.typedSelection!==true||native.initialSelection.passive!==true)throw new Error('Agent does not advertise initial selection');if(initialSelection.bundle!==undefined&&native.initialSelection.bundleSelection!==true)throw new Error('Agent does not advertise initial bundle selection');}
       const created=await this.client.newSession({cwd:this.cwd,mcpServers:[],...(initialSelection?{_meta:{'amplifier.dev/native':{selection:initialSelection}}}:{})});this.nativeId=created.sessionId;
       if(initialSelection){const proof=(created._meta as any)?.['amplifier.dev/native']?.initialSelection;if(proof?.version!==1||!proof.selection||Object.keys(proof.selection).sort().join(',')!==Object.keys(initialSelection).sort().join(',')||Object.entries(initialSelection).some(([key,value])=>proof.selection[key]!==value))throw new Error('Native initial selection effective readback differs from the requested creation configuration');}
       return created;

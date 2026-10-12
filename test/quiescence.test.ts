@@ -22,6 +22,20 @@ async function fixture(options:any={}){
 }
 function participant(id:string,extra:Partial<QuiescenceParticipant>={}):QuiescenceParticipant{return {id,acquire:async c=>({ownerId:id,fenceId:c.fenceId,release:async()=>{}}),...extra};}
 
+test('background readiness requires a viewer and excludes actual turns, owner admissions and fences',async()=>{
+ const f=await fixture();const gate=pause(),entered=pause();try{
+  assert.equal(f.host.inspectBackgroundReadiness().ready,false);
+  const client=await f.connect();assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+  const session=await f.create(client);assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+  const turn=randomUUID();await f.host.submitTurn(session,{commandId:turn,text:'slow',clientId:'owner'});assert.equal(f.host.inspectBackgroundReadiness().ready,false);
+  await f.host.waitForTurn(session,turn);await until(()=>f.host.inspectBackgroundReadiness().ready);
+  const work=f.host.withExternalMutation('test-background',async()=>{entered.release();await gate.promise;});await entered.promise;assert.equal(f.host.inspectBackgroundReadiness().ready,false);gate.release();await work;
+  assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+  const held=await f.host.admitQuiescence({commandId:'background-held',purpose:'distribution-update'});assert.equal(held.admitted,true);assert.equal(f.host.inspectBackgroundReadiness().ready,false);
+  await f.host.releaseQuiescence({fenceId:held.fenceId,commandId:'background-held',outcome:'unchanged'});assert.equal(f.host.inspectBackgroundReadiness().ready,true);
+ }finally{gate.release();await f.close();}
+});
+
 test('zero viewers does not imply idle: active turns and native-owned background work refuse retirement',async()=>{
  const f=await fixture();try{
   const client=await f.connect(),session=await f.create(client),commandId=randomUUID();await f.host.submitTurn(session,{commandId,text:'slow',clientId:'owner'});await client.shutdown();
@@ -212,4 +226,42 @@ test('public Host retires the resident and joins stop callbacks before acquiring
   assert.equal(result.admitted,true);assert.equal(acquired,1);assert.equal(stopJoined,true);assert.equal(host.diagnostics().activeAgents,0);
   assert.deepEqual(await host.admitQuiescence({commandId:'resident-writer-order',purpose:'distribution-update'}),result);assert.equal(acquired,1);
  }finally{await f.close();}
+});
+
+test('restarted metadata settlement retains intake protection and grants no native maintenance or ordinary admission',async()=>{
+ const owner=participant('owner'),f=await fixture({quiescence:configuration({requiredOwners:['owner'],participants:[owner]})});
+ try{
+  const held=await f.host.admitQuiescence({commandId:'cleanup-original',purpose:'recovery'});
+  const fence={fenceId:held.fenceId,commandId:'cleanup-original'};assert.equal(held.admitted,true);
+  await f.restart({quiescence:configuration({instanceId:'replacement',requiredOwners:['owner'],participants:[owner]})});
+  assert.equal(f.host.inspectQuiescence().fence?.phase,'unknown');
+  await f.host.withQuiescenceSettlement(fence,async()=>{
+   assert.equal(f.host.inspectQuiescence().activeSettlement,1);
+   await assert.rejects(f.host.withExternalMutation('owner',async()=>assert.fail('No ordinary admission')),/intake is closed/);
+   await assert.rejects(f.host.withQuiescenceMaintenance(fence,async()=>assert.fail('No native scope')),/held maintenance/);
+  });
+  assert.equal(f.host.inspectQuiescence().intakeClosed,true);
+  await assert.rejects(f.host.withQuiescenceSettlement({...fence,commandId:'other'},async()=>{}),/Original completed/);
+ }finally{await f.close();}
+});
+
+test('recovery release keeps original participant arguments after lost replies and two replacements',async()=>{
+ let original:any,attempts=0,fail=true;
+ const owner=participant('owner',{acquire:async c=>({ownerId:'owner',fenceId:c.fenceId,release:async(_outcome,proof)=>{
+  original=structuredClone(proof);attempts++;throw Error('Owner released but acknowledgement was lost');
+ }}),reconcileRelease:async input=>{assert.deepEqual(input.proof,original);assert.equal(input.outcome,original.outcome);attempts++;if(fail)throw Error('Second acknowledgement lost');}});
+ const f=await fixture({quiescence:configuration({requiredOwners:['owner'],participants:[owner]})});
+ try{
+  const held=await f.host.admitQuiescence({commandId:'original-recovery',purpose:'recovery'}),request={fenceId:held.fenceId!,commandId:'original-recovery'};
+  await assert.rejects(f.host.releaseQuiescence({...request,outcome:'unchanged'}),/remains unknown/);assert.equal(attempts,1);
+  let wrong=0;
+  const next=(instanceId:string)=>configuration({instanceId,requiredOwners:['owner'],participants:[owner],verifyRelease:async context=>({verified:true,fenceId:context.fenceId,commandId:context.commandId,outcome:context.outcome,instanceId,dataScope:context.dataScope,receiptId:original.receiptId,participantProof:wrong===1?{...original,receiptId:'changed'}:wrong===2?{...original,instanceId:'other-launch',outcome:'ready'}:original})});
+  await f.restart({quiescence:next('launch-two')});wrong=1;
+  await assert.rejects(f.host.releaseQuiescence({...request,outcome:'ready'}),/remains unknown/);assert.equal(attempts,1);
+  wrong=2;await assert.rejects(f.host.releaseQuiescence({...request,outcome:'ready'}),/remains unknown/);assert.equal(attempts,1);
+  wrong=0;await assert.rejects(f.host.releaseQuiescence({...request,outcome:'ready'}),/remains unknown/);assert.equal(attempts,2);
+  await f.restart({quiescence:next('launch-three')});fail=false;
+  const result=await f.host.releaseQuiescence({...request,outcome:'ready'});
+  assert.equal(result.released,true);assert.equal(result.instanceId,'launch-three');assert.equal(attempts,3);assert.equal(f.host.inspectQuiescence().intakeClosed,false);
+ }finally{await f.close()}
 });

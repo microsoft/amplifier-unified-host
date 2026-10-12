@@ -1,27 +1,27 @@
-import {createHash} from 'node:crypto';
 import {SessionStatus} from '@microsoft/agent-host-protocol';
 import type {Catalog,CatalogRecord} from './host.js';
-export interface HostObservation {version:1;source:string;incarnation:string;revision:number;observedAt:string;effect:'unknown'|'error'|'settled'|'unverified';unknownChecked:true;}
-export interface LibraryQuery {connectionId:string;allowedWorkspaceRoots:string[];limit?:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;archive?:'active'|'all'|'archived';sort?:'activity'|'created'|'name';activity?:'all'|'working'|'attention';location?:'all'|'managed';allowedManagedRoots?:string[];}
-export interface LiveFact {uri:string;runtime:'working'|'input-needed'|'idle'|'unknown';effect:HostObservation['effect'];modifiedAt:number;}
+import type {NavigationProjection} from './navigation.js';
+export interface HostObservation {version:1;source:string;incarnation:string;revision:number;observedAt:string;effect:'unknown'|'error'|'settled'|'unverified';unknownChecked:true;navigation?:NavigationProjection;}
+export interface LibraryQuery {connectionId:string;allowedWorkspaceRoots:string[];limit?:number;cursor?:string;workingDirectory?:string;search?:string;parentUri?:string;archive?:'active'|'all'|'archived';sort?:'activity'|'created'|'name'|'recent';activity?:'all'|'working'|'attention';location?:'all'|'managed'|'missing';allowedManagedRoots?:string[];navigationVersion?:1;includeAgentCreated?:boolean;selectedUri?:string;}
+export interface LiveFact {uri:string;runtime:'working'|'input-needed'|'idle'|'unknown';effect:HostObservation['effect'];modifiedAt:number;navigation?:NavigationProjection;}
 export interface LibraryRead extends LibraryQuery {liveFacts:{source:string;incarnation:string;items:LiveFact[]};observationFreshness:{phase:'complete'|'reconciling'|'degraded';issues:string[]};}
 export interface LibraryHooks {
  /** Metadata-only URIs and row reads; no Store.get/active-event/history replay. */
  page:(after:string)=>string[];record:(uri:string)=>CatalogRecord|undefined;
  unknown:(uri:string)=>boolean;live:()=>LiveFact[];changed:()=>void;
+ navigation?:(record:CatalogRecord)=>NavigationProjection;
 }
 /** Rebuildable observations using existing Catalog writes; no durable delivery queue. */
 export class LibraryIndex {
- readonly source:string;
  private revision=0;private failureRevision=0;private requests=new Set<Promise<unknown>>();private stopping=false;private pass?:Promise<void>;
  private jobs=new Set<Promise<void>>();private failures=new Set<string>();
  private writes=new Map<string,{latest:number;pending:number}>();
  private phase:'complete'|'reconciling'|'degraded'='reconciling';
- constructor(private catalog:Catalog,private hooks:LibraryHooks,stateDirectory:string,readonly incarnation:string){this.source=createHash('sha256').update(stateDirectory).digest('hex');}
+ constructor(private catalog:Catalog,private hooks:LibraryHooks,readonly source:string,readonly incarnation:string){}
  observation(record:CatalogRecord):HostObservation {
   const status=Number(record.status)||0;
   const effect=this.hooks.unknown(record.uri)?'unknown':status&SessionStatus.Error?'error':status&SessionStatus.InProgress?'unverified':'settled';
-  return {version:1,source:this.source,incarnation:this.incarnation,revision:++this.revision,observedAt:new Date().toISOString(),effect,unknownChecked:true};
+  return {version:1,source:this.source,incarnation:this.incarnation,revision:++this.revision,observedAt:new Date().toISOString(),effect,unknownChecked:true,...(this.hooks.navigation?{navigation:this.hooks.navigation(record)}:{})};
  }
  /** Awaited callers retain their existing effect semantics; no retry or mutation replay. */
  async write(record:CatalogRecord,observationOnly=false){

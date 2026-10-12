@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,rm} from 'node:fs/promises';
+import {realpath,mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
@@ -57,7 +57,7 @@ test('new command IDs obey the published bound without truncation; legacy durabl
 });
 
 test('trusted native origin survives a root-scoped action without accepting client session claims',async()=>{
- const directory=await mkdtemp(join(tmpdir(),'ahp-native-capability-origin-')),calls:any[]=[],config=configuration(directory,calls),one='ahp-session:/one',two='ahp-session:/two';
+ const directory=await realpath(await mkdtemp(join(tmpdir(),'ahp-native-capability-origin-'))),calls:any[]=[],config=configuration(directory,calls),one='ahp-session:/one',two='ahp-session:/two';
  const rows=new Map([one,two].map(uri=>[uri,{uri,engineId:'unused',nativeSessionId:uri.slice('ahp-session:/'.length),workingDirectory:directory,title:uri,createdAt:new Date().toISOString(),modifiedAt:new Date().toISOString(),status:'historical',kind:'root',availability:'available',workspaceAvailability:'present'}]));
  const host=await createHost({...config,catalog:{list:async()=>({items:[...rows.values()]}),get:async(uri:string)=>rows.get(uri)??null,upsert:async(record:any)=>record} as any}),client=await connect(host);
  try{

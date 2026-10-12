@@ -49,9 +49,9 @@ asyncio.run(rename())`,config,native,workspace],{env:{...process.env,...env}});
   const snapshot=(await client.subscribe(chat,{view:{turns:2}})).result.snapshot!.state as any,originalTurn=snapshot.turns.find((t:any)=>t.id===target),frozenQuote=originalTurn.message._meta['amplifier.dev/history'].replyTo;assert.ok(frozenQuote);assert.match((await calls()).at(-1)!,/Exact retained edit file context/);
   let selected=session,boundary=originalTurn.message._meta['amplifier.dev/history'].messageId;const beforeSource=(await host.inspectSessionHistory(session)).historyRevision;
   if(mode==='fork'){const forkCommand=randomUUID(),fork=await host.forkSession(session,{commandId:forkCommand,expectedHistoryRevision:beforeSource,throughMessageId:boundary});selected=fork.uri;assert.equal((await host.reconcileOriginalForkAttachments(session,forkCommand)).grantCoverage,'complete');
-   // This selected copied row is genuine Native identity; Web's saved source
-   // physical boundary is qualified separately, rather than guessed here.
-   const copied=(await host.readPublicOriginalRows(selected)).rows.find((r:any)=>r.publicMessage.inputId===target);assert.ok(copied);boundary=copied.locator.messageId;
+   const copied=(await host.readPublicOriginalRows(selected)).rows.find((r:any)=>r.publicMessage.inputId===target);assert.ok(copied);
+   assert.deepEqual(fork.forkBoundary,{sourceMessageId:boundary,targetMessageId:copied.locator.messageId,historyRevision:fork.historyRevision});
+   boundary=fork.forkBoundary.targetMessageId;
   }
   const before=(await host.inspectSessionHistory(selected)).historyRevision,count=(await calls()).length;
   const stale=await host.reviseHistory(selected,{commandId:randomUUID(),operationId:randomUUID(),targetMessageId:boundary,expectedHistoryRevision:'stale-owned-revision',text:'Must never execute stale edit'});assert.equal(stale.accepted,false);assert.equal((await calls()).length,count);assert.equal((await host.inspectSessionHistory(selected)).historyRevision,before);

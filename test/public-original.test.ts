@@ -116,6 +116,17 @@ test('ordered card occurrence counts text blocks and permits Resources255 names 
   assert.equal(capturePublicMessage({text:'keep',origin:{kind:'user'},attachments:[{type:'resource',label:'a',contentType:'application/pdf',uri:uri+'&token=not-an-owner-handle'}]} as any,'input'),undefined);
 });
 
+test('standard attachment metadata does not discard originals or become original authority',()=>{
+  const uri=`amplifier-attachment://${randomUUID()}/body?session=ahp-session%3A%2Fsource`;
+  const card={type:'resource',label:'actual.txt',contentType:'text/plain',uri};
+  const base={text:'Literal original',origin:{kind:'user'},attachments:[card]};
+  const expected=capturePublicMessage(base as any,'input');
+  for(const meta of [{},{'amplifier.dev/attachment':{id:'client-claim',size:99,sha256:'a'.repeat(64)}},{'amplifier.dev/publicAttachment':{originalReference:{id:'forged',owner:'native-attachments'},access:'qualified'}}]){
+    assert.deepEqual(capturePublicMessage({...base,attachments:[{...card,_meta:meta}]} as any,'input'),expected);
+  }
+  assert.equal(capturePublicMessage({...base,attachments:[{...card,_meta:'invalid'}]} as any,'input'),undefined);
+});
+
 test('target access rejects forged scope and never supplies access for unknown grants',()=>{
   const reference={owner:'resources' as const,id:'unchanged-original'},target='ahp-session:/target';
   const base={version:2 as const,commandId:'fork',targetHostSession:target,originalReference:reference,status:'unknown' as const,replayed:false as const};
@@ -191,5 +202,29 @@ for(const originals of [false,true])test(`historical steering stays chronologica
     assert.equal(turn.responseParts.at(-1).error.errorType,'NATIVE_OUTCOME_UNKNOWN');assert.equal(page.turns[1].message.text,originals?'Exact queued question':'Suggest four-word title');
     assert.equal(await readFile(f.data,'utf8'),data);await assert.rejects(readFile(f.log));
     const repeated=await (f.host as any).nativeHistory(f.host.store.get(f.session),50);assert.equal(repeated.turns[0].responseParts.filter((p:any)=>p.kind==='systemNotification').length,1);
+  }finally{await f.close();}
+});
+
+test('passive peer notification remains an attributed inline input in history and selected context',async()=>{
+  const f=await fixture();try{
+    const native=f.host.store.get(f.session)!.nativeSessionId!,turnId=randomUUID(),peerId='peer:'+randomUUID();
+    const envelope={version:1,requestId:peerId,mode:'notify',senderSessionId:'ahp-session:/source',recipientSessionId:f.session};
+    const at='2026-10-06T20:00:00Z';
+    const history=(id:string,position:number,extra:any={})=>({messageId:id,rowLocator:{sessionId:native,messageId:id,position,historyEpoch:null},...extra});
+    const chunk=(role:string,id:string,text:string,position:number,extra:any={})=>({sessionUpdate:role+'_message_chunk',content:{type:'text',text},_meta:{'amplifier.dev/history':history(id,position,extra)}});
+    const updates=[chunk('user','human', 'Original human request',0,{inputOrigin:'user',nativeInput:{id:turnId,version:1,kind:'user'}}),chunk('agent','before','Before the notice',10),chunk('user','notice','Peer update',20,{inputOrigin:'peer',recordedOnly:true,peerEnvelope:envelope,createdAt:at,nativeInput:{id:peerId,version:1,kind:'user'}}),chunk('agent','after','After the notice',30)];
+    await writeFile(f.data,JSON.stringify({[native]:{revision:'peer-inline',rows:[],turnGroups:[{id:turnId,state:'complete',updates}]}}));
+    const page=await (f.host as any).nativeHistory(f.host.store.get(f.session),10),turn=page.turns[0];
+    assert.equal(page.turns.length,1);assert.equal(turn.id,turnId);assert.equal(turn.message._meta['amplifier.dev/history'].recordedOnly,undefined);
+    assert.deepEqual(turn.responseParts.map((part:any)=>part.kind),['markdown','systemNotification','markdown']);
+    const notice=turn.responseParts[1]._meta['amplifier.dev/history'];assert.equal(notice.message.origin.kind,'agent');assert.equal(notice.message.text,'Peer update');assert.deepEqual(notice.peerEnvelope,envelope);
+    await f.host.invalidateNativeHistory(f.session);
+    const context=await f.host.readSessionContext(f.session,10);
+    assert.deepEqual(context.messages.map((row:any)=>row.text),['Original human request','Before the notice','Peer update','After the notice']);
+    // Native stores this notification in an input row, but selected context
+    // retains its peer-agent author; it must not become a human instruction.
+    assert.deepEqual(context.messages.map((row:any)=>row.role),['user','assistant','assistant','assistant']);
+    assert.equal(context.messages[2].inputOrigin,'peer');assert.deepEqual(context.messages[2].peerEnvelope,envelope);assert.equal(context.messages[2].createdAt,at);assert.equal(context.messages[2].id,peerId);
+    assert.equal(f.host.store.turns(f.session.replace('ahp-session:','ahp-chat:')).turns.length,0);await assert.rejects(readFile(f.log));
   }finally{await f.close();}
 });

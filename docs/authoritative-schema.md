@@ -33,7 +33,14 @@ on small owned fault fixtures.
 
 `PRAGMA user_version` stores schema-admission version `0x41480100` plus fixed
 namespace bits (Store 1, quiescence 2, managed-files 4, retention 8, presentation
-16, managed-allocation 32). An initialized namespace requires all of its tables
+16, managed-allocation 32, durable library identity 64, scalar model usage 128). The identity bit is an
+additive Store schema epoch: an intact earlier marked Store migrates once using
+its canonical current directory hash, preserving the source used by its Catalog.
+A marked identity table or row cannot be lost and silently recreated. The usage
+bit adds `model_usage` once, backfills retained and edited-away call evidence,
+and prevents loss of that table from silently resetting budgets. Older
+Host versions reject this additional schema bit; use their retained backup rather
+than running them against the newer Host database. An initialized namespace requires all of its tables
 and expected column names/types. Unsupported versions refuse. Creation,
 recognized migrations, restart normalization and the marker commit in one SQLite
 savepoint. A failed first initialization cannot publish half a namespace.

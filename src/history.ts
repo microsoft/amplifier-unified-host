@@ -1,6 +1,55 @@
 import { createHash } from 'node:crypto';
 import type { Turn } from '@microsoft/agent-host-protocol';
 
+/** Concurrent calls from one recorded assistant message may start in any
+ * order. Match that batch exactly while preserving every text/input boundary
+ * and the order between different assistant messages. Child diagnostics are
+ * not part of the root transcript and remain in their observed positions.
+ */
+export function samePublicResponseOrder(canonical:any[],observed:any[],normalizeTool:(id:string)=>string):boolean {
+  const calls=canonical.filter(part=>part.kind==='toolCall');
+  const ids=calls.map(part=>String(part.toolCall.toolCallId));
+  if(new Set(ids).size!==ids.length)return false;
+  const batches=new Map(calls.map(part=>{
+    const id=String(part.toolCall.toolCallId),history=part._meta?.['amplifier.dev/history'];
+    return [id,typeof history?.messageId==='string'?'batch:'+history.messageId:'tool:'+id];
+  }));
+  const liveIds=observed.filter(part=>part.kind==='toolCall').map(part=>normalizeTool(String(part.toolCall.toolCallId))).filter(id=>batches.has(id));
+  if(liveIds.length!==ids.length||new Set(liveIds).size!==ids.length)return false;
+  const order=(parts:any[],live:boolean)=>{
+    const result:string[]=[];let text=0;
+    for(const part of parts){
+      let token:string|undefined;
+      if(part.kind==='markdown')token='text:'+text++;
+      else if(part.kind==='toolCall')token=batches.get(live?normalizeTool(String(part.toolCall.toolCallId)):String(part.toolCall.toolCallId));
+      else {const history=part._meta?.['amplifier.dev/history'],input=part._meta?.['amplifier.dev/steering']?.inputId??(history?.nativeInput?.kind==='steer'?history.nativeInput.id:undefined);if(input)token='input:'+input;}
+      if(token&&(token!==result.at(-1)||!token.startsWith('batch:')))result.push(token);
+    }
+    return result;
+  };
+  return JSON.stringify(order(canonical,false))===JSON.stringify(order(observed,true));
+}
+
+/** Add saved passive inputs between matched public parts without losing live
+ * provider recordings. Their order relative to public content is canonical;
+ * diagnostics retain their observed order within each public-content interval.
+ */
+export function retainPassiveInputs(canonical:any[],observed:any[],normalizeTool:(id:string)=>string):any[] {
+  const key=(part:any)=>part.kind==='toolCall'?'tool:'+normalizeTool(String(part.toolCall.toolCallId)):
+    part._meta?.['amplifier.dev/history']?.messageId?'message:'+part._meta['amplifier.dev/history'].messageId:undefined;
+  const result=[...observed];
+  for(let index=0;index<canonical.length;index++){
+    const part=canonical[index],history=part._meta?.['amplifier.dev/history'];
+    if(part.kind!=='systemNotification'||history?.inputOrigin!=='peer'||history.recordedOnly!==true||history.peerEnvelope?.mode!=='notify')continue;
+    const identity=key(part);if(!identity)throw new Error('Passive input lacks canonical identity');
+    if(result.some(row=>key(row)===identity))continue;
+    const following=canonical.slice(index+1).map(key).find(value=>value&&result.some(row=>key(row)===value));
+    const position=following?result.findIndex(row=>key(row)===following):result.length;
+    result.splice(position,0,part);
+  }
+  return result;
+}
+
 /** Exact shared IDs anchor two ordered sources; receipt payloads never decide canonical order. */
 export function mergeHistoryTurns(canonical:Turn[],live:Turn[]):Turn[] {
   const positions=new Map(live.map((turn,index)=>[turn.id,index]));
@@ -9,7 +58,7 @@ export function mergeHistoryTurns(canonical:Turn[],live:Turn[]):Turn[] {
     const position=positions.get(canonical[index].id);if(position===undefined)continue;
     if(position<liveStart)throw new Error('Native and host history ordering disagree; reconcile the canonical history boundary');
     if(position>liveStart&&index>nativeStart)throw new Error('Unindexed native and host rows share an ordering interval');
-    result.push(...live.slice(liveStart,position),...canonical.slice(nativeStart,index),live[position]);
+    result.push(...live.slice(liveStart,position),...canonical.slice(nativeStart,index),{...live[position],message:{...live[position].message,_meta:{...live[position].message._meta,...canonical[index].message._meta}}});
     nativeStart=index+1;liveStart=position+1;
   }
   if(nativeStart<canonical.length&&liveStart<live.length)throw new Error('Unindexed native and host rows share an ordering interval');

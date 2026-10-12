@@ -12,7 +12,7 @@ import { chatReducer,type ChatState,type StateAction } from '@microsoft/agent-ho
 import { createHost,MessageUnavailableError } from '../src/host.js';
 
 async function setup(options:any={}) {
-  const dir=await mkdtemp(join(tmpdir(),'ahp-host-'));const log=join(dir,'prompts.jsonl');
+  const dir=await realpath(await mkdtemp(join(tmpdir(),'ahp-host-')));const log=join(dir,'prompts.jsonl');
   const config={stateDirectory:join(dir,'state'),allowedWorkspaceRoots:[dir],engines:[{id:'fixture',label:'Fixture',command:process.execPath,args:[fileURLToPath(new URL('./agent.mjs',import.meta.url))],env:{FIXTURE_LOG:log}}],...options};
   const host=await createHost(config);const clients:AhpClient[]=[];
   async function connect(id=randomUUID()) {const transport=await WebSocketTransport.connect(host.url);const client=new AhpClient(transport);client.connect();await client.initialize({clientId:id,protocolVersions:['0.9.0'],initialSubscriptions:['ahp-root://']});clients.push(client);return client;}
@@ -21,6 +21,48 @@ async function setup(options:any={}) {
   return {dir,log,config,host,clients,connect,create,cleanup};
 }
 function action(text:string,turnId=randomUUID()):any{return {type:'chat/turnStarted',turnId,startedAt:new Date().toISOString(),message:{text,origin:{kind:'user'}}};}
+
+test('declared ephemeral observations require the authenticated selected UI and never acquire durable receipts',async()=>{
+ let calls=0;const capability={manifest:{version:1,topics:{observed:{uri:'amplifier-capability://observed',version:1}},actions:{'observed.frame':{topic:'observed',operation:'observed.frame',method:'x-amplifier/capabilityAction'}}},quiescenceAccess:{'observed.frame':'read'},ephemeralActions:{'observed.frame':true},read:async()=>({}),action:async()=>{calls++;return {accepted:true,result:{sequence:calls}}}};
+ const f=await setup({capabilities:capability});try{
+  const client=await f.connect('viewer'),one=await f.create(client),two=await f.create(client);await client.subscribe(one.session);
+  const commandId=randomUUID(),request={version:1,topic:'observed',operation:'observed.frame',channel:one.session,commandId,args:{}};
+  await client.request('x-amplifier/capabilityAction',request);
+  assert.equal(calls,1);assert.equal(f.host.store.receipt(commandId),undefined);
+  for(const actor of [{actorId:'agent',clientId:'viewer',origin:'agent' as const},{actorId:'other',clientId:'other',origin:'ui' as const}])await assert.rejects(f.host.invokeCapability({...request,commandId:randomUUID()},actor),/authenticated selected browser/);
+  await assert.rejects(f.host.invokeCapability({...request,channel:two.session},{actorId:'viewer',clientId:'viewer',origin:'ui'}),/authenticated selected browser/);
+  assert.equal(calls,1);
+ }finally{await f.cleanup();}
+});
+
+test('saved output origin checks exact indexed public parts without starting another turn',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),two=await f.create(client),turnId=randomUUID();
+  await f.host.submitTurn(one.session,{commandId:turnId,text:'writing origin',clientId:'output-test'});await f.host.waitForTurn(one.session,turnId);
+  const row=f.host.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(one.chat,turnId),turn=JSON.parse(String(row!.payload));
+  const index=turn.responseParts.findIndex((p:any)=>p.kind==='markdown'),part=turn.responseParts[index],id=part.id||`${turnId}:markdown:${index}`;
+  assert.equal(await f.host.verifyOutputMessage(one.session,id,turnId),true);
+  assert.equal((await f.host.verifyMediaMessage(one.session,id,turnId)).messageId,id);
+  const discovered=await f.host.readSavedAssistantMessages(one.session);
+  assert.equal(discovered.messages.at(-1)!.messageId,id);assert.equal(discovered.messages.at(-1)!.messageTurnId,turnId);
+  assert.equal(discovered.execution,false);assert.equal((await f.host.readSavedAssistantMessages(two.session)).messages.length,0);
+  await assert.rejects(f.host.verifyMediaMessage(one.session,turnId+':input',turnId),/saved assistant/);
+  await assert.rejects(f.host.verifyMediaMessage(two.session,id,turnId),/saved assistant/);
+  turn.responseParts[index]._meta={'amplifier.dev/observation':{source:'test'}};
+  f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
+  await assert.rejects(f.host.verifyMediaMessage(one.session,id,turnId),/unavailable or ambiguous/);
+  assert.equal((await f.host.readSavedAssistantMessages(one.session)).messages.length,0);
+  delete turn.responseParts[index]._meta;
+  turn.state='cancelled';f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
+  await assert.rejects(f.host.verifyMediaMessage(one.session,id,turnId),/saved assistant/);
+  assert.equal((await f.host.readSavedAssistantMessages(one.session)).messages.length,0);
+  turn.state='complete';f.host.store.db.prepare('UPDATE turns SET payload=? WHERE chat=? AND turn_id=?').run(JSON.stringify(turn),one.chat,turnId);
+
+  assert.equal(await f.host.verifyOutputMessage(one.session,'invented',turnId),false);
+  assert.equal(await f.host.verifyOutputMessage(two.session,id,turnId),false);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});
 async function waitFor(predicate:()=>unknown,timeout=5000){const deadline=Date.now()+timeout;while(Date.now()<deadline){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,10));}throw new Error('Timed out');}
 
 test('scoped capability submission uses ordinary admission and observers cannot widen unrelated histories',async()=>{
@@ -123,6 +165,37 @@ test('origin and Host authority resist DNS rebinding; external workspace and for
     const {chat}=await f.create(a);await a.subscribe(chat,{view:{turns:1}});
     a.dispatch(chat,{type:'chat/turnComplete',turnId:'forged',duration:0} as any);await new Promise(resolve=>setTimeout(resolve,30));
     assert.equal(f.host.store.turns(chat).turns.length,0);
+  }finally{await f.cleanup();}
+});
+
+test('catalog navigation reads persisted summaries without hydrating chat bodies or active events',async()=>{
+  const rows:any[]=[];
+  const f=await setup({catalog:{list:async({limit}:any)=>({items:rows.slice(0,limit)}),get:async(uri:string)=>rows.find(row=>row.uri===uri),upsert:async()=>{}}});
+  try {
+    const client=await f.connect(),timestamp='2026-01-01T00:00:00.000Z';
+    for(let i=0;i<3;i++){
+      const uri='ahp-session:/metadata-'+i,chat=uri.replace('ahp-session:','ahp-chat:');
+      rows.push({uri,engineId:'fixture',workingDirectory:f.dir,title:'Catalog '+i,createdAt:timestamp,modifiedAt:timestamp});
+      if(i===2)continue;
+      const summary={resource:uri,provider:'fixture',title:'Saved '+i,status:1,createdAt:timestamp,modifiedAt:'2026-01-02T00:00:00.000Z',workingDirectories:[pathToFileURL(f.dir).href]};
+      f.host.store.save({uri,engineId:'fixture',workingDirectory:f.dir,summary,state:{} as any,chat:{resource:chat,turns:[]} as any});
+      // Navigation must remain usable even when execution bodies require recovery.
+      f.host.store.db.prepare('UPDATE sessions SET chat=?,state=? WHERE uri=?').run('unreadable chat','unreadable execution state',uri);
+      f.host.store.db.prepare('INSERT INTO active_events(channel,action) VALUES(?,?)').run(chat,'unreadable active event');
+      assert.deepEqual(f.host.store.summary(chat),summary);
+    }
+    const before=f.host.store.db.prepare('SELECT uri,chat,state FROM sessions ORDER BY uri').all();
+    const events=f.host.store.db.prepare('SELECT * FROM active_events ORDER BY seq').all();
+    const page=await client.request('listSessions',{channel:'ahp-root://',limit:2});
+    assert.deepEqual(page.items.map((row:any)=>row.title),['Saved 0','Saved 1']);
+    assert.ok(page.items.every((row:any)=>row.modifiedAt==='2026-01-02T00:00:00.000Z'));
+    const all=await client.request('listSessions',{channel:'ahp-root://',limit:3});
+    assert.equal(all.items[2].title,'Catalog 2');
+    assert.equal(f.host.store.summary('ahp-session:/missing'),undefined);
+    assert.deepEqual(f.host.store.db.prepare('SELECT uri,chat,state FROM sessions ORDER BY uri').all(),before);
+    assert.deepEqual(f.host.store.db.prepare('SELECT * FROM active_events ORDER BY seq').all(),events);
+    assert.equal(f.host.diagnostics().activeAgents,0);
+    await assert.rejects(readFile(f.log,'utf8'));
   }finally{await f.cleanup();}
 });
 
@@ -238,8 +311,11 @@ test('scheduled admission compares durable revisions, shares stop lifecycle, and
 test('source-config creation shares durable creation and rejects changed or uncertain reuse',async()=>{
  const f=await setup();try{
   const client=await f.connect(),{session}=await f.create(client),before=await f.host.inspectSession(session);
-  const input={commandId:randomUUID(),idempotencyKey:'scheduled-once',sourceSession:session,expectedConfigurationHash:before.configurationHash,title:'Created task'};
+  assert.equal(f.host.store.navigation.projection(session,0).agentCreated,false);
+  await assert.rejects(f.host.createSession({commandId:randomUUID(),idempotencyKey:'bad-provenance',sourceSession:session,expectedConfigurationHash:before.configurationHash,creation:{creatorSessionId:'other',requestId:'r'}}),/Creation source differs/);
+  const input={commandId:randomUUID(),idempotencyKey:'scheduled-once',sourceSession:session,expectedConfigurationHash:before.configurationHash,title:'Created task',creation:{creatorSessionId:session,requestId:'r'}};
   const created=await f.host.createSession(input);assert.equal(created.creationConfirmed,true);assert.equal((await f.host.inspectSession(created.uri)).title,'Created task');
+  assert.equal(f.host.store.navigation.projection(created.uri,0).agentCreated,true);
   assert.equal((await f.host.createSession(input)).uri,created.uri);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
   await assert.rejects(f.host.createSession({...input,title:'different'}),/reused/);
   await client.subscribe(session);client.dispatch(session,{type:'session/configChanged',config:{mode:'fast'}});
@@ -280,7 +356,8 @@ test('independent ACP metadata, legacy modes, usage and raw input replacements p
  const f=await setup();try{
   f.config.engines[0].env.FIXTURE_LEGACY='1';
   const client=await f.connect(),{session,chat}=await f.create(client);await client.subscribe(session);await client.subscribe(chat,{view:{turns:10}});
-  await waitFor(()=>f.host.store.get(session)?.state.title==='Idle peer title');
+  // Drain through the final ordered metadata update, not just the preceding title.
+  await waitFor(()=>f.host.store.get(session)?.state.title==='Idle peer title'&&f.host.store.get(session)?.state.config?.values?.mode==='fast');
   let state=f.host.store.get(session)!.state,meta=state._meta!['amplifier.dev/acp'] as any;
   assert.equal(meta.availableCommands[0].name,'inspect');assert.deepEqual(meta.usage.cost,{amount:0.12,currency:'USD'});assert.equal(meta.usage.used,123);assert.equal(meta.sessionInfo.updatedAt,'2026-10-02T00:00:00Z');assert.equal(state.config?.values?.mode,'fast');
   client.dispatch(session,{type:'session/configChanged',config:{mode:'safe'}});await waitFor(()=>f.host.store.get(session)?.state.config?.values?.mode==='safe');
@@ -487,6 +564,25 @@ test('Recall inventories stay cold and pages retain exact messages, scoped curso
  }finally{if(reader)await reader.close();await f.cleanup();}
 });
 
+test('retained historical source lookup stays passive, bounded and separate from human admission',async()=>{
+ const f=await setup();let reader:any;try{
+  const dir=await realpath(f.dir),history=join(dir,'retained.json'),timestamp=new Date().toISOString();
+  const groups=Array.from({length:51},(_,i)=>({id:'old-'+i,state:'complete',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:'historical '+i},_meta:{'amplifier.dev/history':{messageId:'old-'+i,nativeInput:{version:1,kind:'user',id:'old-'+i},createdAt:timestamp}}}]}));
+  await writeFile(history,JSON.stringify(groups));
+  const record={uri:'ahp-session:/retained',engineId:'fixture',nativeSessionId:'native-retained',workingDirectory:dir,title:'Retained',kind:'root',workspaceAvailability:'present',createdAt:timestamp,modifiedAt:timestamp};
+  reader=await createHost({...f.config,stateDirectory:join(dir,'retained-state'),engines:f.config.engines.map((e:any)=>({...e,env:{...e.env,FIXTURE_HISTORY:history}})),catalog:{get:async(id:string)=>id===record.uri?record:undefined,upsert:async()=>{},list:async()=>({items:[record]})}});
+  const row=await reader.readHistoricalMessage(record.uri,'old-50');
+  assert.equal(row.text,'historical 50');assert.equal(row.role,'user');assert.equal(row._meta['amplifier.dev/history'].authorization,'unverified-native-history');
+  assert.deepEqual(row.provenance,{source:'host-projection',complete:true});assert.equal(row._meta['amplifier.dev/history'].nativeInput.id,'old-50');
+  await assert.rejects(reader.readUserMessage(record.uri,'old-50'),(e:any)=>e.reason==='not-indexed');
+  await assert.rejects(reader.readHistoricalMessage(record.uri,'old-0'),(e:any)=>e.data.reason==='outside-window');
+  await assert.rejects(reader.readHistoricalMessage(record.uri,'absent'),(e:any)=>e.data.reason==='outside-window');
+  await writeFile(history,JSON.stringify([{...groups[50],updates:[{...groups[50]!.updates[0],content:{type:'text',text:'x'.repeat(65536)}}]}]));
+  await assert.rejects(reader.readHistoricalMessage(record.uri,'old-50'),/complete-source byte bound/);
+  assert.equal(reader.diagnostics().activeAgents,0);await assert.rejects(readFile(f.log,'utf8'));
+ }finally{if(reader)await reader.close();await f.cleanup();}
+});
+
 test('question answers use settled common admission, preserve provenance and refuse busy or uncertain replay',async()=>{
  const f=await setup();try{
   const client=await f.connect(),{session}=await f.create(client),question={commandId:randomUUID(),text:'Use the blue option',questionId:'q-1',questionRevision:4,answerProvenance:{actor:'user',sourceMessageId:'answer-1',revision:7}};
@@ -613,10 +709,12 @@ test('standard steering stays in its active turn, with durable receipts and no s
   const request=JSON.parse((await readFile(f.log+'.steering','utf8')).trim());assert.equal(request.activeInputId,initial.turnId);assert.equal(request.inputId,'next-boundary');
   assert.equal((await f.host.readUserMessage(session,'next-boundary')).text,'Correct path');
   assert.ok((await f.host.readSessionContext(session,5)).messages.some(row=>row.id==='next-boundary'&&row.delivery==='steering'));
+  assert.deepEqual((await f.host.inspectOutputInputEpoch(session)).inputIds,[initial.turnId,'next-boundary']);
   await assert.rejects(f.host.updatePendingQueue(session,pending('next-boundary','duplicate'),{clientId:'owner'}),/already consumed/);
   await assert.rejects(f.host.updatePendingQueue(session,{type:'chat/pendingMessageRemoved',kind:'steering',id:'next-boundary'} as any,{clientId:'owner'}),/cannot be retracted/);
   await assert.rejects(f.host.nativeControl(session,'steer',{text:'bypass'}),/updatePendingQueue/);
   assert.equal((await f.host.waitForTurn(session,initial.turnId)).completed,true);
+  assert.deepEqual((await f.host.inspectOutputInputEpoch(session)).inputIds,[]);
   assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);assert.equal(f.host.store.turns(chat).turns.length,1);
   assert.ok(seen.some(event=>event.action.type==='chat/pendingMessageRemoved'&&event.action.id==='next-boundary'));assert.equal(f.host.store.get(session)?.chat.steeringMessage,undefined);
  }finally{await f.cleanup();}
@@ -746,6 +844,20 @@ test('lost native fork acknowledgement fences source and reserved identity until
  }finally{await f.cleanup();}
 });
 
+test('output owner failure reconciles the confirmed original fork without creating another native copy',async()=>{
+ let reject=true,calls=0;const received:any[]=[];
+ const f=await setup({outputFork:{references:async()=>[{key:'saved-output',origin:{messageId:'native:message'}}],commit:async(input:any)=>{calls++;received.push(input);if(reject)throw Error('Fixture output owner unavailable');return {copied:1,workReplayed:false};}}});try{
+  const client=await f.connect(),{session}=await f.create(client),commandId=randomUUID(),args={commandId,expectedHistoryRevision:'fixture-history'};
+  await assert.rejects(f.host.forkSession(session,args),/output owner unavailable/);
+  const row=f.host.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(commandId)!;assert.equal(row.status,'unknown');
+  assert.equal(received[0].source,session);assert.equal(received[0].target,row.target);assert.equal(received[0].proof.items[0].key,'saved-output');
+  await assert.rejects(f.host.forkSession(session,args),/without replay/);reject=false;
+  const recovered=await f.host.inspectSessionLifecycleReceipt(session,commandId);assert.equal(recovered.status,'completed');assert.equal(recovered.result.outputs.copied,1);assert.ok(calls>=2);
+  const receipts=JSON.parse(await readFile(f.log+'.lifecycle','utf8'));assert.equal(Object.keys(receipts).length,1);assert.equal(recovered.result.uri,row.target);
+  await assert.rejects(readFile(f.log,'utf8'));assert.equal(f.host.diagnostics().activeAgents,0);
+ }finally{await f.cleanup();}
+});
+
 test('committed attachment references resolve only on execution and never inflate retained history',async()=>{
  const calls:any[]=[],f=await setup({resolvePromptAttachment:async(context:any,attachment:any)=>{calls.push({context,attachment});if(attachment.uri.includes('too-large'))return [{type:'text',text:'x'.repeat(8*1024*1024)}];return [{type:'resource_link',uri:'file:///owned-immutable/blob',name:attachment.label,mimeType:attachment.contentType}];}});try{
   const a=await f.connect(),{session,chat}=await f.create(a),ref={type:'resource',uri:'amplifier-attachment://owned/body?session='+encodeURIComponent(session),label:'Report.pdf',contentType:'application/pdf'} as any;
@@ -799,7 +911,7 @@ test('mixed canonical voice and live receipts use one bounded shared window and 
     await a.unsubscribe(chat);await b.unsubscribe(chat);await waitFor(()=>!(f.host as any).hasSubscribers(chat));
     const reset=(await a.subscribe(chat,{view:{turns:2}})).result.snapshot!.state as ChatState;assert.equal(reset.turns.length,2);assert.ok(reset.turnsNextCursor);
     const context=await f.host.readSessionContext(session,3);assert.ok(context.messages.some(row=>row.text==='spoken between chats'));assert.ok(context.messages.findIndex(row=>row.text==='before voice')<context.messages.findIndex(row=>row.text==='spoken between chats'));
-    const full=(await a.subscribe(chat)).result.snapshot!.state as ChatState;assert.equal(full.turns.length,61);assert.equal(full.turnsNextCursor,undefined);
+    const full=(await a.subscribe(chat)).result.snapshot!.state as ChatState;assert.equal(full.turns.length,50);assert.ok(full.turnsNextCursor);
   }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
 });
 
@@ -813,6 +925,11 @@ test('native mixed window refuses an unindexed ordering gap without scanning all
     const record=f.host.store.get(session)!;record.chat._meta={'amplifier.dev/history':{source:'native'}};f.host.store.save(record);
     await assert.rejects(client.subscribe(chat,{view:{turns:2}}),(error:any)=>error.code===-32013&&error.data?.reason==='unindexed-ordering-boundary');
     assert.equal((await readFile(log+'.passive','utf8')).trim(),'page');assert.equal(f.host.store.receipt(input.turnId)?.status,'completed');assert.equal(f.host.store.turns(chat).turns.length,1);
+    const context=await f.host.readSessionContext(session,2);
+    assert.deepEqual(context.historyContext,{source:'native',complete:false,reason:'unindexed-ordering-boundary'});
+    assert.deepEqual(context.messages.map(row=>row.text),['voice 4998','voice 4999']);
+    assert.equal(f.host.store.turns(chat).turns.length,1,'context reads do not rebaseline or widen shared history');
+    assert.equal((await readFile(log+'.passive','utf8')).trim().split('\n').length,3,'only bounded pages are read');
   }finally{await f.cleanup();await rm(dir,{recursive:true,force:true});}
 });
 
@@ -928,4 +1045,40 @@ test('older catalog without reconcileFamily retains fresh indexed proof only',as
  const f=await setup({catalog});try{
   const client=await f.connect(),root=await f.create(client);stale=true;await assert.rejects(f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'}),/coverage/);stale=false;assert.equal((await f.host.forkSession(root.session,{commandId:randomUUID(),expectedHistoryRevision:'fixture-history',mode:'recovery'})).workReplayed,false);
  }finally{await f.cleanup();}
+});
+
+
+test('guarded peer inputs use exact recipient revisions and cannot become human authority',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),{session}=await f.create(client),before=await f.host.inspectSession(session),commandId=randomUUID();
+  const input={commandId,grantId:'human-scope',text:'Saved peer request',peerEnvelope:{requestId:commandId,grantId:'human-scope',mode:'queue',senderSessionId:'source',recipientSessionId:session},taskId:null,taskRevision:null,expectedExecutionRevision:before.executionRevision,expectedInterruptionRevision:before.interruptionRevision,expectedConfigurationHash:before.configurationHash,expectedNativeSessionId:before.nativeSessionId!,expectedNativeLocationRevision:before.nativeLocationRevision};
+  await assert.rejects(f.host.submitPeer(session,{...input,expectedNativeSessionId:'moved'}),/identity or location changed/);
+  assert.equal((await f.host.submitPeer(session,input)).accepted,true);assert.equal((await f.host.waitForTurn(session,commandId)).status,'completed');
+  const wire=JSON.parse((await readFile(f.log,'utf8')).trim());assert.equal(wire.operation,'peer.submit');assert.equal(wire.args.inputId,commandId);assert.equal(wire.args.text,undefined);assert.equal(wire.args.peerEnvelope,undefined);
+  const context=await f.host.readSessionContext(session,2);assert.equal(context.messages[0].inputOrigin,'peer');await assert.rejects(f.host.readUserMessage(session,commandId),(e:any)=>e.reason==='not-user');
+  await assert.rejects(f.host.submitPeer(session,input),/already admitted/);
+  await assert.rejects(f.host.nativeControl(session,'peer.submit',{}),/submitPeer admission/);await assert.rejects(f.host.nativeControl(session,'peer.steer',{}),/submitPeerSteering admission/);
+  const current=await f.host.inspectSession(session);assert.equal(current.peerAdmission,undefined);
+  const refused=randomUUID();await f.host.submitPeer(session,{...input,commandId:refused,peerEnvelope:{...input.peerEnvelope,requestId:refused},taskRevision:99,expectedExecutionRevision:current.executionRevision});
+  assert.equal((await f.host.waitForTurn(session,refused)).status,'failed');assert.equal(f.host.store.turns(session.replace('ahp-session:','ahp-chat:')).turns.length,1);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});
+
+
+test('active export requires exact peer snapshot support and never interrupts old or malformed peers',async()=>{
+ for(const details of [undefined,{version:1},{version:1,activeSnapshot:{version:1,canonicalOnly:true,executionUnchanged:false}},{version:1,activeSnapshot:{version:2,canonicalOnly:true,executionUnchanged:true}}]){
+  const f=await setup();try{
+   if(details)(f.config.engines[0].env as any).FIXTURE_EXPORT_DETAILS=JSON.stringify(details);
+   const client=await f.connect(),{session}=await f.create(client);
+   await f.host.submitTurn(session,{commandId:'active-export-guard',text:'slow',clientId:'reviewer'});
+   const before=await f.host.inspectSession(session);
+   await assert.rejects(f.host.exportSession(session,{commandId:'export-not-admitted',expectedHistoryRevision:'fixture-history',format:'markdown'}),/active work/);
+   const during=await f.host.inspectSession(session);
+   assert.equal(during.activeTurnId,'active-export-guard');assert.equal(during.interruptionRevision,before.interruptionRevision);
+   assert.equal(f.host.store.receipt('export-not-admitted'),undefined);
+   assert.equal(f.host.store.db.prepare('SELECT 1 FROM lifecycle_commands WHERE command_id=?').get('export-not-admitted'),undefined);
+   await f.host.waitForTurn(session,'active-export-guard');
+  }finally{await f.cleanup();}
+ }
 });

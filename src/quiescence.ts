@@ -52,13 +52,15 @@ export interface AdmissionAbortProof extends AdmissionAbortBinding {kind:'distri
 export interface AdmissionAbortOwnerReceipt extends AdmissionAbortBinding {ownerId:string;status:'released'|'not-acquired';receiptId:string;}
 export interface HostAdmissionAbortReceipt extends AdmissionAbortBinding {schema:'host-admission-abort-v1';status:'aborted';intakeClosed:false;receiptId:string;owners:AdmissionAbortOwnerReceipt[];}
 interface AdmissionAbortAttempt {kind:'admission-abort-v1';requestSignature:string;proofSignature:string;context:QuiescenceFence;proof:AdmissionAbortProof;owners:AdmissionAbortOwnerReceipt[];result?:HostAdmissionAbortReceipt;}
-export interface QuiescenceLease {ownerId:string;fenceId:string;release:(outcome:QuiescenceOutcome,proof?:QuiescenceProof|{kind:'admission-refused'})=>Promise<void>;}
+export interface QuiescenceLease {inspectRetentionReferences?:(input:{sessions:string[];limit:number})=>Promise<any>;ownerId:string;fenceId:string;release:(outcome:QuiescenceOutcome,proof?:QuiescenceProof|{kind:'admission-refused'})=>Promise<void>;}
 export interface QuiescenceParticipant {
  id:string;
  /** Declares full persisted service identity and service-specific release proof support. */
  serviceStop?:{version:1};
  /** Supports persisted retention-purpose identity and exact selected-item release evidence. */
  retentionHide?:{version:1};
+ /** Read-only selected references under an already held recovery fence. */
+ recoveryReferences?:{version:1};
  /** Atomically closes this owner's intake; null is a proven no-effect busy refusal. */
  acquire:(context:Readonly<QuiescenceContext>)=>Promise<QuiescenceLease|null>;
  /** Exact persisted owner fence reconciliation after process/supervisor replacement. */
@@ -74,7 +76,7 @@ export interface QuiescenceConfig {
  coverage:{capabilities?:Record<string,string>;resources?:Record<string,string>;nativeHost?:string;nativeHostOwners?:string[]};
  participants:QuiescenceParticipant[];
  /** Reads authenticated supervisor receipts; caller assertions never count as proof. */
- verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';evidence:unknown})=>Promise<QuiescenceProof>;
+ verifyRelease:(request:Readonly<QuiescenceContext>&{outcome:'ready'|'unchanged';evidence:unknown})=>Promise<QuiescenceProof&{participantProof?:QuiescenceProof}>;
  /** Distinct supervisor authority proving pre-retirement admission abort, not a running/release assertion. */
  verifyAdmissionAbort?:(request:Readonly<QuiescenceContext>&{evidence?:unknown})=>Promise<AdmissionAbortProof>;
  serviceLifecycle?:ServiceLifecycleConfig;
@@ -99,6 +101,7 @@ export class QuiescenceGate {
  private calls=0;
  private continuations=0;
  private maintenance=0;
+ private settlement=0;
  private leases=new Map<string,QuiescenceLease>();
  private changing=false;
  // A timeout is not cancellation: late owner work must settle before an abort can be admitted.
@@ -149,7 +152,7 @@ export class QuiescenceGate {
  private result(commandId:string,result:unknown){this.db.prepare('UPDATE host_quiescence_commands SET payload=? WHERE command_id=?').run(JSON.stringify(result),commandId);}
  private bindResult(fence:QuiescenceFence,result:any){return fence.purpose==='service-stop'?{...result,purpose:'service-stop',expected:fence.serviceIdentity}:fence.purpose==='initial-start'?{...result,purpose:'initial-start',expected:fence.serviceIdentity,fenceId:fence.fenceId,commandId:fence.commandId}:result;}
  private clear(fence:QuiescenceFence,result:unknown){this.db.exec('BEGIN IMMEDIATE');try{this.result(fence.commandId,this.bindResult(fence,result));this.db.prepare('DELETE FROM host_quiescence_fence WHERE id=1').run();this.db.exec('COMMIT');}catch(e){this.db.exec('ROLLBACK');throw e;}}
- inspect(){return {enabled:!!this.config,intakeClosed:!!this.fence(),fence:this.fence(),activeAdmissions:this.calls,continuations:this.continuations,activeMaintenance:this.maintenance};}
+ inspect(){return {enabled:!!this.config,intakeClosed:!!this.fence(),fence:this.fence(),activeAdmissions:this.calls,continuations:this.continuations,activeMaintenance:this.maintenance,activeSettlement:this.settlement};}
  receipt(commandId:string){token(commandId,'command identity');const row=this.db.prepare('SELECT payload FROM host_quiescence_commands WHERE command_id=?').get(commandId);return row?JSON.parse(String(row.payload)):undefined;}
  /** The scope expires with the outer call; detached promises cannot inherit an open gate forever. */
  async run<T>(work:()=>Promise<T>):Promise<T>{
@@ -173,6 +176,37 @@ export class QuiescenceGate {
   this.maintenance++;
   try{return await this.scope.run({active:false},work);}catch(error){this.unknown(fence,'maintenance-effect-outcome-unknown');throw error;}finally{this.maintenance--;}
  }
+ /** Trusted metadata settlement only, including after a process replacement.
+  * Each metadata owner must verify its own retained fence. This neither
+  * reacquires leases nor provides ordinary or native execution authority. */
+ async settle<T>(input:{fenceId:string;commandId:string},work:()=>Promise<T>):Promise<T>{
+  const fence=this.fence();
+  if(!fence||fence.purpose!=='recovery'||!['held','unknown'].includes(fence.phase)||fence.admissionStage!=='held'||fence.dataScope!==this.config?.dataScope||fence.fenceId!==input.fenceId||fence.commandId!==input.commandId||this.changing||this.pending.size||this.maintenance||this.calls||this.continuations)throw new QuiescenceError('Original completed recovery admission is required for metadata settlement',{executed:false});
+  this.maintenance++;this.settlement++;
+  try{return await this.scope.run({active:false},work);}finally{this.settlement--;this.maintenance--;}
+ }
+ /** Uses original live leases only. Exclusions are trusted composed canonical
+  * authorities whose references are inspected separately by their owner. */
+ async inspectRecoveryReferences(sessions:string[],input:QuiescenceContext,excludedOwners:string[]=[]){
+  const requireHeld=()=>{const f=this.fence();if(!f||f.phase!=='held'||f.purpose!=='recovery'||this.maintenance!==1||this.changing||this.settlement||['fenceId','commandId','instanceId','dataScope','purpose'].some(k=>(f as any)[k]!==(input as any)[k]))throw Error('Exact live recovery reference hold required');return f;};
+  const fence=requireHeld();
+  if(!Array.isArray(sessions)||sessions.length>1000||new Set(sessions).size!==sessions.length||sessions.some(s=>typeof s!=='string'||!/^ahp-session:\/[^\s\x00-\x1f]{1,480}$/.test(s))||!Array.isArray(excludedOwners)||new Set(excludedOwners).size!==excludedOwners.length||excludedOwners.some(id=>!fence.owners.includes(id)))throw Error('Bounded explicit history reference selection required');
+  const results=[];
+  for(const id of fence.owners){
+   requireHeld();if(excludedOwners.includes(id))continue;
+   const participant=this.config?.participants.find(p=>p.id===id),lease=this.leases.get(id);
+   if(participant?.recoveryReferences?.version!==1||!lease?.inspectRetentionReferences)throw Error('Held reference coverage unavailable: '+id);
+   // Empty mappings contain only unindexed Native histories; no product session
+   // can reference them. Owner support and live ownership still remain required.
+   for(let offset=0;offset<sessions.length;offset+=101){
+    const refs=await this.deadline(lease.inspectRetentionReferences({sessions:sessions.slice(offset,offset+101),limit:101}));
+    requireHeld();
+    if(!refs||refs.coverage!=='complete'||!Array.isArray(refs.protected)||!Array.isArray(refs.omissions)||refs.protected.length||refs.omissions.length)throw Error('Saved work or incomplete references protect history: '+id);
+   }
+   results.push(id);
+  }
+  return {coverage:'all-configured-owners-held',owners:results.sort(),canonicalOwners:[...excludedOwners].sort()};
+ }
  workChanged(){this.maybeIdle();}
  /** End observations of this local lifetime without treating process shutdown as drained work. */
  hostClosing(){this.closing=true;const fence=this.fence();if(fence?.admissionModel==='shared-service-v1'&&fence.phase==='closed')this.unknown(fence,'host-closing');this.drainWake?.();}
@@ -187,6 +221,14 @@ export class QuiescenceGate {
  async admit(input:{commandId:string;purpose:Exclude<QuiescencePurpose,'service-stop'|'initial-start'|'retention-hide'>;retryRefused?:boolean}) {
   if(['service-stop','initial-start'].includes(input.purpose as string))throw new QuiescenceError('Service stop requires its identity-bound admission API',{executed:false});
   return this.admitBound(input);
+ }
+ /** Explicit offline backup/handoff preparation. Ordinary shutdown never uses
+  * this stronger owner-exclusion path. The retained identity-bound participant
+  * protocol supplies real capture coverage, not a census inferred from exit. */
+ async admitMaintenanceServiceStop(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
+  const expected=identity(input.expected),configured=this.config?.serviceLifecycle;
+  if(!configured||!sameIdentity(expected,configured.identity))throw new QuiescenceError('Maintenance stop requires the exact configured running service identity',{executed:false});
+  return this.admitBound({commandId:input.commandId,purpose:'service-stop',serviceIdentity:expected});
  }
  async admitServiceStop(input:ServiceStopRequest):Promise<ServiceStopReceipt>{
   const closed=await this.closeServiceIntake(input);
@@ -430,11 +472,23 @@ export class QuiescenceGate {
    const proof=await this.deadline(this.config.verifyRelease({...fence,outcome:input.outcome,evidence:input.evidence}));
    if(!proof||proof.verified!==true||proof.fenceId!==fence.fenceId||proof.commandId!==fence.commandId||proof.outcome!==input.outcome||proof.dataScope!==fence.dataScope||proof.dataScope!==this.config.dataScope||proof.instanceId!==this.config.instanceId||(input.outcome==='ready'?proof.instanceId===fence.instanceId:proof.instanceId!==fence.instanceId))throw Error('Supervisor proof does not bind the exact fence, outcome and running instance');
    token(proof.receiptId,'supervisor receipt');
+   // A replacement may authenticate today's Host generation while settling the
+   // original owner release. Pin that owner proof before the first callback so
+   // lost acknowledgements keep identical arguments across further restarts.
+   const participantProof=proof.participantProof??proof;
+   if(proof.participantProof&&fence.purpose!=='recovery')throw Error('Participant continuation is limited to authenticated recovery settlement');
+   if(fence.purpose==='recovery'){
+    if((proof.participantProof&&Object.keys(participantProof).sort().join(',')!=='commandId,dataScope,fenceId,instanceId,outcome,receiptId,verified')||participantProof.verified!==true||participantProof.fenceId!==fence.fenceId||participantProof.commandId!==fence.commandId||participantProof.dataScope!==fence.dataScope||participantProof.receiptId!==proof.receiptId||!['unchanged','ready'].includes(participantProof.outcome)||((participantProof.instanceId===fence.instanceId)!==(participantProof.outcome==='unchanged')))throw Error('Exact original recovery participant proof required');
+    token(participantProof.instanceId,'participant generation');
+    const saved=this.db.prepare("SELECT payload FROM host_quiescence_attempts WHERE command_id=? AND json_extract(payload,'$.kind')='recovery-release-v1' ORDER BY id DESC LIMIT 1").get(fence.commandId);
+    if(saved){const prior=JSON.parse(String(saved.payload));if(prior.fenceId!==fence.fenceId||canonical(prior.proof)!==canonical(participantProof))throw Error('Recovery participant proof differs from its original release');}
+    else this.db.prepare('INSERT INTO host_quiescence_attempts(command_id,payload) VALUES(?,?)').run(fence.commandId,JSON.stringify({kind:'recovery-release-v1',fenceId:fence.fenceId,proof:participantProof}));
+   }
    fence.phase='releasing';this.save(fence);
    for(const owner of [...fence.owners].reverse()){
     const lease=this.leases.get(owner),participant=this.config.participants.find(p=>p.id===owner);
-    if(lease)await this.deadline(lease.release(input.outcome,proof));
-    else if(participant?.reconcileRelease)await this.deadline(participant.reconcileRelease({...fence,outcome:input.outcome,proof}));
+    if(lease)await this.deadline(lease.release(participantProof.outcome,participantProof));
+    else if(participant?.reconcileRelease)await this.deadline(participant.reconcileRelease({...fence,outcome:participantProof.outcome,proof:participantProof}));
     else throw Error('Participant recovery release is unavailable:'+owner);
     this.leases.delete(owner);
    }

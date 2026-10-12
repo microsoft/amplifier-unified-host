@@ -94,3 +94,47 @@ test('cold native selected history publishes negotiated message grants without m
   const session=(await client.subscribe(f.session)).result.snapshot!.state as any;assert.deepEqual(session._meta['amplifier.dev/acp'].capabilities._meta['amplifier.dev/native'].messageInteractions,grant);assert.deepEqual(session._meta['amplifier.dev/acp'].configOptions,[{id:'retained-option'}]);assert.equal(session._meta['amplifier.dev/acp'].lastSettledTurnId,'retained-marker');assert.equal(cold.diagnostics().activeAgents,0);assert.equal((cold as any).starting.size,0);await assert.rejects(readFile(f.log),{code:'ENOENT'});
  }finally{await client?.shutdown();await cold?.close();await rm(f.dir,{recursive:true,force:true});}
 });
+
+
+test('canonical refresh retains model recordings and child tools across native root tool namespaces',async()=>{
+ const f=await fixture({principal:'trusted',grant,history:true});try{
+  const id=randomUUID();await f.host.submitTurn(f.session,{commandId:id,text:'Original request',clientId:'observed'});await wait(()=>f.host.store.receipt(id)?.status==='completed');
+  const native=(await f.host.inspectSession(f.session)).nativeSessionId,original=f.host.store.turns(f.chat,1).turns[0];
+  const model={kind:'systemNotification',content:'',_meta:{'amplifier.dev/modelCall':{version:1,id:'llm:recorded',kind:'llm',phase:'completed',requestDetail:{uri:'amplifier-model://recording?exact=retained'},usage:{inputTokens:123}}}};
+  const tool=(toolCallId:string)=>({kind:'toolCall',toolCall:{toolCallId,toolName:'read',status:'completed',toolInput:'{}',success:true}});
+  const parts:any[]=[model,{kind:'markdown',content:'Progress'},tool(native+':root-tool'),tool('child-session:child-tool'),{kind:'markdown',content:'Final answer'}];
+  f.host.store.saveTurn(f.chat,{...original,responseParts:parts});
+  const canonical=(answer='Final answer',toolId='root-tool')=>[{id,state:'complete',updates:[{sessionUpdate:'user_message_chunk',content:{type:'text',text:'Original request'}},{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Progress'}},{sessionUpdate:'tool_call',toolCallId:toolId,title:'read',kind:'read',status:'completed',rawInput:{}},{sessionUpdate:'agent_message_chunk',content:{type:'text',text:answer},_meta:{'amplifier.dev/history':{messageId:'native:final'}}}]}];
+  await writeFile(join(f.dir,'history.json'),JSON.stringify(canonical()));
+  const receipt=f.host.store.receipt(id),result=await f.host.refreshSessionHistory(f.session,{limit:1});assert.equal(result.refreshedTurns,1);assert.equal(result.retainedTurns,0);
+  const retained=f.host.store.turns(f.chat,1).turns[0];assert.deepEqual(retained.responseParts[0],model);assert.equal(retained.responseParts.length,parts.length);assert.equal((retained.responseParts.at(-1) as any)._meta['amplifier.dev/history'].messageId,'native:final');
+  for(const [answer,toolId]of [['Different answer','root-tool'],['Final answer','different-tool']]){await writeFile(join(f.dir,'history.json'),JSON.stringify(canonical(answer,toolId)));const refused=await f.host.refreshSessionHistory(f.session,{limit:1});assert.equal(refused.retainedTurns,1);assert.deepEqual(f.host.store.turns(f.chat,1).turns[0],retained);}
+  assert.deepEqual(f.host.store.receipt(id),receipt);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.close();}
+});
+
+test('parallel root tools restore saved references without rearranging live recordings or crossing message boundaries',async()=>{
+ const f=await fixture({principal:'trusted',grant,history:true});try{
+  const id=randomUUID();await f.host.submitTurn(f.session,{commandId:id,text:'Parallel request',clientId:'observed'});await wait(()=>f.host.store.receipt(id)?.status==='completed');
+  const native=(await f.host.inspectSession(f.session)).nativeSessionId,original=f.host.store.turns(f.chat,1).turns[0];
+  const model={kind:'systemNotification',content:'',_meta:{'amplifier.dev/modelCall':{version:1,id:'llm:recorded',kind:'llm',phase:'completed',usage:{inputTokens:123}}}};
+  const tool=(toolCallId:string)=>({kind:'toolCall',toolCall:{toolCallId,toolName:'read',status:'completed',toolInput:'{}',success:true}});
+  const parts:any[]=[model,{kind:'markdown',content:'Progress'},tool(native+':a'),tool('child:one'),tool(native+':c'),model,tool(native+':b'),{kind:'markdown',content:'Final'}];
+  f.host.store.saveTurn(f.chat,{...original,responseParts:parts});
+  const history=(separate=false)=>[{id,state:'complete',updates:[
+   {sessionUpdate:'user_message_chunk',content:{type:'text',text:'Parallel request'},_meta:{'amplifier.dev/history':{messageId:ref.messageId,messageReference:{...ref,sessionId:native}}}},
+   {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Progress'},_meta:{'amplifier.dev/history':{messageId:'native:progress'}}},
+   ...['a','b','c'].map((toolCallId,index)=>({sessionUpdate:'tool_call',toolCallId,title:'read',kind:'read',status:'in_progress',rawInput:{},_meta:{'amplifier.dev/history':{messageId:separate?'native:batch-'+index:'native:batch'}}})),
+   ...['a','b','c'].map(toolCallId=>({sessionUpdate:'tool_call_update',toolCallId,status:'completed',rawOutput:'done',_meta:{'amplifier.dev/history':{messageId:'native:result-'+toolCallId}}})),
+   {sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Final'},_meta:{'amplifier.dev/history':{messageId:'native:final',messageReference:{...ref,sessionId:native,messageId:'native:final',position:500}}}}
+  ]}];
+  await writeFile(join(f.dir,'history.json'),JSON.stringify(history()));
+  const receipt=f.host.store.receipt(id),result=await f.host.refreshSessionHistory(f.session,{limit:1});assert.equal(result.refreshedTurns,1);assert.equal(result.retainedTurns,0);
+  const saved=f.host.store.turns(f.chat,1).turns[0];assert.deepEqual(saved.message._meta?.['amplifier.dev/history']?.messageReference,{...ref,sessionId:native});
+  assert.equal((saved.responseParts.at(-1) as any)._meta['amplifier.dev/history'].messageReference.messageId,'native:final');
+  assert.deepEqual(saved.responseParts.filter(p=>p.kind!=='markdown'),parts.filter(p=>p.kind!=='markdown'));
+  assert.equal((await f.host.refreshSessionHistory(f.session,{limit:1})).refreshedTurns,1);
+  await writeFile(join(f.dir,'history.json'),JSON.stringify(history(true)));assert.equal((await f.host.refreshSessionHistory(f.session,{limit:1})).retainedTurns,1);
+  assert.deepEqual(f.host.store.turns(f.chat,1).turns[0],saved);assert.deepEqual(f.host.store.receipt(id),receipt);assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.close();}
+});

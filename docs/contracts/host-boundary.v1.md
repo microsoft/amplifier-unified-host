@@ -41,6 +41,29 @@ Their approved direction is separate from the implementation evidence below.
 | **HB8** — WS1; CB3; MA7–11 | Hiding discovery, purging a retired copy and disposing managed files are distinct reviewed authorities. Preserve canonical history unless separately authorized. | Age or an arbitrary cwd implies ownership; incomplete family/reference coverage permits disposal. | [Retention](../../test/retention.integration.test.ts), [retired copies](../../test/retired-copy.integration.test.ts), [managed files](../../test/managed-files.integration.test.ts) |
 | **HB9** — CB1, CB4–6 | Develop with public fixture peers and owned state; record exact source, package, installed and runtime evidence independently. | A local green test is reported as vendor, browser, Linux process or deployed acceptance. | [Run/verification guide](../../README.md#verification-boundary), [family Q1–Q12 gates][gates] |
 
+## Native event admission and completion ordering
+
+The ACP transport is duplex. The SDK may resolve a response while an earlier
+notification is still traversing its asynchronous dispatch handlers. Before the
+Host settles a prompt or native input, it joins admission of every native event
+already received on that connection. The Host callback records generation
+identity and checkpoint evidence synchronously, before releasing that admission.
+Asynchronous catalog and capability listeners may finish separately; they must
+not prevent the transport from receiving replies to their own requests.
+
+Admission is bounded to 512 pending notifications and eight MiB. Missing,
+foreign-session, timed-out or closed admissions make the input outcome unknown;
+they never create proof, repeat the input, or qualify a staged peer result. A
+completed answer still needs the existing exact native checkpoint and generation
+match. Standard ACP agents without native events have no admission work.
+
+`test/terminal-burst.test.ts` uses an independent wire peer that sends its final
+message, native terminal proof and RPC response in one write. It covers repeated
+turns, cancellation, errors, foreign sessions and a slow optional listener.
+`test/native-event-intake.test.ts` covers missing admissions and capacity bounds.
+The installed SDK must preserve extension parameter identity through dispatch;
+an incompatible SDK change is rejected instead of silently losing evidence.
+
 ## Scope, actor and command authority
 
 A capability topic marked `scope:'host'` requires resource `scope=host` and action
@@ -57,6 +80,17 @@ handler does not accept that binding from client arguments, metadata or claimed
 actor fields. A UI actor cannot set it. `args.sessionId` is an owner-validated
 selector, never proof that the caller owns that session. Owners enforce own-session
 restrictions against authenticated context even when the action's topic is global.
+
+Trusted composition can call `confirmCapability(session, {operation,title,args})`
+to review a bounded proposed effect through the existing AHP tool confirmation
+surface. The originating session must already have an active turn. The review
+authorizes exactly that in-flight call, never a future turn, retained blanket
+grant, caller-supplied approval, or remote-effect outcome. Rejection, cancellation
+and turn completion refuse without effect authority. The method is not a wire
+RPC or an agent-advertised action. Capability owners still own validation,
+publication, durable receipts and reconciliation. Source qualification:
+`test/capability-approval.test.ts` uses two official clients and an independent
+ACP peer; this does not certify external publication or browser presentation.
 
 New capability v1 command IDs follow the registry's 1–256-character bound, with
 no truncation. Existing longer durable IDs remain passively inspectable through
@@ -320,3 +354,38 @@ at composition before an engine naming capability is advertised.
 [Focused causal checks](../../test/session-title-metadata.test.ts) use owned
 metadata fixtures and an independent ACP notification peer; source/package
 acceptance remains separate from Native, bridge and browser/account acceptance.
+
+### Missing ordinary workspace history
+
+A missing folder inside the launcher's canonical workspace grants may remain a
+read scope. Host advertises `amplifier.dev/native.workspaceAvailable: false` and
+`historyReadOnly: true`, negotiates Native's exact-metadata passive reader, and
+uses its configured existing default directory only to launch that reader.
+It never substitutes that directory for execution or rewrites the native cwd.
+Native still proves the original identity and metadata. Mutation/lifecycle
+admission is refused; restoring the original folder clears this temporary state.
+Managed allocation recovery continues to use its separate receipt contract.
+
+## Detailed readable exports
+
+The optional Native `sessionLifecycle.exportDetails` version 1 enables boolean
+`includeExecution`, `includeConversationId`, `includeTimestamps`, and
+`includeReferenceIds` arguments on `exportSession`. A caller cannot supply
+`exportContext`. The Host constructs it from its retained materialized turn
+observations and the Resources owner's revision-stable metadata list, after
+binding the selected session and before the export journal records an effect.
+No additional event journal or transcript authority is introduced.
+
+Only recorded status, tool/model counts and optional duration cross the work
+summary boundary. Unknown outcomes remain unknown and unrecorded durations are
+omitted. Up to 1,000 recent work summaries and 1,000 artifact references fit within
+a 1 MiB contribution. Artifact metadata pages must retain the same session scope,
+revision and unique identities/cursors. Unavailable/inconsistent references are
+omitted with explicit coverage rather than fabricated or partially mixed.
+
+Native binds observations to canonical ranges and freezes all content in its
+existing immutable snapshot. The Host validates the requested format, scope,
+minimal setting and explicit option proof before exposing the resource. Exact
+command recovery uses the original journal and snapshot rather than recapturing
+observations or replaying an export. Busy or uncertain native ownership remains a
+pre-effect refusal. Clipboard/download delivery stays local to the client.

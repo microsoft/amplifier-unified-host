@@ -1,7 +1,9 @@
-import {initializeAuthority,preflightAuthorityFile} from './authoritative-schema.js';
+import {UsageReceipts} from './usage.js';
+import {initializeAuthority,preflightAuthorityFile,AuthoritativeSchemaError} from './authoritative-schema.js';
 import type {NativeFailedInput} from './input-outcome.js';
+import {NavigationIndex} from './navigation.js';
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync,realpathSync } from 'node:fs';
 import { OwnerLease } from './owner-lease.js';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -12,6 +14,7 @@ export interface SessionRecord {
   summary: SessionSummary; state: SessionState; chat: ChatState;
 }
 export interface Receipt {
+  peerTerminals?:Record<string,any>[];
   commandId: string; channel: string; clientId: string; clientSeq: number;
   status: 'admitted' | 'dispatching' | 'completed' | 'failed' | 'cancelled' | 'unknown';
   fingerprint: string; createdAt: string; updatedAt: string; detail?: string;requestSignature?:string;retryEligibility?:'waiting_worker';observationAdmission?:Record<string,unknown>;nativeInputOutcome?:NativeFailedInput;
@@ -20,6 +23,8 @@ export interface Receipt {
 /** Host projections and admission only. Native agent history is never rewritten here. */
 export class Store {
   readonly db: DatabaseSync;
+  readonly navigation:NavigationIndex;
+  readonly usage:UsageReceipts;
   readonly incarnation = randomUUID();
   private replayBytes=0;
   private lease:OwnerLease;
@@ -35,7 +40,15 @@ export class Store {
     const path=join(directory,'host.sqlite'),existingFile=preflightAuthorityFile(path,'store');
     this.db = opened = new DatabaseSync(path);
     initializeAuthority(this.db,'store',()=>{
+    // Established stores must retain their identity, even after a stopped copy
+    // moves directories. Only the recognized pre-identity schema can mint it.
+    const hadIdentity=!!this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='library_identity'").get();
+    this.db.exec('CREATE TABLE IF NOT EXISTS library_identity(id INTEGER PRIMARY KEY CHECK(id=1),source TEXT NOT NULL)');
+    if(!hadIdentity)this.db.prepare('INSERT INTO library_identity VALUES(1,?)').run(createHash('sha256').update(realpathSync(directory)).digest('hex'));
+    const identities=this.db.prepare('SELECT id,source FROM library_identity LIMIT 2').all();
+    if(identities.length!==1||identities[0].id!==1||typeof identities[0].source!=='string'||!/^[a-f0-9]{64}$/.test(identities[0].source))throw new AuthoritativeSchemaError('library identity missing or invalid');
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS model_usage(session TEXT NOT NULL,call_id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session,call_id));
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL);
       INSERT OR IGNORE INTO meta VALUES('seq',0);
       CREATE TABLE IF NOT EXISTS sessions(uri TEXT PRIMARY KEY,chat_uri TEXT UNIQUE NOT NULL,engine_id TEXT NOT NULL,native_id TEXT,cwd TEXT NOT NULL,modified TEXT NOT NULL,summary TEXT NOT NULL,state TEXT NOT NULL,chat TEXT NOT NULL);
@@ -89,6 +102,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS active_events(seq INTEGER PRIMARY KEY AUTOINCREMENT,channel TEXT NOT NULL,action TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS active_events_channel ON active_events(channel,seq);
     `);
+    if(!this.db.prepare('PRAGMA table_info(session_admission)').all().some(column=>column.name==='navigation'))this.db.exec('ALTER TABLE session_admission ADD COLUMN navigation TEXT');
     if(!this.db.prepare('PRAGMA table_info(terminals)').all().some(column=>column.name==='lifecycle'))this.db.exec("ALTER TABLE terminals ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'exited'; UPDATE terminals SET lifecycle=json_extract(payload,'$.lifecycle.status');");
     if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='execution_cwd'))this.db.exec('ALTER TABLE sessions ADD COLUMN execution_cwd TEXT; ALTER TABLE sessions ADD COLUMN native_location_revision INTEGER NOT NULL DEFAULT 0; UPDATE sessions SET execution_cwd=cwd');
     if(!this.db.prepare('PRAGMA table_info(sessions)').all().some(column=>column.name==='hidden'))this.db.exec('ALTER TABLE sessions ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0');
@@ -109,9 +123,13 @@ export class Store {
       this.finish(receipt.commandId, 'unknown', 'Host restarted before a conclusive ACP outcome; reconcile native history before new work.');
     }
     },{existingFile,configure:'PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;'});
+    this.usage=new UsageReceipts(this.db);
+    this.transaction(()=>{this.usage.backfill();this.usage.interrupted();});
+    this.navigation=new NavigationIndex(this.db);
     }catch(error){opened?.close();this.lease.close();throw error;}
   }
   get seq(): number { return Number(this.db.prepare("SELECT value FROM meta WHERE key='seq'").get()!.value); }
+  get librarySource():string {return String(this.db.prepare('SELECT source FROM library_identity WHERE id=1').get()!.source);}
   get count(): number { return Number(this.db.prepare('SELECT count(*) AS n FROM sessions').get()!.n); }
   transaction<T>(work: () => T): T {
     if(this.transactionOpen)return work();
@@ -121,6 +139,11 @@ export class Store {
     try { const result = work(); this.db.exec('COMMIT');this.transactionOpen=false;const channels=[...this.receiptChanges];this.receiptChanges.clear();for(const channel of channels)this.notifyReceipt(channel);return result; }
     catch (error) {this.replayBytes=replayBytes;this.receiptChanges.clear();if(this.transactionOpen)this.db.exec('ROLLBACK');throw error;}
     finally {this.transactionOpen=false;}
+  }
+  /** Navigation needs metadata only, never the active event log or chat snapshot. */
+  summary(uri:string):SessionSummary|undefined {
+    const row=this.db.prepare('SELECT summary FROM sessions WHERE uri=? OR chat_uri=?').get(uri,uri);
+    return row?JSON.parse(row.summary as string):undefined;
   }
   get(uri: string): SessionRecord | undefined {
     const row = this.db.prepare('SELECT * FROM sessions WHERE uri=? OR chat_uri=?').get(uri, uri);
@@ -148,6 +171,8 @@ export class Store {
   saveTurn(chat: string, turn: Turn):number {
     if(!this.transactionOpen)return this.transaction(()=>this.saveTurn(chat,turn));
     this.db.prepare('INSERT INTO turns(chat,turn_id,payload) VALUES(?,?,?) ON CONFLICT(chat,turn_id) DO UPDATE SET payload=excluded.payload').run(chat, turn.id, JSON.stringify(turn));
+    const identity=this.db.prepare('SELECT uri,native_id FROM sessions WHERE chat_uri=?').get(chat);
+    if(identity?.native_id)this.usage.observeTurn(String(identity.uri),String(identity.native_id),turn);
     const ordinal=Number(this.db.prepare('SELECT ordinal FROM turns WHERE chat=? AND turn_id=?').get(chat,turn.id)!.ordinal);
     const text=turn.responseParts.filter(part=>part.kind==='markdown').map(part=>(part as {content:string}).content).join('\n'),bytes=Buffer.from(text),preview=bytes.subarray(0,20000).toString('utf8');
     this.db.prepare('INSERT INTO coordination_results VALUES(?,?,?,?,?,?) ON CONFLICT(chat,turn_id) DO UPDATE SET text=excluded.text,truncated=excluded.truncated,state=excluded.state').run(chat,turn.id,ordinal,preview,bytes.length>20000?1:0,turn.state);
@@ -206,7 +231,7 @@ export class Store {
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,status,detail,updatedAt:new Date().toISOString()}),commandId);
     if(receipt.status!==status){if(this.transactionOpen){if(this.receiptChanges.size<128)this.receiptChanges.add(receipt.channel);else this.receiptChanges.add('*capacity');}else this.notifyReceipt(receipt.channel);}
   }
-  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'|'nativeInputOutcome'>) {
+  annotateReceipt(commandId:string,values:Pick<Receipt,'requestSignature'|'retryEligibility'|'observationAdmission'|'nativeInputOutcome'|'peerTerminals'>) {
     const receipt=this.receipt(commandId);if(!receipt)throw new Error('Unknown command identity');
     this.db.prepare('UPDATE receipts SET payload=? WHERE command_id=?').run(JSON.stringify({...receipt,...values}),commandId);
   }

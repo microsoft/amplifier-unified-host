@@ -208,6 +208,16 @@ AHP actions. Tool update fields replace their prior values: `rawInput` objects
 are never concatenated into malformed JSON, and omitted completion fields retain
 previous tool content. A pending permission stays pending when input changes.
 
+Tool inputs and results larger than 4 KiB use standard AHP content references.
+Snapshots retain their outcome and position; `resourceRead` returns the exact
+saved body when requested. Result resources use
+`application/vnd.amplifier.tool-result+json` to preserve the whole public result
+envelope, including structured output and content blocks. Pending permission
+arguments remain inline so the complete reviewed input is immediately available.
+Content writes are atomic and reads verify the URI's SHA-256 digest. These are
+derived projections; native history stays authoritative. This bounds large tool
+bodies in snapshots, not native history indexing or the number of execution nodes.
+
 Idle `session_info_update` values are preserved, and title changes update the
 session/catalog. Opaque `available_commands_update` lists and context-window /
 cumulative-cost `usage_update` reports have full replacement semantics under
@@ -392,6 +402,14 @@ bridge ports before exposing an engine naming feature. Host fixtures qualify its
 source/package boundary; Native, bridge, browser and account acceptance are separate.
 
 ## Background work and runtime loss
+
+`inspectBackgroundReadiness()` is a trusted advisory snapshot for optional
+composition-owned background work. It requires a connected client, open intake,
+and no active execution, admission, continuation, retirement or control request.
+It is not an authorization or lease: each actual effect must still pass through
+the ordinary admitted owner boundary. Composition must additionally check its
+own media and other non-Host activity. The Host does not schedule naming or
+interpret Native history through this method.
 
 A settled prompt is not proof that its agent has no owned background work. Idle
 capacity eviction requires negotiated native
@@ -1482,3 +1500,70 @@ trusted Workspace read with indexed whole-domain predicates and explicit freshne
 It preserves standard listSessions and selected-session AHP authority. Cold runtime
 unknown differs from a retained uncertain executed effect; no global current count
 or frozen-result snapshot is promised.
+
+### ACP plans
+
+Standard ACP `plan` updates retain bounded structured entries in an AHP
+`systemNotification` part under `_meta["amplifier.dev/acp"].plan` (version 1).
+The part also carries a plain-text fallback for generic clients. The shared
+projection handles live updates and passive history identically; it never adds
+a user input or starts execution. Invalid/oversized latest updates retain an
+explicit unavailable snapshot rather than substituting a stale plan. Optional
+Native todo active wording and unavailable metadata are presentation only.
+`test/plan.test.ts` checks the official reducer and serialization boundary.
+
+### Durable model-call accounting
+
+The Host retains scalar model-call receipts independently of the loaded turn
+window. Native owns the revisioned budget policy and supplies its snapshot for
+each pre-provider `capacity.admit` request. The Host binds that request to its
+currently owned Native process and session, records admission before replying,
+and uses cumulative call snapshots rather than adding repeated usage events.
+Input plus cache writes plus output is the gross token total; cache reads and
+reasoning tokens are not added twice. Estimated cost, known zero, pending usage
+and unknown settled usage remain distinct. Editing history does not refund calls.
+
+`readCapacity` uses passive persisted Native policy without starting a worker.
+`historicalUsage` is an optional trusted distribution migration callback. It
+returns bounded scalar call rows for the exact engine, Native identity and
+canonical history workspace; it is not a public import or policy authority.
+The Host imports it before both inspection and admission, atomically and
+idempotently by call identity. Invalid or ambiguous migration refuses rather
+than reporting a zero balance. Interrupted calls become unknown and are never
+replayed. An enabled policy pauses on unknown settled usage unless explicitly
+configured otherwise. In-flight calls can finish above the limit.
+
+`test/usage.test.ts` covers retained-window independence, cache accounting,
+partial/duplicate revisions, unknowns, edited-away backfill and restart. The
+composed distribution test separately exercises installed Native admission and
+selected-main accounting migration before a provider invocation.
+
+Shared-history cleanup exposes trusted composition ports for metadata census, held owner reference checks, and completed-Native visibility projection. Families of up to 1000 indexed conversations are checked in batches of at most 101. Incomplete owner coverage, identity disagreement, external descendants, or protected work refuse review. Projection commands deduplicate exact retained evidence and cannot delete or replay Native history.
+
+### Saved outputs during conversation copies
+
+The optional composition `outputFork` port belongs to Resources. Before an
+explicit copy, Host obtains a bounded set of saved output origins and asks
+Native to prove their original and copied message identities. After Native
+confirms the copy, Resources commits the immutable output relationships before
+Host announces completion. A failed acknowledgment retains the original Native
+receipt; inspection resumes that same Resources commit without copying or
+prompting again. Host verifies ordinary saved-output message links through its
+retained exact turn or a passive canonical visible-message read. It never grants
+history mutation authority through a display reference.
+
+The trusted composition port `readSavedAssistantMessages(session)` discovers
+up to 12 saved assistant references. Native engines negotiate the bounded
+`history.savedMessages` passive read; other engines expose only completed saved
+host turns, with their required `messageTurnId`. Results carry 512-character
+previews and no execution or mutation authority. The composition exposes this
+as `app_control get_state {path:"/messages"}` so an agent can attach media to
+its saved commentary. Normal idle history refresh binds those same canonical
+IDs to the client message while retaining provider and tool observations.
+
+Workspace `createSession.config` can include an exact `bundle` reference when the
+Native engine advertises `initialSelection.bundleSelection`. The passive standard
+resolver validates it in the requested workspace; a bundle-only choice does not
+pin a model. The host requires matching mounted readback before accepting the
+first prompt. Unsupported engines and changed resolver values refuse before
+allocation; uncertain mounted results retain their original creation receipt.
