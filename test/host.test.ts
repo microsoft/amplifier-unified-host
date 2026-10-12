@@ -21,6 +21,19 @@ async function setup(options:any={}) {
   return {dir,log,config,host,clients,connect,create,cleanup};
 }
 function action(text:string,turnId=randomUUID()):any{return {type:'chat/turnStarted',turnId,startedAt:new Date().toISOString(),message:{text,origin:{kind:'user'}}};}
+
+test('saved output origin checks exact indexed public parts without starting another turn',async()=>{
+ const f=await setup();try{
+  const client=await f.connect(),one=await f.create(client),two=await f.create(client),turnId=randomUUID();
+  await f.host.submitTurn(one.session,{commandId:turnId,text:'writing origin',clientId:'output-test'});await f.host.waitForTurn(one.session,turnId);
+  const row=f.host.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(one.chat,turnId),turn=JSON.parse(String(row!.payload));
+  const index=turn.responseParts.findIndex((p:any)=>p.kind==='markdown'),part=turn.responseParts[index],id=part.id||`${turnId}:markdown:${index}`;
+  assert.equal(await f.host.verifyOutputMessage(one.session,id,turnId),true);
+  assert.equal(await f.host.verifyOutputMessage(one.session,'invented',turnId),false);
+  assert.equal(await f.host.verifyOutputMessage(two.session,id,turnId),false);
+  assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);
+ }finally{await f.cleanup();}
+});
 async function waitFor(predicate:()=>unknown,timeout=5000){const deadline=Date.now()+timeout;while(Date.now()<deadline){if(predicate())return;await new Promise(resolve=>setTimeout(resolve,10));}throw new Error('Timed out');}
 
 test('scoped capability submission uses ordinary admission and observers cannot widen unrelated histories',async()=>{
@@ -667,10 +680,12 @@ test('standard steering stays in its active turn, with durable receipts and no s
   const request=JSON.parse((await readFile(f.log+'.steering','utf8')).trim());assert.equal(request.activeInputId,initial.turnId);assert.equal(request.inputId,'next-boundary');
   assert.equal((await f.host.readUserMessage(session,'next-boundary')).text,'Correct path');
   assert.ok((await f.host.readSessionContext(session,5)).messages.some(row=>row.id==='next-boundary'&&row.delivery==='steering'));
+  assert.deepEqual((await f.host.inspectOutputInputEpoch(session)).inputIds,[initial.turnId,'next-boundary']);
   await assert.rejects(f.host.updatePendingQueue(session,pending('next-boundary','duplicate'),{clientId:'owner'}),/already consumed/);
   await assert.rejects(f.host.updatePendingQueue(session,{type:'chat/pendingMessageRemoved',kind:'steering',id:'next-boundary'} as any,{clientId:'owner'}),/cannot be retracted/);
   await assert.rejects(f.host.nativeControl(session,'steer',{text:'bypass'}),/updatePendingQueue/);
   assert.equal((await f.host.waitForTurn(session,initial.turnId)).completed,true);
+  assert.deepEqual((await f.host.inspectOutputInputEpoch(session)).inputIds,[]);
   assert.equal((await readFile(f.log,'utf8')).trim().split('\n').length,1);assert.equal(f.host.store.turns(chat).turns.length,1);
   assert.ok(seen.some(event=>event.action.type==='chat/pendingMessageRemoved'&&event.action.id==='next-boundary'));assert.equal(f.host.store.get(session)?.chat.steeringMessage,undefined);
  }finally{await f.cleanup();}
@@ -797,6 +812,20 @@ test('lost native fork acknowledgement fences source and reserved identity until
   await assert.rejects(client.request('createSession',{channel:String(row.target),provider:'fixture',workingDirectories:[pathToFileURL(f.dir).href]}),/lifecycle outcome/);
   await assert.rejects(f.host.forkSession(session,args),/without replay/);const recovered=await f.host.inspectSessionLifecycleReceipt(session,commandId);assert.equal(recovered.status,'completed');assert.equal(recovered.result.uri,row.target);assert.equal(recovered.result.workReplayed,false);
   assert.deepEqual(await f.host.forkSession(session,args),recovered.result);const receipts=JSON.parse(await readFile(f.log+'.lifecycle','utf8'));assert.equal(Object.keys(receipts).length,1);assert.equal(f.host.diagnostics().activeAgents,0);
+ }finally{await f.cleanup();}
+});
+
+test('output owner failure reconciles the confirmed original fork without creating another native copy',async()=>{
+ let reject=true,calls=0;const received:any[]=[];
+ const f=await setup({outputFork:{references:async()=>[{key:'saved-output',origin:{messageId:'native:message'}}],commit:async(input:any)=>{calls++;received.push(input);if(reject)throw Error('Fixture output owner unavailable');return {copied:1,workReplayed:false};}}});try{
+  const client=await f.connect(),{session}=await f.create(client),commandId=randomUUID(),args={commandId,expectedHistoryRevision:'fixture-history'};
+  await assert.rejects(f.host.forkSession(session,args),/output owner unavailable/);
+  const row=f.host.store.db.prepare('SELECT * FROM lifecycle_commands WHERE command_id=?').get(commandId)!;assert.equal(row.status,'unknown');
+  assert.equal(received[0].source,session);assert.equal(received[0].target,row.target);assert.equal(received[0].proof.items[0].key,'saved-output');
+  await assert.rejects(f.host.forkSession(session,args),/without replay/);reject=false;
+  const recovered=await f.host.inspectSessionLifecycleReceipt(session,commandId);assert.equal(recovered.status,'completed');assert.equal(recovered.result.outputs.copied,1);assert.ok(calls>=2);
+  const receipts=JSON.parse(await readFile(f.log+'.lifecycle','utf8'));assert.equal(Object.keys(receipts).length,1);assert.equal(recovered.result.uri,row.target);
+  await assert.rejects(readFile(f.log,'utf8'));assert.equal(f.host.diagnostics().activeAgents,0);
  }finally{await f.cleanup();}
 });
 

@@ -107,6 +107,11 @@ export interface HostConfig {
   clientMetadata?:(context:{clientId:string;metadata:Json})=>Promise<Json|undefined>;
   /** Read-only historical accounting from an explicitly configured migration owner. */
   historicalUsage?:(context:{session:string;engineId:string;nativeSessionId:string;workingDirectory:string})=>Promise<Json[]>;
+  /** Resources owns immutable output copies. Native proves retained message identities. */
+  outputFork?:{
+    references:(session:string)=>Promise<Array<{key:string;origin:Json}>>;
+    commit:(input:{source:string;target:string;commandId:string;historyRevision:string;proof:Json;workingDirectory:string})=>Promise<Json>;
+  };
   capabilities?: {
     manifest:{version:1;topics:Record<string,{uri:string;version:number;watch?:boolean;scope?:'context'|'host'}>;actions:Record<string,{topic:string;operation:string;method:string}>};
     /** Trusted exact manifest action classification; no ordinary mutation rights are inherited. */
@@ -1422,7 +1427,26 @@ export class AmplifierHost {
   }
   private async nativeLifecycle(agent:AcpProcess,record:SessionRecord,operation:string,args:Json={}) {
     const result:Json=await agent.client.extMethod('_amplifier/session',{sessionId:record.nativeSessionId,cwd:record.workingDirectory,operation,args});
-    if(!result||typeof result!=='object'||Array.isArray(result)||Buffer.byteLength(JSON.stringify(result))>256*1024)throw new RpcFault(-32000,'Invalid or oversized native lifecycle response');return result;
+    if(!result||typeof result!=='object'||Array.isArray(result)||Buffer.byteLength(JSON.stringify(result))>512*1024)throw new RpcFault(-32000,'Invalid or oversized native lifecycle response');return result;
+  }
+  private async forkOutputReferences(record:SessionRecord):Promise<Json[]> {
+    const references=await this.config.outputFork!.references(record.uri);
+    if(!Array.isArray(references)||references.length>500)throw new RpcFault(-32000,'Complete output copy selection exceeds its bound');
+    const result=references.map(({key,origin})=>{
+      if(typeof key!=='string'||!key||key.length>512||typeof origin?.messageId!=='string')throw new RpcFault(-32000,'Invalid saved output origin');
+      if(origin.messageId.startsWith('native:'))return {key,messageId:origin.messageId};
+      if(typeof origin.legacyMessageId==='string'&&/^[a-f0-9]{32}$/.test(origin.legacyMessageId))return {key,legacyMessageId:origin.legacyMessageId};
+      const turnId=origin.turnId;if(typeof turnId!=='string'||!turnId)throw new RpcFault(-32011,'Saved output message requires an original history reference before copying');
+      if(origin.messageId===turnId+':input')return {key,messageId:turnId};
+      const saved=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,turnId),turn=saved?JSON.parse(String(saved.payload)):undefined;
+      if(!turn)throw new RpcFault(-32011,'Saved output turn is unavailable; originals retained');
+      const input=origin.messageId===turn.id+':input',parts=input?[]:turn.responseParts.filter((part:Json,index:number)=>part.kind==='markdown'&&(origin.messageId===(part.id||`${turn.id}:${part.kind}:${index}`)||origin.messageId===part._meta?.['amplifier.dev/history']?.messageId));
+      const text=input?turn.message.text:parts.length===1?parts[0].content:undefined;
+      if(typeof text!=='string'||!text.trim())throw new RpcFault(-32011,'Saved output has no exact retained public message');
+      return {key,inputId:turn.id,role:input?'user':'assistant',textSha256:createHash('sha256').update(text).digest('hex')};
+    });
+    if(Buffer.byteLength(JSON.stringify(result))>131072||new Set(result.map(row=>row.key)).size!==result.length)throw new RpcFault(-32000,'Invalid or oversized output copy references');
+    return result;
   }
   /** Bounded workspace progress. Does not subscribe, load history, or activate workers. */
   async sessionPlans(input:Json) {return this.intake.inspectOnly(()=>this.readSessionPlans(input));}
@@ -1593,6 +1617,8 @@ export class AmplifierHost {
       if(target.nativeSessionId!==native.sessionId||target.workingDirectory!==historyCwd)throw new Error('Reserved fork target now has a different identity');
       if(native.forkBoundary&&(native.forkBoundary.sourceMessageId!==args.throughMessageId||native.forkBoundary.historyRevision!==native.historyRevision||typeof native.forkBoundary.targetMessageId!=='string'||!native.forkBoundary.targetMessageId.startsWith('native:')||native.forkBoundary.targetMessageId.length>512))throw new Error('Native fork boundary does not match the confirmed copy');
       this.store.save(target);await this.syncCatalog(target);result={uri,creationConfirmed:true,historyRevision:native.historyRevision,source:native.source,...(native.forkBoundary?{forkBoundary:native.forkBoundary}:{}),workReplayed:false,...(allocation?{location:native.location,generatedFilesCopied:false}:{}),mode:native.mode??'complete',...(native.bundleSelection!==undefined?{bundleSelection:native.bundleSelection}:{}),preservedSource:true,receipt:native.receipt};
+      if(this.config.outputFork&&native.outputReferences===undefined&&(await this.config.outputFork.references(record.uri)).length)throw new Error('Native copy has no retained output message proof; original outputs preserved');
+      if(this.config.outputFork&&native.outputReferences!==undefined)result.outputs=await this.config.outputFork.commit({source:record.uri,target:uri,commandId:String(entry.command_id),historyRevision:native.historyRevision,proof:native.outputReferences,workingDirectory:native.executionDirectory});
       this.notify('root/sessionAdded',{channel:ROOT,summary:target.summary});
     }else if(operation==='legacyCopy.purge'){
       if(native.receipt.operation!==operation||native.sessionId!==record.nativeSessionId||native.historyCwd!==record.workingDirectory||native.historyRevision!==args.expectedHistoryRevision||native.previewId!==args.previewId||native.previewHash!==args.previewHash||native.canonicalFilesDeleted!==0||native.eventsDeleted!==0||native.legacyWriterCoverage!=='launcher-attested-retired'||!Array.isArray(native.removed)||!native.removed.length||native.removed.length>3||new Set(native.removed.map((f:Json)=>f.name)).size!==native.removed.length||native.removed.some((f:Json)=>!['transcript.jsonl','metadata.json','checkpoint.json'].includes(f.name)||!Number.isSafeInteger(f.bytes)||f.bytes<0||f.bytes>64*1024*1024||typeof f.sha256!=='string'||!/^[a-f0-9]{64}$/.test(f.sha256)))throw new Error('Retired-copy effect lacks exact duplicate-only native receipt proof');
@@ -1676,6 +1702,8 @@ export class AmplifierHost {
         const inspected=await this.nativeLifecycle(agent,record,'inspect');if(inspected.historyRevision!==args.expectedHistoryRevision)throw new RpcFault(-32011,'Native history changed; inspect a fresh revision',{executed:false});
         if(operation==='export'&&EXPORT_FLAGS.some(key=>args[key]!==undefined)&&capability?.exportDetails?.version!==1)throw new RpcFault(-32601,'Configured engine does not support detailed export options',{executed:false});
         const exportContext=operation==='export'&&capability?.exportDetails?.version===1?await exportObservations(this.store.db,record.chat.resource,record.uri,args.includeExecution===true,this.config.capabilities):undefined;
+        const outputReferences=operation==='fork'&&this.config.outputFork?await this.forkOutputReferences(record):undefined;
+        if(outputReferences&&capability?.outputReferences?.version!==1)throw new RpcFault(-32601,'Configured engine cannot preserve output message references',{executed:false});
         const managedCopy=operation==='fork'&&!!record.state._meta?.['amplifier.dev/location'];
         if(managedCopy&&(!this.managed||(agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json)?.managedCreation?.historyCopy?.version!==1))throw new RpcFault(-32601,'Configured engine does not support fresh managed history copies',{executed:false});
         const target=operation==='fork'?'ahp-session:/'+randomUUID():null;
@@ -1687,7 +1715,7 @@ export class AmplifierHost {
         let allocation:Json|undefined;
         try{
           if(allocationRequest)await this.withLock('@directory-reservations',async()=>{allocation=this.managed!.reserve(allocationRequest,{operation:'fork',sessionId:record.nativeSessionId,historyRevision:args.expectedHistoryRevision,commandId:args.commandId});await this.managed!.allocate(allocation);this.managed!.settle(allocation.commandId,'dispatching');});
-          return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,operation,{...nativeArgs,...(exportContext?{exportContext}:{}),...(target?{targetSessionId:target.slice('ahp-session:/'.length),...(capability?.descendantGuard?.version===1?{descendants}: {})}:{ }),...(allocation?{managedTarget:{cwd:allocation.marker.workspace,commandId:allocation.commandId,allocationHash:allocation.marker.allocationHash}}:{})}));
+          return await this.applyLifecycleResult(record,entry,await this.nativeLifecycle(agent,record,operation,{...nativeArgs,...(outputReferences?{outputReferences}:{}),...(exportContext?{exportContext}:{}),...(target?{targetSessionId:target.slice('ahp-session:/'.length),...(capability?.descendantGuard?.version===1?{descendants}: {})}:{ }),...(allocation?{managedTarget:{cwd:allocation.marker.workspace,commandId:allocation.commandId,allocationHash:allocation.marker.allocationHash}}:{})}));
         }
         catch(error){
           if(allocation&&this.managed!.receipt(allocation.commandId)?.state!=='completed')this.managed!.settle(allocation.commandId,'unknown');
@@ -2776,6 +2804,30 @@ export class AmplifierHost {
       interruptionRevision:this.store.revisions(record.uri).interruptionRevision,
       sourceDigest:message.sourceDigest}};
   }
+  /** Verify a saved resource's originating public message without granting input authority. */
+  async verifyOutputMessage(session:string,messageId:string,turnId?:string):Promise<boolean> {
+    if(typeof messageId!=='string'||!messageId||messageId.length>512||turnId!==undefined&&(typeof turnId!=='string'||!turnId||turnId.length>256))throw new RpcFault(-32602,'Exact bounded message identities required');
+    const record=await this.record(session);
+    if(turnId){
+      const saved=this.store.db.prepare('SELECT payload FROM turns WHERE chat=? AND turn_id=?').get(record.chat.resource,turnId);
+      const turn=saved?JSON.parse(String(saved.payload)):record.chat.activeTurn?.id===turnId?record.chat.activeTurn:undefined;
+      if(turn){if(messageId===turn.id+':input'&&turn.message.text)return true;
+        if(turn.responseParts.some((part:Json,index:number)=>part.kind==='markdown'&&typeof part.content==='string'&&part.content.trim()&&(messageId===(part.id||`${turn.id}:${part.kind}:${index}`)||messageId===part._meta?.['amplifier.dev/history']?.messageId)))return true;}
+    }
+    if(!messageId.startsWith('native:'))return false;
+    const engine=this.config.engines.find(engine=>engine.id===record.engineId);if(!engine||!record.nativeSessionId)throw new RpcFault(-32601,'Passive message verification is unavailable');
+    if(this.passiveReads>=4)throw new RpcFault(-32000,'Passive history read capacity reached');this.passiveReads++;
+    const agent=new AcpProcess(engine,this.passiveProcessDirectory(record),{update:async()=>{},permission:async()=>({outcome:{outcome:'cancelled'}}),admitEffect:async()=>{throw new RpcFault(-32009,'Message reference verification cannot perform effects');}});
+    try{
+      const initialized=await agent.initialize(),history=(initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined)?.history;
+      if(history?.passive!==true||history.exactMessageRead?.visibleReferenceOnly!==1)throw new RpcFault(-32601,'Agent cannot verify a visible message reference');
+      const scope={sessionId:record.nativeSessionId,cwd:record.workingDirectory},inspected:Json=await agent.client.extMethod('_amplifier/history/inspect',scope);
+      if(inspected.available!==true||typeof inspected.revision!=='string'||!inspected.revision)throw new RpcFault(-32008,'Historical source is unavailable');
+      const result:Json=await agent.client.extMethod('_amplifier/history/message',{...scope,messageId,expectedRevision:inspected.revision,visibleReferenceOnly:true});
+      if(result.revision!==inspected.revision||result.selection!=='exact-visible-reference'||result.complete!==true||result.execution!==false||result.mutationAuthority!=='none'||result.message?.id!==messageId||!['user','assistant'].includes(result.message.role)||Buffer.byteLength(JSON.stringify(result))>4096)throw new RpcFault(-32000,'Invalid visible message reference');
+      return true;
+    }finally{this.passiveReads--;await agent.retire();}
+  }
   /** Selected context only. It never widens an AHP subscription's shared history window. */
   async readSessionContext(session:string,limit=12) {
     limit=bounded(limit,12,50);const record=await this.record(session);let turns:Array<Turn|NonNullable<ChatState['activeTurn']>>=this.store.turns(record.chat.resource,limit).turns;
@@ -3312,6 +3364,14 @@ export class AmplifierHost {
     retainedReplay:this.store.db.prepare('SELECT count(*) events,coalesce(sum(bytes),0) bytes FROM actions').get(),
     pendingQueue:this.store.db.prepare("SELECT count(*) messages,coalesce(sum(length(CAST(message AS BLOB))),0) bytes FROM queue_intents WHERE status='pending'").get()
   };}
+  /** Trusted composition-only image lifetime; queued input grants no authority. */
+  async inspectOutputInputEpoch(session:string) {
+    const record=await this.record(session),active=this.active.get(record.uri);
+    if(!active?.busy||!active.turnId)return {inputIds:[]};
+    const rows=this.store.db.prepare("SELECT id FROM steering_intents WHERE chat=? AND active_turn_id=? AND status IN ('applied','dispatching','unknown') ORDER BY rowid LIMIT 129").all(record.chat.resource,active.turnId);
+    if(rows.length>128)throw new RpcFault(-32000,'Current image input scope exceeds its bounded selection');
+    return {inputIds:[active.turnId,...rows.map(row=>String(row.id))]};
+  }
   async inspectSession(session:string) {
     const record=await this.record(session),revisions=this.store.revisions(record.uri);
     const engine=this.config.engines.find(e=>e.id===record.engineId);

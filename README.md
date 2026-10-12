@@ -1539,3 +1539,15 @@ composed distribution test separately exercises installed Native admission and
 selected-main accounting migration before a provider invocation.
 
 Shared-history cleanup exposes trusted composition ports for metadata census, held owner reference checks, and completed-Native visibility projection. Families of up to 1000 indexed conversations are checked in batches of at most 101. Incomplete owner coverage, identity disagreement, external descendants, or protected work refuse review. Projection commands deduplicate exact retained evidence and cannot delete or replay Native history.
+
+### Saved outputs during conversation copies
+
+The optional composition `outputFork` port belongs to Resources. Before an
+explicit copy, Host obtains a bounded set of saved output origins and asks
+Native to prove their original and copied message identities. After Native
+confirms the copy, Resources commits the immutable output relationships before
+Host announces completion. A failed acknowledgment retains the original Native
+receipt; inspection resumes that same Resources commit without copying or
+prompting again. Host verifies ordinary saved-output message links through its
+retained exact turn or a passive canonical visible-message read. It never grants
+history mutation authority through a display reference.
