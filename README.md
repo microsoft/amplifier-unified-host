@@ -1551,3 +1551,10 @@ receipt; inspection resumes that same Resources commit without copying or
 prompting again. Host verifies ordinary saved-output message links through its
 retained exact turn or a passive canonical visible-message read. It never grants
 history mutation authority through a display reference.
+
+Workspace `createSession.config` can include an exact `bundle` reference when the
+Native engine advertises `initialSelection.bundleSelection`. The passive standard
+resolver validates it in the requested workspace; a bundle-only choice does not
+pin a model. The host requires matching mounted readback before accepting the
+first prompt. Unsupported engines and changed resolver values refuse before
+allocation; uncertain mounted results retain their original creation receipt.

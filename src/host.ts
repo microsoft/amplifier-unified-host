@@ -992,20 +992,21 @@ export class AmplifierHost {
   async resolveSessionConfig(input:Json){
     if(!input||typeof input!=='object'||Array.isArray(input)||input.provider!==undefined&&(typeof input.provider!=='string'||!input.provider||input.provider.length>200))throw new RpcFault(-32602,'Configured agent provider required',{executed:false});
     const config=input.config===undefined?{}:input.config;
-    if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['instance','model','effort'].includes(key))||Object.entries(config).some(([key,value])=>typeof value!=='string'||!value||value.length>({instance:200,model:500,effort:100} as Json)[key]))throw new RpcFault(-32602,'Creation configuration requires bounded instance/model/effort strings',{executed:false});
+    if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['instance','model','effort','bundle'].includes(key))||Object.entries(config).some(([key,value])=>typeof value!=='string'||!value||value.length>({instance:200,model:500,effort:100,bundle:4096} as Json)[key]))throw new RpcFault(-32602,'Creation configuration requires bounded bundle/instance/model/effort strings',{executed:false});
     const provider=input.provider??this.config.engines[0].id,cwd=await this.workspace(input.workingDirectory??pathToFileURL(this.defaultWorkingDirectory).href);
     return this.intake.inspectOnly(()=>this.passiveCreationAgent(provider,cwd,async agent=>{
       const native=agent.initialized.agentCapabilities?._meta?.['amplifier.dev/native'] as Json|undefined,capability=native?.initialSelection;
       if(native?.version!==1||capability?.version!==1||capability.typedSelection!==true||capability.passive!==true){if(Object.keys(config).length)throw new RpcFault(-32601,'Engine does not advertise initial selection',{executed:false});return {schema:{type:'object',properties:{}},values:{}};}
+      if(config.bundle!==undefined&&capability.bundleSelection!==true)throw new RpcFault(-32601,'Engine does not advertise initial bundle selection',{executed:false});
       if(capability.resolveMethod!=='_amplifier/initial-selection')throw new RpcFault(-32601,'Initial selection has no negotiated passive resolver',{executed:false});
       const result:Json=await agent.client.extMethod(capability.resolveMethod,{cwd,selection:config});
       const schema=result.schema,values=result.values;
       if(result.version!==1||!schema||schema.type!=='object'||!schema.properties||typeof schema.properties!=='object'||Array.isArray(schema.properties)||!values||typeof values!=='object'||Array.isArray(values)||Buffer.byteLength(JSON.stringify(result))>1048576)throw new RpcFault(-32000,'Invalid passive initial configuration resolution',{executed:false});
-      const limits:Json={instance:200,model:500,effort:100};
+      const limits:Json={instance:200,model:500,effort:100,bundle:4096};
       for(const [key,property] of Object.entries(schema.properties) as [string,Json][]){
         if(!Object.hasOwn(limits,key)||!property||property.type!=='string'||typeof property.title!=='string'||!Array.isArray(property.enum)||property.enum.length>1000||property.enum.some((value:unknown)=>typeof value!=='string'||!value||value.length>limits[key])||new Set(property.enum).size!==property.enum.length||property.enumLabels!==undefined&&(!Array.isArray(property.enumLabels)||property.enumLabels.length!==property.enum.length||property.enumLabels.some((value:unknown)=>typeof value!=='string'||value.length>512)))throw new RpcFault(-32000,'Invalid initial configuration schema',{executed:false});
       }
-      if(schema.required!==undefined&&(!Array.isArray(schema.required)||schema.required.length>3||new Set(schema.required).size!==schema.required.length||schema.required.some((key:unknown)=>typeof key!=='string'||!Object.hasOwn(schema.properties,key))))throw new RpcFault(-32000,'Invalid required initial configuration fields',{executed:false});
+      if(schema.required!==undefined&&(!Array.isArray(schema.required)||schema.required.length>4||new Set(schema.required).size!==schema.required.length||schema.required.some((key:unknown)=>typeof key!=='string'||!Object.hasOwn(schema.properties,key))))throw new RpcFault(-32000,'Invalid required initial configuration fields',{executed:false});
       for(const [key,value] of Object.entries(values)){const property=schema.properties[key];if(!Object.hasOwn(schema.properties,key)||!property||typeof value!=='string'||!property.enum.includes(value))throw new RpcFault(-32000,'Resolved initial configuration is outside its advertised choices',{executed:false});}
       if(Object.entries(config).some(([key,value])=>values[key]!==value))throw new RpcFault(-32000,'Initial configuration resolution changed or omitted a requested choice',{executed:false});
       return {schema:structuredClone(schema),values:structuredClone(values)};
@@ -1013,8 +1014,8 @@ export class AmplifierHost {
   }
   private resolveSessionConfigShape(config:unknown):Json {
     if(config===undefined)return {};
-    if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['instance','model','effort'].includes(key))||Object.entries(config).some(([key,value])=>typeof value!=='string'||!value||value.length>({instance:200,model:500,effort:100} as Json)[key]))throw new RpcFault(-32602,'Creation configuration requires bounded instance/model/effort strings',{executed:false});
-    if(Object.keys(config).length&&(typeof (config as Json).instance!=='string'||typeof (config as Json).model!=='string'))throw new RpcFault(-32602,'Creation requires both provider instance and model',{executed:false});
+    if(!config||typeof config!=='object'||Array.isArray(config)||Object.keys(config).some(key=>!['instance','model','effort','bundle'].includes(key))||Object.entries(config).some(([key,value])=>typeof value!=='string'||!value||value.length>({instance:200,model:500,effort:100,bundle:4096} as Json)[key]))throw new RpcFault(-32602,'Creation configuration requires bounded bundle/instance/model/effort strings',{executed:false});
+    if(Object.keys(config).some(key=>key!=='bundle')&&(typeof (config as Json).instance!=='string'||typeof (config as Json).model!=='string'))throw new RpcFault(-32602,'Creation requires both provider instance and model',{executed:false});
     return config as Json;
   }
   private managedNativeParams(receipt:Json,operation:string):Json{return {operation,sessionId:receipt.marker.id,cwd:receipt.marker.workspace,commandId:receipt.commandId,allocationHash:receipt.marker.allocationHash,...(operation==='create'?Object.fromEntries(Object.entries(receipt.request).filter(([key])=>['title','bundle','bundleRevision','selection'].includes(key))):{})};}

@@ -5,7 +5,7 @@ const managed={version:1,passive:true,typedSelection:true,configurationScope:'gl
 let selection;
 for await(const line of createInterface({input:process.stdin})){
  const request=JSON.parse(line),p=request.params??{};let result={};
- if(request.method==='initialize')result={protocolVersion:1,agentCapabilities:{loadSession:true,_meta:{[native]:{version:1,managedCreation:managed,...(process.env.NO_SELECTION?{}:{initialSelection:{version:1,typedSelection:true,passive:true,resolveMethod:'_amplifier/initial-selection'}})}}}};
+ if(request.method==='initialize')result={protocolVersion:1,agentCapabilities:{loadSession:true,_meta:{[native]:{version:1,managedCreation:managed,...(process.env.NO_SELECTION?{}:{initialSelection:{version:1,typedSelection:true,...(process.env.NO_BUNDLE?{}:{bundleSelection:true}),passive:true,resolveMethod:'_amplifier/initial-selection'}})}}}};
  else if(request.method==='_amplifier/initial-selection'){
   const config=p.selection??{},model=config.model??'first-model',efforts=model==='second-model'?['low']:model==='no-effort'?[]:['low','high'];
   if(config.instance!==undefined&&config.instance!=='configured'||!['first-model','second-model','no-effort'].includes(model)||config.effort!==undefined&&!efforts.includes(config.effort)){
@@ -17,10 +17,11 @@ for await(const line of createInterface({input:process.stdin})){
   const values={instance:'configured',model,...(efforts.length?{effort:config.effort??efforts.at(-1)}:{})};
   if(process.env.BAD_RESOLUTION)values.model='first-model';
   if(process.env.NO_DEFAULT_MODEL)delete values.model;
+  if(config.bundle!==undefined){schema.properties.bundle={type:'string',title:'Bundle',enum:[config.bundle]};schema.required.push('bundle');values.bundle=process.env.BAD_BUNDLE_RESOLUTION?'wrong-bundle':config.bundle;if(Object.keys(config).length===1){for(const key of ['instance','model','effort']){delete schema.properties[key];delete values[key];}schema.required=['bundle'];}}
   result={version:1,schema,values};log({method:request.method,cwd:p.cwd,selection:p.selection});
  }else if(request.method==='session/new'){
   selection=p._meta?.[native]?.selection;log({method:request.method,selection});
-  result={sessionId:'selection-fixture',_meta:{[native]:{initialSelection:{version:1,selection:process.env.BAD_PROOF?{...selection,effort:'high'}:selection}}}};
+  result={sessionId:'selection-fixture',_meta:{[native]:{initialSelection:{version:1,selection:process.env.BAD_PROOF?{...selection,effort:'high'}:process.env.BAD_BUNDLE_PROOF?{...selection,bundle:'wrong-bundle'}:selection}}}};
  }else if(request.method==='session/prompt'){log({method:request.method,selection,prompt:p.prompt});result={stopReason:'end_turn'};}
  else if(request.method==='session/load'||request.method==='session/cancel')result={};
  else{process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32601,message:'Unknown fixture method'}})+'\n');continue;}
