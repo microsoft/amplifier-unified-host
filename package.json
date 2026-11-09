@@ -7,6 +7,8 @@
     "build": "tsc",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "tsc --noEmit",
+    "check:interop": "npm run build && node --test fixtures/interop/*.test.mjs",
+    "fixture:acp": "node fixtures/interop/acp-peer.mjs",
     "start": "node dist/cli.js"
   },
   "keywords": [],
