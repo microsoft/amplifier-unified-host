@@ -11,9 +11,13 @@ speak upstream AHP; agents speak upstream ACP. Amplifier is one configured agent
 implementation, with its native Core/Foundation composition behind its adapter.
 The host must remain useful without importing that runtime or its private files.
 
-A conversation retains one engine/native identity and one execution authority.
-Multiple authorized viewers can observe it. Closing every view does not cancel
-accepted work, and opening an old view does not mount its agent. A connection,
+A native execution retains one engine/native identity and one execution authority.
+The experience owns its shared conversation and participants; agent participation
+binds to separate execution identities. The current host implementation retains
+one engine/native binding per hosted conversation; multi-participant routing
+remains unqualified. Multiple authorized viewers can observe it. Closing every
+view does not cancel accepted work, and opening an old view does not mount its
+agent. A connection,
 subscription, catalog row and active execution are different facts.
 
 Attention determines the normal working set: filtered catalog pages, selected

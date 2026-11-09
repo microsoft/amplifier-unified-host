@@ -22,6 +22,10 @@ node dist/cli.js --config /absolute/host.json
 ```
 
 Installed executable: `amplifier-unified-host --config /absolute/host.json`.
+For a small standard-ACP peer and one-command independent checks, see
+[the interop baseline](docs/interop-baseline.md). `npm run check:interop` checks
+the built host and fixture without native runtime source or provider accounts.
+
 The published API is `createHost(config)` and the returned host's `url`,
 `inspectSession`, `createSession`, `submitScheduled`, `nativeControl`, `invokeClientTool`, `invalidateCapability`,
 `diagnostics`, and `close` methods. `npm pack` produces a standalone artifact.
