@@ -39,7 +39,7 @@ Their approved direction is separate from the implementation evidence below.
 | **HB6** — WS1–2, WS6; CB2–3 | Index repair changes derived discoverability, not canonical history, command authority or product-owner records. Identity adoption requires exact owning receipts. | Index rebuild deletes native history, silently clears a product fence, or trusts a browser-supplied native ID. | [Import proof tests](../../test/import.test.ts), [archive repair](../../test/archive-projection.test.ts) |
 | **HB7** — HP4; CB7; MA1–6 | Maintenance covers every configured effect owner with actual held intake/lifetime proof. Exact service identity and release evidence govern reopening. | Zero viewers is declared idle, a missing participant is ignored, or a changed/replayed release proof opens a fence. | [Quiescence](../../test/quiescence.test.ts), [service lifecycle](../../test/service-lifecycle.test.ts) |
 | **HB8** — WS1; CB3; MA7–11 | Hiding discovery, purging a retired copy and disposing managed files are distinct reviewed authorities. Preserve canonical history unless separately authorized. | Age or an arbitrary cwd implies ownership; incomplete family/reference coverage permits disposal. | [Retention](../../test/retention.integration.test.ts), [retired copies](../../test/retired-copy.integration.test.ts), [managed files](../../test/managed-files.integration.test.ts) |
-| **HB9** — CB1, CB4–6 | Develop with public fixture peers and owned state; record exact source, package, installed and runtime evidence independently. | A local green test is reported as vendor, browser, Linux process or deployed acceptance. | [Run/verification guide](../../README.md#verification-boundary), [family Q1–Q12 gates][gates] |
+| **HB9** — CB1, CB4–6 | Develop with public fixture peers and owned state; record exact source, package, installed and runtime evidence independently. | A local green test is reported as vendor, browser, Linux process or deployed acceptance. | [Independent ACP checks](../interop-baseline.md), [family Q1–Q12 gates][gates] |
 
 ## Scope, actor and command authority
 
@@ -220,8 +220,9 @@ observe original settlement and never repeat admission or update work.
 The exported `AdmissionAbortBinding`, `AdmissionAbortRequest`,
 `AdmissionAbortProof`, `AdmissionAbortOwnerReceipt`, and
 `HostAdmissionAbortReceipt` are defined in [quiescence.ts](../../src/quiescence.ts).
-The completed wire receipt is `host-admission-abort-v1`; integration obligations
-and passive reads are documented in the [README](../../README.md#pre-retirement-admission-abort-optional).
+The completed wire receipt is `host-admission-abort-v1`. The public types above
+define the exact proof and receipt shapes; uncertain outcomes require passive
+inspection rather than another admission attempt.
 [Focused acceptance](../../test/admission-abort.test.ts) falsifies late-timeout
 races, wrong identity/proof, missing owner coverage, retirement/legacy fences,
 changed retries, and owner-commit/lost-reply recovery through the public Host.
