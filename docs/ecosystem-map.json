@@ -1,0 +1,118 @@
+{
+  "citations": [
+    {
+      "git_blob": "008209b9bb056d4b173780dfac2e3d0a439ac5ff",
+      "path": "README.md",
+      "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+      "sha256": "d97f9f447a0a504d408930f1a1e4b0fbb22e67572cb471a48cc22d63087787dc",
+      "url": "https://github.com/microsoft/amplifier-unified-host/blob/6b4c67e7f8b7978f5439ef123f493c13770725a8/README.md"
+    },
+    {
+      "git_blob": "7146b2fc0df12a9bf0645190830378b27d20de2a",
+      "path": "docs/contracts/host-boundary.v1.md",
+      "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+      "sha256": "2b702d696a0999e4c5051e1a6d1f66ba7eca58d0a8c65c6ae370860924ebbcc5",
+      "url": "https://github.com/microsoft/amplifier-unified-host/blob/6b4c67e7f8b7978f5439ef123f493c13770725a8/docs/contracts/host-boundary.v1.md"
+    },
+    {
+      "git_blob": "dd261a923f0671ef91d8f3c46e00caa30308b748",
+      "path": "package.json",
+      "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+      "sha256": "8e79f0400f0df71a8f517d9e7550e4df8dedde128b6acb02400c819d10ff3173",
+      "url": "https://github.com/microsoft/amplifier-unified-host/blob/6b4c67e7f8b7978f5439ef123f493c13770725a8/package.json"
+    }
+  ],
+  "consumer_cta": {
+    "basis": "Existing approved README route; target release assets/availability not freshly audited in this plan.",
+    "label": "Try the local host",
+    "url": "https://github.com/microsoft/amplifier-unified-host#try-it-locally"
+  },
+  "display_name": "Amplifier Unified Host",
+  "edges": [
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "state"
+    },
+    {
+      "from": "self",
+      "relation": "contains",
+      "to": "bridge"
+    },
+    {
+      "from": "clients",
+      "relation": "uses",
+      "to": "self"
+    },
+    {
+      "from": "bridge",
+      "relation": "uses",
+      "to": "agents"
+    },
+    {
+      "from": "self",
+      "relation": "uses",
+      "to": "catalog"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "self",
+      "kind": "self",
+      "label": "Amplifier Unified Host",
+      "repository": "microsoft/amplifier-unified-host"
+    },
+    {
+      "id": "state",
+      "kind": "internal",
+      "label": "Conversation state & admission"
+    },
+    {
+      "id": "bridge",
+      "kind": "internal",
+      "label": "ACP agent bridge"
+    },
+    {
+      "id": "clients",
+      "kind": "external",
+      "label": "Independent AHP clients"
+    },
+    {
+      "id": "agents",
+      "kind": "external",
+      "label": "Configured ACP agents"
+    },
+    {
+      "id": "catalog",
+      "kind": "external",
+      "label": "Optional Session Catalog",
+      "repository": "microsoft/amplifier-session-catalog"
+    }
+  ],
+  "notes": [
+    "AHP server and ACP client roles are protocol roles, not new ecosystem primitives.",
+    "This is an independently composable host; do not label it the default installed backend of current Amplifier Unified.",
+    "Catalog and capability packages are optional. A same-origin authenticated gateway owns TLS and user account management.",
+    "Does not embed a model runtime or own every agent implementation."
+  ],
+  "purpose": "Keep conversations and shared state available while clients connect to independently installed agents.",
+  "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+  "repository": "microsoft/amplifier-unified-host",
+  "roles": [
+    "Conversation",
+    "Connection"
+  ],
+  "scope": "independent host component",
+  "start_cta": {
+    "basis": "Existing approved README route; target release assets/availability not freshly audited in this plan.",
+    "label": "Try the local host",
+    "url": "https://github.com/microsoft/amplifier-unified-host#try-it-locally"
+  },
+  "summary": "A separately composable AHP host for clients, durable conversation state and independently installed ACP agents.",
+  "supports_roles": [
+    "Experience",
+    "Agent Instance",
+    "Tool"
+  ],
+  "visibility": "private"
+}
