@@ -78,6 +78,27 @@ tokens out of URLs. TLS and user-account management belong to the gateway.
 
 For development, run `npm run check` and `npm test`.
 
+
+<!-- ecosystem-map:start -->
+## Where this fits
+
+A separately composable AHP host for clients, durable conversation state and independently installed ACP agents.
+
+Roles: Conversation, Connection. Supports: Experience, Agent Instance, Tool.
+
+![Ecosystem roles and component relationships](docs/ecosystem-map.svg)
+
+[Open the map](docs/ecosystem-map.svg) · [Product page source (private)](docs/product/index.html) · [Map guide](https://github.com/microsoft/amplifier-constellation/blob/main/docs/ecosystem-maps.md)
+
+<details>
+<summary>The five shared building blocks</summary>
+
+[![Experience, Conversation, Agent Instance, Connection and Tool](https://raw.githubusercontent.com/microsoft/amplifier-constellation/main/site/assets/art/building-blocks.png)](https://microsoft.github.io/amplifier-constellation/)
+
+</details>
+
+<!-- ecosystem-map:end -->
+
 ## Contributing
 
 Most contributions require you to agree to a
