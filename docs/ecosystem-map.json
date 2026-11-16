@@ -1,25 +1,25 @@
 {
   "citations": [
     {
-      "git_blob": "008209b9bb056d4b173780dfac2e3d0a439ac5ff",
+      "git_blob": "89086d212337a0464a72a383351fd69d66c663e4",
       "path": "README.md",
-      "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
-      "sha256": "d97f9f447a0a504d408930f1a1e4b0fbb22e67572cb471a48cc22d63087787dc",
-      "url": "https://github.com/microsoft/amplifier-unified-host/blob/6b4c67e7f8b7978f5439ef123f493c13770725a8/README.md"
+      "ref": "4174b53025d2b3b4131024c5c9b3a410e2d13a26",
+      "sha256": "91746138611b7d36491e39fc7cc48573df7e306d4a0b6e2f916a2d74c8fdc013",
+      "url": "https://github.com/microsoft/amplifier-unified-host/blob/4174b53025d2b3b4131024c5c9b3a410e2d13a26/README.md"
     },
     {
       "git_blob": "7146b2fc0df12a9bf0645190830378b27d20de2a",
       "path": "docs/contracts/host-boundary.v1.md",
-      "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+      "ref": "4174b53025d2b3b4131024c5c9b3a410e2d13a26",
       "sha256": "2b702d696a0999e4c5051e1a6d1f66ba7eca58d0a8c65c6ae370860924ebbcc5",
-      "url": "https://github.com/microsoft/amplifier-unified-host/blob/6b4c67e7f8b7978f5439ef123f493c13770725a8/docs/contracts/host-boundary.v1.md"
+      "url": "https://github.com/microsoft/amplifier-unified-host/blob/4174b53025d2b3b4131024c5c9b3a410e2d13a26/docs/contracts/host-boundary.v1.md"
     },
     {
       "git_blob": "dd261a923f0671ef91d8f3c46e00caa30308b748",
       "path": "package.json",
-      "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+      "ref": "4174b53025d2b3b4131024c5c9b3a410e2d13a26",
       "sha256": "8e79f0400f0df71a8f517d9e7550e4df8dedde128b6acb02400c819d10ff3173",
-      "url": "https://github.com/microsoft/amplifier-unified-host/blob/6b4c67e7f8b7978f5439ef123f493c13770725a8/package.json"
+      "url": "https://github.com/microsoft/amplifier-unified-host/blob/4174b53025d2b3b4131024c5c9b3a410e2d13a26/package.json"
     }
   ],
   "consumer_cta": {
@@ -96,7 +96,7 @@
     "Does not embed a model runtime or own every agent implementation."
   ],
   "purpose": "Keep conversations and shared state available while clients connect to independently installed agents.",
-  "ref": "6b4c67e7f8b7978f5439ef123f493c13770725a8",
+  "ref": "4174b53025d2b3b4131024c5c9b3a410e2d13a26",
   "repository": "microsoft/amplifier-unified-host",
   "roles": [
     "Conversation",
@@ -114,5 +114,5 @@
     "Agent Instance",
     "Tool"
   ],
-  "visibility": "private"
+  "visibility": "public"
 }
